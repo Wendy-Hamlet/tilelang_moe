@@ -3,6 +3,9 @@ Benchmark: Top-K Gating Performance Comparison
 PyTorch vs TileLang (with Hopper features on H100)
 
 Run on server with CUDA-capable GPU
+
+IMPORTANT: Clear TileLang cache after pulling code updates:
+  rm -rf ~/.tilelang_cache
 """
 import torch
 import time

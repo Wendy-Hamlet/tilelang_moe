@@ -14,6 +14,9 @@ cd tilelang_moe
 ## Run Benchmark
 
 ```bash
+# Clear TileLang kernel cache (IMPORTANT: do this after git pull)
+rm -rf ~/.tilelang_cache
+
 # Execute benchmark (auto-tunes and tests multiple batch sizes)
 python benchmarks/benchmark_topk.py
 ```
