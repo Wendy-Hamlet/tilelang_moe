@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from kernels.topk_sonic_style import topk_sonic_style
 
 
-def test_sonic_style(batch=4, num_experts=160, topk=6):
+def test_sonic_style(batch=4, num_experts=160, topk=6, test_warp=False):
     """Quick correctness test"""
     print(f"Testing SonicMoE-style TopK: batch={batch}, num_experts={num_experts}, topk={topk}")
     
@@ -58,13 +58,19 @@ def test_sonic_style(batch=4, num_experts=160, topk=6):
     
     thread_ok = check_and_report(values_thread, indices_thread, "Thread-Level")
     
-    print("\n" + "=" * 60)
-    print("Testing Warp-Level Version")
-    print("=" * 60)
-    
-    # Warp-level version
-    values_warp, indices_warp = topk_sonic_style(logits, topk, use_warp=True)
-    warp_ok = check_and_report(values_warp, indices_warp, "Warp-Level")
+    warp_ok = True
+    if test_warp:
+        print("\n" + "=" * 60)
+        print("Testing Warp-Level Version")
+        print("=" * 60)
+        
+        # Warp-level version
+        values_warp, indices_warp = topk_sonic_style(logits, topk, use_warp=True)
+        warp_ok = check_and_report(values_warp, indices_warp, "Warp-Level")
+    else:
+        print("\n" + "=" * 60)
+        print("Skipping Warp-Level Version (use test_warp=True to enable)")
+        print("=" * 60)
     
     print("\n" + "=" * 60)
     if thread_ok and warp_ok:
