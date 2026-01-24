@@ -230,7 +230,7 @@ def topk_gating_tilelang_baseline(scores: torch.Tensor, k: int) -> tuple[torch.T
     return topk_indices, topk_weights
 
 
-def topk_gating_tilelang(scores: torch.Tensor, k: int, use_optimized: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+def topk_gating_tilelang(scores: torch.Tensor, k: int, use_optimized: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
     """
     TileLang Top-K gating (auto-selects best implementation)
     
@@ -238,6 +238,7 @@ def topk_gating_tilelang(scores: torch.Tensor, k: int, use_optimized: bool = Tru
         scores: [batch, num_experts] - Gate scores (after softmax)
         k: Number of experts to select per token
         use_optimized: If True, use optimized warp-level impl; else use baseline
+                      (Default: False - optimized version has compilation issues)
         
     Returns:
         indices: [batch, k] - Selected expert indices
@@ -249,10 +250,10 @@ def topk_gating_tilelang(scores: torch.Tensor, k: int, use_optimized: bool = Tru
     M, N = scores.shape
     
     if use_optimized:
-        # Use optimized warp-level implementation
+        # Use optimized warp-level implementation (currently has issues)
         kernel = tl_topk_optimized(M=M, N=N, topk=k)
     else:
-        # Use baseline iterative implementation
+        # Use baseline iterative implementation (stable)
         kernel = tl_topk_iterative(M=M, N=N, topk=k)
     
     # Execute kernel
