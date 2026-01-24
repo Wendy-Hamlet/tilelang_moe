@@ -58,7 +58,7 @@ def get_radix_topk_configs():
     return configs
 
 
-@tilelang.autotune(configs=get_radix_topk_configs(), key=['topk'])
+@tilelang.autotune(configs=get_radix_topk_configs())
 @tilelang.jit(pass_configs=pass_configs)
 def tl_topk_radix_optimized_impl(topk, BLOCK_SIZE=1024, SMEM_INPUT_SIZE=4096, 
                                    in_dtype=T.float32, out_dtype=T.int32):
