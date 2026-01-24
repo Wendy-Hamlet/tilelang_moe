@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints
+
+# Benchmark results
+benchmarks/results/*
+!benchmarks/results/.gitkeep
+
+# Cache
+*.cache
+.pytest_cache/
+.tilelang/
+
+# TileLang build artifacts (if building from source)
+third_party/tilelang/build/
+third_party/tilelang/dist/
+third_party/tilelang/*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,6 +1,12 @@
-# TileLang MoE Implementation
+# TileLang MoE Benchmark
 
-DeepSeek MoE算子的TileLang实现及性能对比
+使用TileLang实现MoE算子并与PyTorch进行性能对比
+
+## 项目目标
+
+1. ✅ 学习TileLang语法和优化技术
+2. 🔧 实现高性能MoE算子（Top-K Gating + Expert GEMM）
+3. 📊 对比TileLang vs PyTorch性能
 
 ## 项目结构
 
@@ -43,12 +49,89 @@ tilelang_moe/
 └── README.md
 ```
 
-## 环境配置
+## 快速开始
+
+### 方法1: 一键安装（推荐）
+
+**Windows:**
+```powershell
+.\scripts\setup_tilelang.bat
+```
+
+**Linux/Mac:**
+```bash
+bash scripts/setup_tilelang.sh
+```
+
+### 方法2: 手动安装
 
 ```bash
-conda activate tilelang
+# 1. 克隆项目（含TileLang源码）
+git clone --recursive https://github.com/your-username/tilelang_moe.git
+cd tilelang_moe
+
+# 或者如果已经克隆，单独下载tilelang源码
+git submodule update --init --recursive
+
+# 2. 安装依赖
+pip install tilelang
 pip install -r requirements.txt
 ```
+
+### 验证安装
+
+```bash
+python -c "import tilelang; print(f'TileLang version: {tilelang.__version__}')"
+```
+
+## 学习资源
+
+| 资源 | 位置 | 说明 |
+|------|------|------|
+| 🎯 语法入门 | `examples/tilelang_syntax_examples.py` | TileLang基础语法示例 |
+| 📚 官方示例 | `third_party/tilelang/examples/` | 完整的官方示例代码 |
+| 🔍 参考实现 | `reference_impl/` | DeepSeek MoE的完整实现 |
+| 📖 快速指南 | `QUICKSTART.md` | 详细的入门教程 |
+
+## 开发流程
+
+### 1. 运行参考实现（学习TileLang语法）
+
+```bash
+cd reference_impl
+python test_example_fusedmoe.py
+```
+
+### 2. 实现你的算子
+
+编辑 `kernels/moe_gemm.py` 和 `kernels/topk_gating.py`
+
+### 3. 性能对比
+
+```bash
+python benchmarks/benchmark_moe.py
+```
+
+## 项目亮点
+
+✅ **Git Submodule集成** - 一键下载完整TileLang源码  
+✅ **官方参考实现** - DeepSeek MoE的生产级实现  
+✅ **详细文档** - 从语法入门到性能优化  
+✅ **自动化脚本** - 一键环境配置
+
+## TileLang快速参考
+
+```python
+import tilelang.language as T
+
+# 定义kernel
+@T.prim_func
+def my_kernel(A: T.Buffer, B: T.Buffer):
+    # TileLang代码...
+    pass
+```
+
+参考 `reference_impl/example_fusedmoe_tilelang.py` 学习完整实现。
 
 ## 快速开始
 

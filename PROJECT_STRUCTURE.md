@@ -2,6 +2,17 @@
 
 ## 目录结构
 
+### third_party/tilelang/ - TileLang源码 (git submodule)
+完整的TileLang源码仓库，用于：
+- 学习TileLang的实现细节
+- 查看更多官方示例
+- 理解编译器和优化器原理
+
+**获取方式**：
+```bash
+git submodule update --init --recursive
+```
+
 ### reference_impl/ - 官方参考实现
 从TileLang官方仓库复制的完整DeepSeek MoE实现，包含：
 - 生产级的Grouped GEMM优化

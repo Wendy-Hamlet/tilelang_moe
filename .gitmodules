@@ -1,0 +1,4 @@
+[submodule "third_party/tilelang"]
+	path = third_party/tilelang
+	url = https://github.com/tile-ai/tilelang.git
+	branch = main
