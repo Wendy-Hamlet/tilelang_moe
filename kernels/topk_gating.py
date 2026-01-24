@@ -24,11 +24,11 @@ def get_topk_configs():
 
 
 @tilelang.autotune(configs=get_topk_configs())
-@tilelang.jit(out_idx=[1, 2], target="cuda", enable_hopper_features=True)
+@tilelang.jit(out_idx=[1, 2], target="cuda")
 def tl_topk(M, N, topk, blk_m, threads=128):
     """
-    TileLang Top-K kernel with Hopper features enabled
-    Based on official implementation with auto-tuning
+    TileLang Top-K kernel with auto-tuning
+    Based on official implementation
     """
     dtype = T.float32
 
