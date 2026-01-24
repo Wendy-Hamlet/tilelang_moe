@@ -3,6 +3,10 @@
 测试 topk_radix.py（真正的 O(N) 实现）vs PyTorch
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import torch
 import time
 from kernels.topk_radix import tl_topk_radix
