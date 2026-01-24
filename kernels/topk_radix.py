@@ -208,19 +208,23 @@ def topk_radix_tilelang(logits, topk=6):
     Returns:
         indices: [batch, topk] indices of top-k experts
     """
+    # Get dimensions and convert to Python int explicitly
     batch, num_experts = logits.shape
-    
-    # Ensure all integers are Python int (not torch.int64/Long)
     batch = int(batch)
     num_experts = int(num_experts)
-    topk = int(topk)
     
+    # CRITICAL: Ensure topk is Python int, not torch scalar tensor
+    if isinstance(topk, torch.Tensor):
+        topk = int(topk.item())
+    else:
+        topk = int(topk)
+    
+    # Create output tensors
     indices = torch.zeros((batch, topk), dtype=torch.int32, device=logits.device)
-    
-    # Full range selection
     starts = torch.zeros((batch,), dtype=torch.int32, device=logits.device)
     ends = torch.full((batch,), num_experts, dtype=torch.int32, device=logits.device)
     
+    # Create kernel with Python int topk
     kernel = tl_topk_radix_impl(topk)
     kernel(logits, indices, starts, ends)
     
