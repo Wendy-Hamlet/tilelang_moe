@@ -37,35 +37,13 @@ def convert_to_uint32(x):
     return bits_uint
 
 
-def get_radix_topk_configs():
-    """
-    AutoTune configurations for Radix TopK
-    测试不同的 BLOCK_SIZE 和 SMEM_INPUT_SIZE 组合
-    """
-    configs = []
-    
-    # 不同的线程块大小
-    block_sizes = [256, 512, 1024]
-    # 不同的共享内存缓冲区大小
-    smem_sizes = [2048, 4096, 8192]
-    
-    for bs, smem in itertools.product(block_sizes, smem_sizes):
-        configs.append(dict(
-            BLOCK_SIZE=bs,
-            SMEM_INPUT_SIZE=smem,
-        ))
-    
-    return configs
-
-
-@tilelang.autotune(configs=get_radix_topk_configs())
 @tilelang.jit(pass_configs=pass_configs)
-def tl_topk_radix_optimized_impl(topk, BLOCK_SIZE=1024, SMEM_INPUT_SIZE=4096, 
-                                   in_dtype=T.float32, out_dtype=T.int32):
+def tl_topk_radix_optimized_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
     batch = T.dynamic("batch")
     seq_len = T.dynamic("seq_len")
     RADIX = 1 << 8  # 256 buckets
-    WARP_SIZE = 32
+    BLOCK_SIZE = 1024  # Fixed for now
+    SMEM_INPUT_SIZE = 4096  # Fixed for now
 
     @T.prim_func
     def tl_topk_radix_optimized_kernel(
@@ -76,22 +54,16 @@ def tl_topk_radix_optimized_impl(topk, BLOCK_SIZE=1024, SMEM_INPUT_SIZE=4096,
     ):
         with T.Kernel(batch, threads=BLOCK_SIZE) as (bx):
             tx = T.get_thread_binding()
-            warp_id = tx // WARP_SIZE
-            lane_id = tx % WARP_SIZE
 
             # Shared memory allocations
             s_threshold_bin_id = T.alloc_shared([1], T.int32)
-            # Padding 避免 bank conflict (+1)
+            # Optimization: Padding to avoid bank conflict
             s_histogram = T.alloc_shared([RADIX + 1 + 1], T.int32)
             s_num_input = T.alloc_shared([2], T.int32)
             s_input_idx = T.alloc_shared([2, SMEM_INPUT_SIZE], T.int32)
             
-            # 优化1: 缓存输入的 uint32 值，避免 Stage 2 重复计算
+            # Optimization: Cache uint32 values to avoid recomputation in Stage 2
             s_cached_uint32 = T.alloc_shared([SMEM_INPUT_SIZE], T.uint32)
-            
-            # 优化2: Warp-level 局部直方图，减少原子操作冲突
-            num_warps = BLOCK_SIZE // WARP_SIZE
-            s_warp_histogram = T.alloc_shared([num_warps, RADIX], T.int32)
 
             # Local variables
             l_threshold_bin_id = T.alloc_var(T.int32)
@@ -104,42 +76,22 @@ def tl_topk_radix_optimized_impl(topk, BLOCK_SIZE=1024, SMEM_INPUT_SIZE=4096,
             l_end_idx = T.alloc_var(T.int32)
             l_out_pos = T.alloc_var(T.int32)
             pos = T.alloc_var(T.int32)
-            
-            # Warp-level 归约用的临时变量
-            l_local_count = T.alloc_var(T.int32)
 
             l_new_topk = topk
             l_start_idx = starts[bx]
             l_end_idx = ends[bx]
 
             # ========== Stage 1: Quick 8-bit TopK ==========
-            # 初始化直方图
             T.fill(s_histogram, 0)
-            T.fill(s_warp_histogram, 0)
             T.fill(s_num_input[0], 0)
             T.sync_threads()
 
-            # 优化: Warp-level 构建直方图，减少原子操作冲突
+            # Build histogram using 8-bit representation
             for s in T.serial(T.ceildiv(seq_len, BLOCK_SIZE)):
                 input_idx = s * BLOCK_SIZE + tx
                 if input_idx < l_end_idx and input_idx >= l_start_idx and input_idx < seq_len:
                     inval_int16 = convert_to_uint16(input[bx, input_idx])
-                    # 先累加到 warp 局部直方图（无冲突）
-                    T.atomic_add(s_warp_histogram[warp_id, inval_int16], 1)
-            
-            T.sync_threads()
-            
-            # 归约所有 warp 的局部直方图到全局直方图
-            # 每个线程负责一部分 bins
-            bins_per_thread = T.ceildiv(RADIX, BLOCK_SIZE)
-            for i in T.serial(bins_per_thread):
-                bin_id = tx * bins_per_thread + i
-                if bin_id < RADIX:
-                    l_local_count = 0
-                    for w in T.serial(num_warps):
-                        l_local_count = l_local_count + s_warp_histogram[w, bin_id]
-                    s_histogram[bin_id] = l_local_count
-            
+                    T.atomic_add(s_histogram[inval_int16], 1)
             T.sync_threads()
 
             # Cumulative sum on histogram (保持原样，已经很优化)
@@ -180,7 +132,7 @@ def tl_topk_radix_optimized_impl(topk, BLOCK_SIZE=1024, SMEM_INPUT_SIZE=4096,
                         pos = T.atomic_add(s_num_input[0], 1, return_prev=True)
                         if pos < SMEM_INPUT_SIZE:
                             s_input_idx[0, pos] = input_idx
-                            # 优化: 缓存 uint32 值，避免 Stage 2 重复计算
+                            # Optimization: Cache uint32 value to avoid recomputation in Stage 2
                             s_cached_uint32[pos] = convert_to_uint32(input[bx, input_idx])
 
             # ========== Stage 2: Iterative Refinement (4 rounds max) ==========
@@ -193,33 +145,19 @@ def tl_topk_radix_optimized_impl(topk, BLOCK_SIZE=1024, SMEM_INPUT_SIZE=4096,
 
                 T.sync_threads()
                 T.fill(s_histogram, 0)
-                T.fill(s_warp_histogram, 0)
                 if tx == 0:
                     s_num_input[r_idx ^ 1] = 0
                 T.sync_threads()
 
                 l_num_input = s_num_input[r_idx]
 
-                # 优化: Warp-level 构建直方图
+                # Build histogram for current candidate set
+                # Optimization: Use cached uint32 values
                 for s in T.serial(T.ceildiv(l_num_input, BLOCK_SIZE)):
                     if s * BLOCK_SIZE + tx < l_num_input:
-                        # 优化: 使用缓存的 uint32 值，避免重复读取和计算
                         cached_val = s_cached_uint32[s * BLOCK_SIZE + tx]
                         l_bin_id32 = T.Cast(T.int32, ((cached_val >> (24 - round * 8)) & 0xFF))
-                        T.atomic_add(s_warp_histogram[warp_id, l_bin_id32], 1)
-                
-                T.sync_threads()
-                
-                # 归约 warp 局部直方图
-                bins_per_thread = T.ceildiv(RADIX, BLOCK_SIZE)
-                for i in T.serial(bins_per_thread):
-                    bin_id = tx * bins_per_thread + i
-                    if bin_id < RADIX:
-                        l_local_count = 0
-                        for w in T.serial(num_warps):
-                            l_local_count = l_local_count + s_warp_histogram[w, bin_id]
-                        s_histogram[bin_id] = l_local_count
-                
+                        T.atomic_add(s_histogram[l_bin_id32], 1)
                 T.sync_threads()
 
                 # Cumulative sum
@@ -247,7 +185,7 @@ def tl_topk_radix_optimized_impl(topk, BLOCK_SIZE=1024, SMEM_INPUT_SIZE=4096,
                 for s in T.serial(T.ceildiv(l_num_input, BLOCK_SIZE)):
                     T.sync_threads()
                     if s * BLOCK_SIZE + tx < l_num_input:
-                        # 优化: 使用缓存值
+                        # Optimization: Use cached value
                         cached_val = s_cached_uint32[s * BLOCK_SIZE + tx]
                         l_bin_id32 = T.Cast(T.int32, ((cached_val >> (24 - round * 8)) & 0xFF))
                         
@@ -265,7 +203,7 @@ def tl_topk_radix_optimized_impl(topk, BLOCK_SIZE=1024, SMEM_INPUT_SIZE=4096,
                                 pos = T.atomic_add(s_num_input[r_idx ^ 1], 1, return_prev=True)
                                 if pos < SMEM_INPUT_SIZE:
                                     s_input_idx[r_idx ^ 1, pos] = s_input_idx[r_idx, s * BLOCK_SIZE + tx]
-                                    # 传递缓存值
+                                    # Pass cached value to next round
                                     s_cached_uint32[pos] = cached_val
 
     return tl_topk_radix_optimized_kernel
@@ -273,13 +211,14 @@ def tl_topk_radix_optimized_impl(topk, BLOCK_SIZE=1024, SMEM_INPUT_SIZE=4096,
 
 def topk_radix_optimized(logits, topk=6):
     """
-    优化版 TileLang TopK using Radix Selection
+    Simplified optimized TileLang TopK using Radix Selection
     
-    主要改进：
-    1. Warp-level 原子操作归约（减少冲突 32x）
-    2. AutoTune 自动调优参数
-    3. 缓存 uint32 值避免重复计算
-    4. Padding 共享内存避免 bank conflict
+    Optimizations (simplified to work with TileLang compiler):
+    1. Cache uint32 values to avoid recomputation
+    2. Padding shared memory to avoid bank conflicts
+    
+    Note: Removed warp-level histogram due to TileLang compilation issues.
+    AutoTune also disabled for now - using fixed BLOCK_SIZE=1024.
     
     Args:
         logits: [batch, num_experts] tensor
@@ -308,7 +247,7 @@ def topk_radix_optimized(logits, topk=6):
     starts = torch.zeros((batch,), dtype=torch.int32, device=logits.device)
     ends = torch.full((batch,), num_experts, dtype=torch.int32, device=logits.device)
     
-    # Create optimized kernel with AutoTune
+    # Create simplified optimized kernel (no AutoTune for now)
     kernel = tl_topk_radix_optimized_impl(topk)
     kernel(logits, indices, starts, ends)
     
