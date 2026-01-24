@@ -15,10 +15,14 @@ def topk_gating_pytorch(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, tor
 
 
 def get_topk_configs():
-    """Auto-tune configurations for TopK kernel"""
+    """
+    Auto-tune configurations for TopK kernel
+    Note: threads must be divisible by N (num_experts) for reduce operations
+    For DeepSeek-V2 (N=160), valid thread counts: 160, 320, 480, 640, 800, 960
+    """
     iter_params = dict(
         blk_m=[64, 128, 256],
-        threads=[128, 256, 512],
+        threads=[160, 320, 480],  # Must divide 160 (num_experts for DeepSeek-V2)
     )
     return [dict(zip(iter_params, values)) for values in itertools.product(*iter_params.values())]
 
