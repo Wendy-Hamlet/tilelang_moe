@@ -9,19 +9,24 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
 import time
-from kernels.topk_radix import tl_topk_radix
+import tilelang
+import tilelang.language
+from kernels.topk_radix import tl_topk_radix_impl
 
 def benchmark_config(N, k, batch_size=8, num_runs=50, warmup=10):
     """测试单个配置"""
     device = torch.device('cuda')
     
     # 准备数据
-    x = torch.randn(batch_size, N, device=device, dtype=torch.float16)
+    x = torch.randn(batch_size, N, device=device, dtype=torch.float32)
+    
+    # 创建 TileLang 函数
+    tl_topk_fn = tl_topk_radix_impl(k, in_dtype=tilelang.language.float32, out_dtype=tilelang.language.int32)
     
     # Warmup
     for _ in range(warmup):
         _ = torch.topk(x, k, dim=-1)
-        _ = tl_topk_radix(x, k)
+        _ = tl_topk_fn(x)
     torch.cuda.synchronize()
     
     # Benchmark PyTorch
@@ -36,7 +41,7 @@ def benchmark_config(N, k, batch_size=8, num_runs=50, warmup=10):
     torch.cuda.synchronize()
     start = time.perf_counter()
     for _ in range(num_runs):
-        indices_tl = tl_topk_radix(x, k)
+        indices_tl = tl_topk_fn(x)
     torch.cuda.synchronize()
     tilelang_time = (time.perf_counter() - start) / num_runs * 1000
     
