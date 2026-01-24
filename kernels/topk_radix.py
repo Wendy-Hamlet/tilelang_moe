@@ -208,6 +208,10 @@ def topk_radix_tilelang(logits, topk=6):
     Returns:
         indices: [batch, topk] indices of top-k experts
     """
+    # Ensure logits is float32 (not float16 or float64)
+    if logits.dtype != torch.float32:
+        logits = logits.to(torch.float32)
+    
     # Get dimensions and convert to Python int explicitly
     batch, num_experts = logits.shape
     batch = int(batch)
@@ -219,24 +223,13 @@ def topk_radix_tilelang(logits, topk=6):
     else:
         topk = int(topk)
     
-    # Debug: print types
-    print(f"DEBUG: batch={batch} (type={type(batch)})")
-    print(f"DEBUG: num_experts={num_experts} (type={type(num_experts)})")
-    print(f"DEBUG: topk={topk} (type={type(topk)})")
-    
     # Create output tensors - ensure all dimensions are Python int
     indices = torch.zeros((batch, topk), dtype=torch.int32, device=logits.device)
     starts = torch.zeros((batch,), dtype=torch.int32, device=logits.device)
     ends = torch.full((batch,), num_experts, dtype=torch.int32, device=logits.device)
     
-    print(f"DEBUG: indices.shape={indices.shape}, dtype={indices.dtype}")
-    print(f"DEBUG: starts.shape={starts.shape}, dtype={starts.dtype}")
-    print(f"DEBUG: ends.shape={ends.shape}, dtype={ends.dtype}")
-    
     # Create kernel with Python int topk
-    print(f"DEBUG: Creating kernel with topk={topk}")
     kernel = tl_topk_radix_impl(topk)
-    print(f"DEBUG: Calling kernel...")
     kernel(logits, indices, starts, ends)
     
     return indices
