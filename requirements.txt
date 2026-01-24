@@ -1,5 +1,8 @@
 # 核心依赖
-tilelang>=0.1.6
+# Install TileLang from git submodule (use editable install after cloning)
+# git submodule update --init --recursive
+# pip install -e third_party/tilelang
+tilelang @ git+https://github.com/microsoft/TileLang.git
 torch>=2.0.0
 numpy>=1.20.0
 
