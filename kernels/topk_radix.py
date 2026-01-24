@@ -209,11 +209,15 @@ def topk_radix_tilelang(logits, topk=6):
         indices: [batch, topk] indices of top-k experts
     """
     batch, num_experts = logits.shape
+    
+    # Ensure topk is int (not long)
+    topk = int(topk)
+    
     indices = torch.zeros(batch, topk, dtype=torch.int32, device=logits.device)
     
     # Full range selection
     starts = torch.zeros(batch, dtype=torch.int32, device=logits.device)
-    ends = torch.ones(batch, dtype=torch.int32, device=logits.device) * num_experts
+    ends = torch.full((batch,), num_experts, dtype=torch.int32, device=logits.device)
     
     kernel = tl_topk_radix_impl(topk)
     kernel(logits, indices, starts, ends)
