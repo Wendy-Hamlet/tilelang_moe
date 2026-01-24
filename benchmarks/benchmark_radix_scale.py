@@ -62,21 +62,19 @@ def benchmark_config(N, k, batch_size=8, num_runs=50, warmup=10):
 
 def main():
     print("="*100)
-    print("RADIX SELECTION 规模测试")
+    print("RADIX SELECTION 规模测试 - 寻找 TileLang 优势点")
     print("测试 topk_radix.py (真正的 O(N) 算法) vs PyTorch")
     print("="*100)
     
-    # 测试配置：从小到大
+    # 测试配置：从小到大，重点测试大规模
     configs = [
         # (N, k, batch, runs, name)
         (160, 6, 64, 100, "Baseline (DeepSeek-V2)"),
-        (512, 16, 32, 50, "Small"),
-        (1024, 32, 16, 50, "Medium"),
-        (2048, 64, 8, 30, "Large"),
-        (4096, 128, 8, 20, "XLarge"),
-        (8192, 256, 4, 10, "XXLarge"),
-        (16384, 512, 2, 5, "Huge"),
-        (32768, 2048, 1, 5, "TileLang-like (DeepSeek-V3)"),
+        (1024, 32, 32, 50, "Small"),
+        (4096, 128, 16, 30, "Medium"),
+        (8192, 256, 8, 20, "Large"),
+        (16384, 512, 4, 10, "XLarge"),
+        (32768, 2048, 2, 5, "TileLang-like (DeepSeek-V3)"),
     ]
     
     results = []
