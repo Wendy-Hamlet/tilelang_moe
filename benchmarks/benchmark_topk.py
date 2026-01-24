@@ -110,10 +110,13 @@ def main():
     print(f"CUDA Version: {torch.version.cuda}")
     print(f"PyTorch Version: {torch.__version__}")
     
-    # DeepSeek-V2 configurations + scaling tests
-    batch_sizes = [256, 512, 1024, 2048, 4096, 8192]
+    # DeepSeek-V2 configurations + scaling tests (extended for trend analysis)
+    batch_sizes = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
     num_experts_list = [160]  # DeepSeek-V2
     k_values = [6]  # DeepSeek-V2
+    
+    print("\n⚠️  Testing large batch sizes to analyze scaling behavior")
+    print("   Hypothesis: TileLang may outperform PyTorch at large scale")
     
     print(f"\nTest configurations:")
     print(f"  Batch sizes: {batch_sizes}")
