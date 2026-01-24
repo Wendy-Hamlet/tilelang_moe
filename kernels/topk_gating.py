@@ -107,14 +107,12 @@ def get_optimized_topk_configs():
 @tilelang.jit(out_idx=[1, 2], target="cuda")
 def tl_topk_optimized(M, N, topk, blk_m, threads=128):
     """
-    Optimized Top-K using sorting network for small k
-    Algorithm: Partial bitonic sort - only sort enough to get top-k
-    Time Complexity: O(M × N × log²(k)) - much better than O(M × k × N)
+    Optimized Top-K using selection sort with proper synchronization
     
-    For k=6, N=160:
-    - Load all N values into shared memory
-    - Do partial bitonic sort to bubble top-k to front
-    - Extract top-k results
+    Key fixes:
+    - Remove T.Parallel for selection sort to avoid race conditions
+    - Process each row sequentially within each thread
+    - Thread-level parallelism for loading/storing only
     """
     dtype = T.float32
 
@@ -131,7 +129,7 @@ def tl_topk_optimized(M, N, topk, blk_m, threads=128):
             
             tid = T.get_thread_binding()
             
-            # Load data to shared memory and initialize indices
+            # Load data to shared memory and initialize indices (parallel)
             for i in T.Parallel(blk_m):
                 row = bx * blk_m + i
                 if row < M:
@@ -141,37 +139,39 @@ def tl_topk_optimized(M, N, topk, blk_m, threads=128):
             
             T.sync_threads()
             
-            # Partial selection sort - only need top-k iterations
-            # More efficient than full sort for small k
-            for i in T.Parallel(blk_m):
-                row = bx * blk_m + i
-                if row < M:
-                    # For each position in top-k
-                    for k_pos in T.serial(topk):
-                        # Find max in remaining elements [k_pos:N]
-                        max_val = s_values[i, k_pos]
-                        max_idx_local = k_pos
-                        
-                        for j in T.serial(k_pos + 1, N):
-                            if s_values[i, j] > max_val:
-                                max_val = s_values[i, j]
-                                max_idx_local = j
-                        
-                        # Swap to k_pos position
-                        if max_idx_local != k_pos:
-                            # Swap values
-                            temp_val = s_values[i, k_pos]
-                            s_values[i, k_pos] = s_values[i, max_idx_local]
-                            s_values[i, max_idx_local] = temp_val
+            # Selection sort - process rows sequentially to avoid races
+            # Each thread handles different rows based on thread ID
+            for row_offset in T.serial(T.ceildiv(blk_m, threads)):
+                local_row = tid + row_offset * threads
+                if local_row < blk_m:
+                    global_row = bx * blk_m + local_row
+                    if global_row < M:
+                        # For each position in top-k
+                        for k_pos in T.serial(topk):
+                            # Find max in remaining elements [k_pos:N]
+                            max_val = s_values[local_row, k_pos]
+                            max_idx_local = k_pos
                             
-                            # Swap indices
-                            temp_idx = s_indices[i, k_pos]
-                            s_indices[i, k_pos] = s_indices[i, max_idx_local]
-                            s_indices[i, max_idx_local] = temp_idx
+                            for j in T.serial(k_pos + 1, N):
+                                if s_values[local_row, j] > max_val:
+                                    max_val = s_values[local_row, j]
+                                    max_idx_local = j
+                            
+                            # Swap to k_pos position
+                            if max_idx_local != k_pos:
+                                # Swap values
+                                temp_val = s_values[local_row, k_pos]
+                                s_values[local_row, k_pos] = s_values[local_row, max_idx_local]
+                                s_values[local_row, max_idx_local] = temp_val
+                                
+                                # Swap indices
+                                temp_idx = s_indices[local_row, k_pos]
+                                s_indices[local_row, k_pos] = s_indices[local_row, max_idx_local]
+                                s_indices[local_row, max_idx_local] = temp_idx
             
             T.sync_threads()
             
-            # Write top-k results to output
+            # Write top-k results to output (parallel)
             for i in T.Parallel(blk_m):
                 row = bx * blk_m + i
                 if row < M:
