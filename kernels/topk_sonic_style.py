@@ -150,15 +150,14 @@ def tl_topk_warp_impl(topk, num_experts=160):
                 s_temp_idxs[tx] = local_max_idx
                 T.sync_threads()
                 
-                # Tree reduction to find global max
-                stride = warp_size // 2
-                while stride > 0:
+                # Tree reduction to find global max (log2(warp_size) = 5 iterations for warp_size=32)
+                for log_stride in T.serial(5):  # log2(32) = 5
+                    stride = warp_size >> (log_stride + 1)  # 16, 8, 4, 2, 1
                     if tx < stride:
                         if s_temp_vals[tx + stride] > s_temp_vals[tx]:
                             s_temp_vals[tx] = s_temp_vals[tx + stride]
                             s_temp_idxs[tx] = s_temp_idxs[tx + stride]
                     T.sync_threads()
-                    stride = stride // 2
                 
                 # Thread 0 swaps the max to position k_iter
                 if tx == 0:
