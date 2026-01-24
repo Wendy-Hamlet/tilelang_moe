@@ -1,6 +1,10 @@
 """
 TopK implementation using Radix Selection algorithm
+Baseline 2: 官方 TileLang 实现（未修改）
 Based on tilelang/examples/deepseek_v32/topk_selector.py
+
+这是官方算法的精确复制，作为性能基准。
+优化版本见 topk_radix_optimized.py
 """
 
 import torch
