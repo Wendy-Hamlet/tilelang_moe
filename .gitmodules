@@ -2,3 +2,6 @@
 	path = third_party/tilelang
 	url = https://github.com/tile-ai/tilelang.git
 	branch = main
+[submodule "third_party/sonic-moe"]
+	path = third_party/sonic-moe
+	url = git@github.com:Dao-AILab/sonic-moe.git

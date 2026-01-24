@@ -97,19 +97,56 @@ python benchmarks/benchmark_topk_radix.py
 - Warmup: 10 iterations
 - Benchmark: 50 iterations
 
-## Expected Results
+## Benchmark Results
 
-| Batch | PyTorch | Selection Sort | Radix Selection |
-|-------|---------|----------------|-----------------|
-| 1     | Fast    | Slow           | **Fast**        |
-| 16    | Fast    | Medium         | **Fast**        |
-| 64    | Medium  | Medium         | **Faster**      |
-| 256   | Slow    | Fast           | **Fastest**     |
+### Actual Performance (H100, 2026-01-24)
+
+| Batch | PyTorch(ms) | Radix(ms) | Speedup | Correct |
+|-------|-------------|-----------|---------|----------|
+| 1     | 0.0111      | 0.0501    | **0.22x** | ✅ |
+| 2     | 0.0105      | 0.0432    | **0.24x** | ✅ |
+| 4     | 0.0104      | 0.0426    | **0.24x** | ✅ |
+| 8     | 0.0100      | 0.0424    | **0.24x** | ✅ |
+| 16    | 0.0101      | 0.0425    | **0.24x** | ✅ |
+| 32    | 0.0102      | 0.0418    | **0.24x** | ✅ |
+| 64    | 0.0104      | 0.0432    | **0.24x** | ✅ |
+| 128   | 0.0102      | 0.0430    | **0.24x** | ✅ |
+| 256   | 0.0103      | 0.0428    | **0.24x** | ✅ |
+
+### Analysis
+
+**结果：Radix Selection 在所有 batch size 下都比 PyTorch 慢 4-5 倍！**
+
+可能原因：
+1. **问题规模太小**: num_experts=160, topk=6 对 Radix Selection 不够友好
+   - 原始实现针对 seq_len=32K, topk=2048 设计
+   - 我们的场景只有 160 个候选，topk=6
+   - Radix 的多阶段开销无法摊销
+
+2. **PyTorch 高度优化**: torch.topk 在小规模问题上极其高效
+   - 可能使用了特殊的 warp-level primitives
+   - 对小 N 有专门优化路径
+
+3. **共享内存开销**: 
+   - SMEM_INPUT_SIZE=4096 对我们的场景过大
+   - 直方图 256 个桶可能太多（N=160 只需要 160 个桶）
+
+4. **算法不匹配**: Radix Selection 优势在大 topk
+   - topk=6 时，简单算法更高效
+   - 多阶段细化的开销无法被节省的计算抵消
+
+### Conclusion
+
+**TopK 优化在 DeepSeek-V2 MoE 场景下不是瓶颈！**
+
+- PyTorch topk 已经足够快（0.01ms）
+- TileLang 的两种实现（Selection Sort, Radix Selection）都更慢
+- 应该将优化重点放在 **MoE GEMM 融合** 上
 
 关键指标：
-- **Correctness**: 100% 索引交集
-- **Speedup**: 相对 PyTorch 的加速比
-- **Scaling**: 随 batch 增长的性能曲线
+- **Correctness**: 100% 正确 ✅
+- **Speedup**: 0.22-0.24x（比 PyTorch 慢）❌
+- **Scaling**: 各 batch size 性能稳定，无改善
 
 ## Code Structure
 
@@ -132,10 +169,11 @@ benchmarks/
 
 1. ✅ 实现 Radix Selection 核心算法
 2. ✅ 创建 batch 1-256 测试脚本
-3. ⬜ 在 H100 上运行性能测试
-4. ⬜ 分析性能数据，与选择排序对比
-5. ⬜ 如果性能优秀，替换现有 TopK 实现
-6. ⬜ 继续优化 MoE GEMM 融合（真正瓶颈）
+3. ✅ 在 H100 上运行性能测试
+4. ✅ 分析性能数据 - **结果：比 PyTorch 慢 4-5 倍**
+5. ❌ TopK 优化放弃 - 不是瓶颈
+6. ⏭️ 研究 **sonic-moe** (Dao-AILab) 的 TopK 加速方法
+7. ⏭️ 转向 **MoE GEMM 融合** - 真正的性能瓶颈
 
 ## References
 
