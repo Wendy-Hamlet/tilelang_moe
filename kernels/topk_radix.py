@@ -210,13 +210,15 @@ def topk_radix_tilelang(logits, topk=6):
     """
     batch, num_experts = logits.shape
     
-    # Ensure topk is int (not long)
+    # Ensure all integers are Python int (not torch.int64/Long)
+    batch = int(batch)
+    num_experts = int(num_experts)
     topk = int(topk)
     
-    indices = torch.zeros(batch, topk, dtype=torch.int32, device=logits.device)
+    indices = torch.zeros((batch, topk), dtype=torch.int32, device=logits.device)
     
     # Full range selection
-    starts = torch.zeros(batch, dtype=torch.int32, device=logits.device)
+    starts = torch.zeros((batch,), dtype=torch.int32, device=logits.device)
     ends = torch.full((batch,), num_experts, dtype=torch.int32, device=logits.device)
     
     kernel = tl_topk_radix_impl(topk)
