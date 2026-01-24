@@ -81,23 +81,26 @@ def tl_topk(M, N, topk, blk_m, threads=128):
     return topk_kernel
 
 
-def topk_gating_tilelang(scores: torch.Tensor, k: int, blk_m: int = 64) -> tuple[torch.Tensor, torch.Tensor]:
+def topk_gating_tilelang(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     """
     TileLang optimized Top-K gating
     
     Args:
         scores: [batch, num_experts] - Gate scores (after softmax)
         k: Number of experts to select per token
-        blk_m: Block size for M dimension (auto-tuned by default)
         
     Returns:
         indices: [batch, k] - Selected expert indices
         weights: [batch, k] - Corresponding weights (scores)
+        
+    Note:
+        Block size (blk_m) and thread count are auto-tuned automatically.
+        Do not pass tunable parameters to enable auto-tuning.
     """
     M, N = scores.shape
     
-    # Compile kernel with auto-tuning
-    kernel = tl_topk(M=M, N=N, topk=k, blk_m=blk_m)
+    # Compile kernel with auto-tuning (DO NOT pass blk_m or threads here!)
+    kernel = tl_topk(M=M, N=N, topk=k)
     
     # Execute kernel
     topk_weights, topk_indices = kernel(scores)
