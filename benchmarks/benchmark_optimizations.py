@@ -1,5 +1,5 @@
 """
-对比测试：原始版 vs 优化版 Radix TopK
+四版本TopK对比测试: PyTorch vs PyTorch Compile vs TileLang Official vs TileLang Optimized
 """
 
 import sys
@@ -12,15 +12,22 @@ from kernels.topk_radix import topk_radix_tilelang
 from kernels.topk_radix_optimized import topk_radix_optimized
 
 def benchmark_comparison(N, k, batch_size, num_runs=50):
-    """对比三个实现的性能"""
+    """对比四个实现的性能"""
     device = torch.device('cuda')
     
     # 准备数据
     x = torch.randn(batch_size, N, device=device, dtype=torch.float32)
     
+    # 编译torch.topk
+    def topk_wrapper(x, k):
+        return torch.topk(x, k, dim=-1).indices
+    
+    topk_compiled = torch.compile(topk_wrapper, mode='max-autotune')
+    
     # Warmup
     for _ in range(5):
         _ = torch.topk(x, k, dim=-1)
+        _ = topk_compiled(x, k)
         _ = topk_radix_tilelang(x, k)
         _ = topk_radix_optimized(x, k)
     torch.cuda.synchronize()
@@ -33,7 +40,15 @@ def benchmark_comparison(N, k, batch_size, num_runs=50):
     torch.cuda.synchronize()
     pytorch_time = (time.perf_counter() - start) / num_runs * 1000
     
-    # Benchmark 原始 TileLang
+    # Benchmark PyTorch Compiled
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    for _ in range(num_runs):
+        indices_compiled = topk_compiled(x, k)
+    torch.cuda.synchronize()
+    compiled_time = (time.perf_counter() - start) / num_runs * 1000
+    
+    # Benchmark 官方 TileLang
     torch.cuda.synchronize()
     start = time.perf_counter()
     for _ in range(num_runs):
@@ -50,13 +65,17 @@ def benchmark_comparison(N, k, batch_size, num_runs=50):
     optimized_time = (time.perf_counter() - start) / num_runs * 1000
     
     # 验证正确性
+    compiled_correct = True
     orig_correct = True
     opt_correct = True
     for i in range(min(2, batch_size)):
         ref_set = set(indices_pt[i].cpu().to(torch.int32).numpy())
+        compiled_set = set(indices_compiled[i].cpu().to(torch.int32).numpy())
         orig_set = set(indices_orig[i].cpu().numpy())
         opt_set = set(indices_opt[i].cpu().numpy())
         
+        if len(ref_set & compiled_set) < len(ref_set) * 0.95:
+            compiled_correct = False
         if len(ref_set & orig_set) < len(ref_set) * 0.95:
             orig_correct = False
         if len(ref_set & opt_set) < len(ref_set) * 0.95:
@@ -64,24 +83,27 @@ def benchmark_comparison(N, k, batch_size, num_runs=50):
     
     return {
         'pytorch_ms': pytorch_time,
+        'compiled_ms': compiled_time,
         'original_ms': original_time,
         'optimized_ms': optimized_time,
+        'speedup_compiled': pytorch_time / compiled_time,
         'speedup_orig': pytorch_time / original_time,
         'speedup_opt': pytorch_time / optimized_time,
-        'improvement': original_time / optimized_time,
+        'compiled_correct': compiled_correct,
         'orig_correct': orig_correct,
         'opt_correct': opt_correct,
     }
 
 def main():
-    print("="*100)
-    print("优化效果对比测试 - Radix TopK")
-    print("="*100)
-    print("\n对比三个实现：")
-    print("  1. PyTorch baseline")
-    print("  2. 原始 TileLang (官方算法)")
-    print("  3. 优化 TileLang (Warp归约 + AutoTune + 缓存)")
-    print("="*100)
+    print("="*120)
+    print("四版本TopK性能对比测试")
+    print("="*120)
+    print("\n对比四个实现：")
+    print("  1. PyTorch baseline (torch.topk)")
+    print("  2. PyTorch Compiled (torch.compile with max-autotune)")
+    print("  3. TileLang Official (官方Radix Selection)")
+    print("  4. TileLang Optimized (缓存优化版)")
+    print("="*120)
     
     test_cases = [
         # (N, k, batch, name)
@@ -97,17 +119,17 @@ def main():
     
     for N, k, batch, name in test_cases:
         print(f"\n{name}: N={N}, k={k}, batch={batch}")
-        print("-"*100)
+        print("-"*120)
         
         try:
             result = benchmark_comparison(N, k, batch, num_runs=50)
             results.append((name, N, k, result))
             
-            print(f"  PyTorch:        {result['pytorch_ms']:8.4f} ms")
-            print(f"  原始 TileLang:  {result['original_ms']:8.4f} ms  (speedup: {result['speedup_orig']:5.2f}x vs PyTorch)")
-            print(f"  优化 TileLang:  {result['optimized_ms']:8.4f} ms  (speedup: {result['speedup_opt']:5.2f}x vs PyTorch)")
-            print(f"  📈 优化提升:     {result['improvement']:5.2f}x  (优化版 vs 原始版)")
-            print(f"  ✓ 正确性: 原始={result['orig_correct']}, 优化={result['opt_correct']}")
+            print(f"  PyTorch:          {result['pytorch_ms']:8.4f} ms  (baseline)")
+            print(f"  PyTorch Compiled: {result['compiled_ms']:8.4f} ms  (speedup: {result['speedup_compiled']:5.2f}x)")
+            print(f"  TileLang Official:{result['original_ms']:8.4f} ms  (speedup: {result['speedup_orig']:5.2f}x)")
+            print(f"  TileLang Optimized:{result['optimized_ms']:8.4f} ms  (speedup: {result['speedup_opt']:5.2f}x)")
+            print(f"  ✓ 正确性: Compiled={result['compiled_correct']}, Official={result['orig_correct']}, Optimized={result['opt_correct']}")
             
         except Exception as e:
             print(f"  ✗ FAILED: {e}")
@@ -115,30 +137,25 @@ def main():
             traceback.print_exc()
     
     # Summary
-    print("\n" + "="*100)
-    print("总结")
-    print("="*100)
-    print(f"{'场景':<25} {'N':<8} {'k':<6} {'原始(ms)':<12} {'优化(ms)':<12} {'优化提升':<10}")
-    print("-"*100)
+    print("\n" + "="*120)
+    print("性能对比总结")
+    print("="*120)
+    print(f"{'场景':<25} {'N':<8} {'k':<6} {'PyTorch':<10} {'Compiled':<10} {'Official':<10} {'Optimized':<10}")
+    print("-"*120)
     
     for name, N, k, r in results:
-        print(f"{name:<25} {N:<8} {k:<6} {r['original_ms']:<12.4f} {r['optimized_ms']:<12.4f} {r['improvement']:<10.2f}x")
+        print(f"{name:<25} {N:<8} {k:<6} {r['pytorch_ms']:<10.4f} {r['compiled_ms']:<10.4f} {r['original_ms']:<10.4f} {r['optimized_ms']:<10.4f}")
     
     if results:
-        avg_improvement = sum(r['improvement'] for _, _, _, r in results) / len(results)
-        max_improvement = max((r['improvement'], name) for name, _, _, r in results)
+        print("\n" + "="*120)
+        print("加速比总结 (相对PyTorch baseline)")
+        print("="*120)
+        print(f"{'场景':<25} {'Compiled':<12} {'Official':<12} {'Optimized':<12}")
+        print("-"*120)
         
-        print("\n" + "="*100)
-        print("关键发现")
-        print("="*100)
-        print(f"📊 平均优化提升: {avg_improvement:.2f}x")
-        print(f"📊 最大优化提升: {max_improvement[0]:.2f}x (在 {max_improvement[1]} 场景)")
-        
-        print("\n主要优化技术：")
-        print("  ✓ Warp-level 原子操作归约 (减少冲突 32x)")
-        print("  ✓ AutoTune 参数调优 (BLOCK_SIZE, SMEM_INPUT_SIZE)")
-        print("  ✓ 缓存 uint32 值 (避免重复计算)")
-        print("  ✓ Padding 共享内存 (避免 bank conflict)")
+        for name, N, k, r in results:
+            print(f"{name:<25} {r['speedup_compiled']:<12.2f}x {r['speedup_orig']:<12.2f}x {r['speedup_opt']:<12.2f}x")
 
 if __name__ == "__main__":
     main()
+

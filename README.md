@@ -1,114 +1,49 @@
-# TileLang MoE Benchmark
+# TileLang TopK 性能对比
 
-MoE算子性能测试：TileLang vs PyTorch
+四版本TopK实现性能对比项目。
 
-## 项目目标
+## 四个版本
 
-优化MoE Top-K Gating算子，在H100上测试性能提升
-
-### 当前工作
-
-- ✅ 基于官方TileLang TopK实现
-- ✅ 启用Hopper特性 (H100优化)
-- ✅ 自动调优支持
-- 🔧 服务器性能测试
-
-## 快速使用
-
-```
-tilelang_moe/
-├── reference_impl/      # TileLang官方FusedMoE实现（参考）
-│   ├── example_fusedmoe_tilelang.py  # TileLang完整实现
-│   ├── example_fusedmoe_torch.py     # PyTorch参考实现
-│   ├── test_example_fusedmoe.py      # 测试脚本
-│   └── README.md                      # 参考实现说明
-├── kernels/              # TileLang算子实现（我们的实现）
-│   ├── moe_gemm.py      # MoE GEMM核心算子
-│   ├── topk_gating.py   # Top-K门控选择
-│   └── __init__.py
-├── baselines/           # Baseline实现
-│   └── pytorch/         # PyTorch原生实现
-│       └── moe_layer.py
-├── benchmarks/          # 性能测试
-│   ├── benchmark_moe.py # 完整MoE benchmark
-│   ├── benchmark_kernels.py # 单个算子benchmark
-│   └── results/         # 测试结果
-├── tests/               # 单元测试
-│   └── test_correctness.py # 正确性测试
-├── configs/             # 配置文件
-│   └── moe_config.yaml  # MoE模型配置
-├── scripts/             # 运行脚本
-│   ├── run_benchmark.sh
-│   └── run_tests.sh
-├── examples/            # 使用示例
-│   └── demo_moe.py
-├── utils/               # 工具函数
-│   ├── profiler.py      # 性能分析工具
-│   └── visualizer.py    # 结果可视化
-├── docs/                # 文档
-│   ├── implementation_analysis.md  # 实现流程分析
-│   ├── kernel_details.md           # Kernel详细说明
-│   ├── topk_implementation.md      # TopK实现分析
-│   └── gpu_features_support.md     # GPU特性支持
-├── requirements.txt     # 依赖列表
-└── README.md
-```
-
-## 快速使用
-
-### 安装依赖
-
-```bash
-pip install tilelang torch pandas
-```
-
-### 运行Benchmark
-
-```bash
-# 在H100服务器上运行
-python benchmarks/benchmark_topk.py
-```
-
-### 查看结果
-
-```bash
-cat benchmarks/results/topk_benchmark_results.csv
-```
-
-## 核心实现
-
-### Top-K Gating算子
-
-**PyTorch Baseline**: `torch.topk`  
-**TileLang优化**: 基于官方实现 + Hopper特性 + AutoTune
-
-文件位置：
-- 实现：`kernels/topk_gating.py`
-- 测试：`benchmarks/benchmark_topk.py`
-
-### 配置 (DeepSeek-V2)
-
-- Batch: 256-8192
-- Num Experts: 160
-- K: 6
+1. **PyTorch Baseline** - `torch.topk`
+2. **PyTorch Compiled** - `torch.compile(torch.topk, mode='max-autotune')`
+3. **TileLang Official** - 官方Radix Selection算法
+4. **TileLang Optimized** - 优化版（uint32缓存 + 共享内存填充）
 
 ## 项目结构
 
 ```
 tilelang_moe/
 ├── kernels/
-│   ├── topk_gating.py          # Top-K算子 (PyTorch + TileLang)
-│   └── moe_gemm.py             # MoE GEMM (待实现)
+│   ├── topk_radix.py           # TileLang官方实现
+│   └── topk_radix_optimized.py # TileLang优化版
 ├── benchmarks/
-│   └── benchmark_topk.py       # Top-K性能测试
-├── reference_impl/             # 官方fusedmoe参考
-├── third_party/tilelang/       # TileLang源码 (git submodule)
-└── docs/
-    └── topk_implementation_plan.md
+│   └── benchmark_optimizations.py  # 四版本性能对比
+├── third_party/
+│   └── tilelang/               # TileLang子模块
+└── requirements.txt
 ```
 
-## 参考资源
+## 运行测试
 
-- TileLang官方TopK: `third_party/tilelang/examples/topk/`
-- DeepSeek MoE实现: `third_party/tilelang/examples/fusedmoe/`
+```bash
+# 在H100服务器上运行
+python benchmarks/benchmark_optimizations.py
+```
 
+## 测试场景
+
+- 小规模 (DeepSeek-V2): N=160, k=6
+- Small: N=1024, k=32
+- Medium: N=4096, k=128
+- Large: N=8192, k=256
+- XLarge: N=16384, k=512
+- 大规模 (DeepSeek-V3): N=32768, k=2048
+
+## 环境要求
+
+- CUDA 12.9+
+- PyTorch 2.8.0+
+- H100 GPU
+- TileLang (git submodule)
+
+│   ├── topk_implementation.md      # TopK实现分析
