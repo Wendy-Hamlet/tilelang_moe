@@ -11,7 +11,7 @@ import time
 from kernels.topk_radix import topk_radix_tilelang
 from kernels.topk_radix_optimized import topk_radix_optimized
 
-def benchmark_comparison(N, k, batch_size, num_runs=50):
+def benchmark_comparison(N, k, batch_size, num_runs=100):
     """对比四个实现的性能"""
     device = torch.device('cuda')
     
@@ -24,8 +24,9 @@ def benchmark_comparison(N, k, batch_size, num_runs=50):
     
     topk_compiled = torch.compile(topk_wrapper, mode='max-autotune')
     
-    # Warmup
-    for _ in range(5):
+    # Warmup - 10次预热确保编译完成
+    print("  预热中...")
+    for _ in range(10):
         _ = torch.topk(x, k, dim=-1)
         _ = topk_compiled(x, k)
         _ = topk_radix_tilelang(x, k)
@@ -103,6 +104,7 @@ def main():
     print("  2. PyTorch Compiled (torch.compile with max-autotune)")
     print("  3. TileLang Official (官方Radix Selection)")
     print("  4. TileLang Optimized (缓存优化版)")
+    print("\n⚙️  测试配置: 预热10次 + 测试100次取平均")
     print("="*120)
     
     test_cases = [
@@ -122,7 +124,7 @@ def main():
         print("-"*120)
         
         try:
-            result = benchmark_comparison(N, k, batch, num_runs=50)
+            result = benchmark_comparison(N, k, batch, num_runs=100)
             results.append((name, N, k, result))
             
             print(f"  PyTorch:          {result['pytorch_ms']:8.4f} ms  (baseline)")
