@@ -52,8 +52,8 @@ def tl_topk_radix_large_k_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
         starts: T.Tensor[(batch,), out_dtype],
         ends: T.Tensor[(batch,), out_dtype],
     ):
-        with T.Kernel(T.ceildiv(batch, 1), threads=BLOCK_SIZE) as (bx,):
-            tx = T.thread_idx()
+        with T.Kernel(batch, threads=BLOCK_SIZE) as (bx,):
+            tx = T.get_thread_binding()
             
             # 共享内存分配 - 增大缓存，优化padding
             s_histogram = T.alloc_shared([RADIX + 8], T.int32)  # +8 padding避免bank conflict
@@ -65,7 +65,15 @@ def tl_topk_radix_large_k_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
             s_cached_uint32 = T.alloc_shared([SMEM_INPUT_SIZE + 8], "uint32")  # +8 padding
             s_cached_indices = T.alloc_shared([SMEM_INPUT_SIZE + 8], T.int32)  # 缓存索引
             
+            # Local variables
             l_threshold_bin_id = T.alloc_var(T.int32)
+            l_new_topk = T.alloc_var(T.int32)
+            l_num_input = T.alloc_var(T.int32)
+            l_bin_id32 = T.alloc_var(T.int32)
+            l_val = T.alloc_var(T.int32)
+            l_start_idx = T.alloc_var(T.int32)
+            l_end_idx = T.alloc_var(T.int32)
+            pos = T.alloc_var(T.int32)
 
             l_start_idx = starts[bx]
             l_end_idx = ends[bx]
