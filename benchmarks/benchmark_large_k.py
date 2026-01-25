@@ -24,48 +24,64 @@ def benchmark_large_k(N=32768, k=2048, batch_size=64, num_runs=1000):
     # 准备数据
     x = torch.randn(batch_size, N, device=device, dtype=torch.float32)
     
-    # 预热 - 100次预热确保完全消除编译开销
-    print(f"预热中 (N={N}, k={k}, batch={batch_size})...")
-    for _ in range(100):
+    print(f"开始性能测试 (N={N}, k={k}, batch={batch_size})...")
+    print("使用独立预热避免版本间干扰")
+    
+    # ========== PyTorch baseline ==========
+    print("  测试 PyTorch baseline...", end=" ", flush=True)
+    for _ in range(50):
         _ = torch.topk(x, k, dim=-1)
-        _ = topk_radix_tilelang(x, k)
-        _ = topk_radix_optimized(x, k)
-        _ = topk_radix_large_k(x, k)
     torch.cuda.synchronize()
     
-    print("开始性能测试...")
-    
-    # Benchmark PyTorch
     torch.cuda.synchronize()
     start = time.perf_counter()
     for _ in range(num_runs):
         indices_pt = torch.topk(x, k, dim=-1).indices
     torch.cuda.synchronize()
     pytorch_time = (time.perf_counter() - start) / num_runs * 1000
+    print(f"{pytorch_time:.4f}ms")
     
-    # Benchmark Official TileLang
+    # ========== Official TileLang ==========
+    print("  测试 TileLang Official...", end=" ", flush=True)
+    for _ in range(50):
+        _ = topk_radix_tilelang(x, k)
+    torch.cuda.synchronize()
+    
     torch.cuda.synchronize()
     start = time.perf_counter()
     for _ in range(num_runs):
         indices_orig = topk_radix_tilelang(x, k)
     torch.cuda.synchronize()
     original_time = (time.perf_counter() - start) / num_runs * 1000
+    print(f"{original_time:.4f}ms")
     
-    # Benchmark Optimized (general)
+    # ========== Optimized (general) ==========
+    print("  测试 TileLang Optimized...", end=" ", flush=True)
+    for _ in range(50):
+        _ = topk_radix_optimized(x, k)
+    torch.cuda.synchronize()
+    
     torch.cuda.synchronize()
     start = time.perf_counter()
     for _ in range(num_runs):
         indices_opt = topk_radix_optimized(x, k)
     torch.cuda.synchronize()
     optimized_time = (time.perf_counter() - start) / num_runs * 1000
+    print(f"{optimized_time:.4f}ms")
     
-    # Benchmark Large-k Optimized
+    # ========== Large-k Optimized ==========
+    print("  测试 TileLang Large-k...", end=" ", flush=True)
+    for _ in range(50):
+        _ = topk_radix_large_k(x, k)
+    torch.cuda.synchronize()
+    
     torch.cuda.synchronize()
     start = time.perf_counter()
     for _ in range(num_runs):
         indices_large_k = topk_radix_large_k(x, k)
     torch.cuda.synchronize()
     large_k_time = (time.perf_counter() - start) / num_runs * 1000
+    print(f"{large_k_time:.4f}ms")
     
     # 验证正确性 - 使用更多样本
     orig_correct = True
