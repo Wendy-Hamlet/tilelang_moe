@@ -187,12 +187,14 @@ def tl_topk_radix_large_k_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
 
                 T.sync_threads()
 
-                # 累加直方图
-                offset = 1
-                for _ in T.serial(8):
-                    T.sync_threads()
-                    if tx < RADIX - offset:
-                        l_val = s_histogram[tx] + s_histogram[tx + offset]
+                # 累加直方图（并行前缀和）
+                if tx < RADIX:
+                    for i in T.serial(8):
+                        offset = 1 << i
+                        T.sync_threads(3, RADIX)
+                        if tx < RADIX - offset:
+                            l_val = s_histogram[tx] + s_histogram[tx + offset]
+                        T.sync_threads(3, RADIX)
                         if tx < RADIX - offset:
                             s_histogram[tx] = l_val
 
