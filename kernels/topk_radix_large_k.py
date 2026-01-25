@@ -3,10 +3,12 @@ TopK implementation optimized for large k scenarios (k > 512)
 专门针对 N=32768, k=2048 场景优化
 
 优化策略：
-1. 增大共享内存缓存 (SMEM_INPUT_SIZE: 4096 → 8192)
-2. 更大的BLOCK_SIZE (1024 → 2048) 提高并行度
-3. 优化bank conflict访问模式
-4. 针对大threshold bin的处理优化
+1. 使用H100的shared_memory_per_block_optin (232KB)
+2. 大幅增加缓存: SMEM_INPUT_SIZE = 12288 (约145KB)
+3. 优化内存访问模式减少bank conflict
+4. 针对大threshold bin优化处理流程
+
+注意：需要TileLang支持设置cudaFuncSetAttribute来启用大共享内存
 """
 
 import torch
@@ -42,8 +44,8 @@ def tl_topk_radix_large_k_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
     batch = T.dynamic("batch")
     seq_len = T.dynamic("seq_len")
     RADIX = 1 << 8  # 256 buckets
-    BLOCK_SIZE = 1024  # 保持1024（CUDA限制）
-    SMEM_INPUT_SIZE = 6144  # 6K缓存（平衡性能和共享内存限制）
+    BLOCK_SIZE = 1024  # CUDA标准限制
+    SMEM_INPUT_SIZE = 12288  # H100可以支持145KB (需要opt-in大共享内存)
 
     @T.prim_func
     def tl_topk_radix_large_k_kernel(
@@ -55,15 +57,15 @@ def tl_topk_radix_large_k_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
         with T.Kernel(batch, threads=BLOCK_SIZE) as (bx,):
             tx = T.get_thread_binding()
             
-            # 共享内存分配 - 优化padding，控制总量
+            # 共享内存分配 - H100大共享内存优化
             s_histogram = T.alloc_shared([RADIX + 1], T.int32)  # 1KB
             s_threshold_bin_id = T.alloc_shared([1], T.int32)
             s_num_input = T.alloc_shared([2], T.int32)
-            s_input_idx = T.alloc_shared([2, SMEM_INPUT_SIZE], T.int32)  # 49KB
+            s_input_idx = T.alloc_shared([2, SMEM_INPUT_SIZE], T.int32)  # 98KB
             
-            # 大k场景优化：只缓存uint32值（移除索引缓存以节省空间）
-            s_cached_uint32 = T.alloc_shared([SMEM_INPUT_SIZE + 1], "uint32")  # 24KB
-            # 总共约74KB，在限制范围内
+            # 大k场景优化：缓存uint32值（避免Stage 2重复转换）
+            s_cached_uint32 = T.alloc_shared([SMEM_INPUT_SIZE + 1], "uint32")  # 49KB
+            # 总共约148KB，需要H100的shared_memory_per_block_optin (232KB)
             
             # Local variables
             l_threshold_bin_id = T.alloc_var(T.int32)
@@ -95,14 +97,12 @@ def tl_topk_radix_large_k_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
                 if local_idx < smem_load_count:
                     global_idx = l_start_idx + local_idx
                     if global_idx < l_end_idx and global_idx < seq_len:
-                        # 一次性完成转换和缓存
+                        # 转换并缓存uint32值
                         val = input[bx, global_idx]
                         val_uint = convert_to_uint32(val)
                         
-                        # 缓存uint32值和索引 - 使用stride访问减少bank conflict
-                        cache_pos = local_idx
-                        s_cached_uint32[cache_pos] = val_uint
-                        s_cached_indices[cache_pos] = global_idx
+                        # 缓存uint32值（索引通过l_start_idx+local_idx计算）
+                        s_cached_uint32[local_idx] = val_uint
                         
                         # 构建直方图
                         bin_id = val_uint >> 24
@@ -136,7 +136,7 @@ def tl_topk_radix_large_k_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
                 if local_idx < smem_load_count:
                     # 从缓存读取，避免重复转换
                     cached_val = s_cached_uint32[local_idx]
-                    cached_idx = s_cached_indices[local_idx]
+                    global_idx = l_start_idx + local_idx  # 重新计算索引
                     
                     bin_id = cached_val >> 24
                     l_bin_id32 = T.Cast(T.int32, bin_id)
@@ -144,12 +144,12 @@ def tl_topk_radix_large_k_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
                     if l_bin_id32 > l_threshold_bin_id:
                         # 高于threshold - 直接输出
                         pos = T.atomic_add(s_histogram[l_bin_id32 + 1], 1, return_prev=True)
-                        index[bx, pos] = cached_idx
+                        index[bx, pos] = global_idx
                     elif l_bin_id32 == l_threshold_bin_id and l_new_topk > 0:
                         # 在threshold bin - 收集到下一阶段
                         pos = T.atomic_add(s_num_input[0], 1, return_prev=True)
                         if pos < SMEM_INPUT_SIZE:  # 防止溢出
-                            s_input_idx[0, pos] = cached_idx
+                            s_input_idx[0, pos] = global_idx
 
             # ========== Stage 2: Iterative Refinement ==========
             for round in T.serial(4):
