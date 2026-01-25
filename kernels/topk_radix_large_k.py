@@ -157,6 +157,8 @@ def tl_topk_radix_large_k_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
                         pos = T.atomic_add(s_num_input[0], 1, return_prev=True)
                         if pos < SMEM_INPUT_SIZE:  # 防止溢出
                             s_input_idx[0, pos] = input_idx
+                            # 关键：缓存uint32值供Stage 2使用
+                            s_cached_uint32[pos] = val_uint
 
             # ========== Stage 2: Iterative Refinement ==========
             for round in T.serial(4):
@@ -174,14 +176,14 @@ def tl_topk_radix_large_k_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
 
                 l_num_input = s_num_input[r_idx]
 
-                # 构建直方图 - 优化bank conflict
+                # 构建直方图 - 使用缓存的uint32值
                 for chunk in T.serial(T.ceildiv(l_num_input, BLOCK_SIZE)):
                     local_idx = chunk * BLOCK_SIZE + tx
                     if local_idx < l_num_input:
-                        input_idx = s_input_idx[r_idx, local_idx]
-                        if input_idx < seq_len:
-                            bin_id = convert_to_uint16(input[bx, input_idx])
-                            T.atomic_add(s_histogram[T.Cast(T.int32, bin_id)], 1)
+                        # 使用缓存的uint32值而不是重新计算
+                        cached_val = s_cached_uint32[local_idx]
+                        l_bin_id32 = T.Cast(T.int32, ((cached_val >> (24 - round * 8)) & 0xFF))
+                        T.atomic_add(s_histogram[l_bin_id32], 1)
 
                 T.sync_threads()
 
@@ -204,23 +206,31 @@ def tl_topk_radix_large_k_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
                 l_new_topk = l_new_topk - s_histogram[l_threshold_bin_id + 1]
                 T.sync_threads()
 
-                # 分区并输出
+                # 分区并输出 - 使用缓存的uint32值
                 for chunk in T.serial(T.ceildiv(l_num_input, BLOCK_SIZE)):
                     T.sync_threads()
                     local_idx = chunk * BLOCK_SIZE + tx
                     if local_idx < l_num_input:
-                        input_idx = s_input_idx[r_idx, local_idx]
-                        if input_idx < seq_len:
-                            bin_id = convert_to_uint16(input[bx, input_idx])
-                            l_bin_id32 = T.Cast(T.int32, bin_id)
-                            
-                            if l_bin_id32 > l_threshold_bin_id:
-                                pos = T.atomic_add(s_histogram[l_bin_id32 + 1], 1, return_prev=True)
-                                index[bx, l_start_pos + pos] = input_idx
-                            elif l_bin_id32 == l_threshold_bin_id and l_new_topk > 0:
+                        # 使用缓存的uint32值
+                        cached_val = s_cached_uint32[local_idx]
+                        l_bin_id32 = T.Cast(T.int32, ((cached_val >> (24 - round * 8)) & 0xFF))
+                        
+                        if l_bin_id32 > l_threshold_bin_id:
+                            pos = T.atomic_add(s_histogram[l_bin_id32 + 1], 1, return_prev=True)
+                            index[bx, l_start_pos + pos] = s_input_idx[r_idx, local_idx]
+                        elif l_bin_id32 == l_threshold_bin_id and l_new_topk > 0:
+                            if round == 3:
+                                # 最后一轮 - 直接输出
+                                l_out_pos = T.atomic_add(s_histogram[l_bin_id32 + 1], 1, return_prev=True) + l_start_pos
+                                if l_out_pos < topk:
+                                    index[bx, l_out_pos] = s_input_idx[r_idx, local_idx]
+                            else:
+                                # 继续下一轮
                                 pos = T.atomic_add(s_num_input[r_idx ^ 1], 1, return_prev=True)
                                 if pos < SMEM_INPUT_SIZE:
-                                    s_input_idx[r_idx ^ 1, pos] = input_idx
+                                    s_input_idx[r_idx ^ 1, pos] = s_input_idx[r_idx, local_idx]
+                                    # 传递缓存值到下一轮
+                                    s_cached_uint32[pos] = cached_val
 
     return tl_topk_radix_large_k_kernel
 

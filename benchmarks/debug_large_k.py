@@ -54,8 +54,12 @@ def debug_correctness():
     print(f"  前5个值: {values_large_k[0, :5].cpu().numpy()}")
     print(f"  最后5个索引: {indices_large_k[0, -5:].cpu().numpy()}")
     print(f"  最后5个值: {values_large_k[0, -5:].cpu().numpy()}")
-    print(f"  最大值: {values_large_k[0, 0].item():.6f if values_large_k.numel() > 0 else 'N/A'}")
-    print(f"  最小值: {values_large_k[0, -1].item():.6f if values_large_k.numel() > 0 else 'N/A'}")
+    if values_large_k.numel() > 0:
+        print(f"  最大值: {values_large_k[0, 0].item():.6f}")
+        print(f"  最小值: {values_large_k[0, -1].item():.6f}")
+    else:
+        print(f"  最大值: N/A")
+        print(f"  最小值: N/A")
     
     # 正确性检查
     print("\n" + "="*100)
