@@ -89,24 +89,21 @@ def tl_topk_radix_large_k_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
             T.sync_threads()
 
             # ========== Stage 1: 8-bit Radix Partition ==========
-            # 优化1: 合并数据加载和直方图构建，同时缓存uint32值
-            smem_load_count = T.min(SMEM_INPUT_SIZE, l_end_idx - l_start_idx)
-            
-            for chunk in T.serial(T.ceildiv(smem_load_count, BLOCK_SIZE)):
-                local_idx = chunk * BLOCK_SIZE + tx
-                if local_idx < smem_load_count:
-                    global_idx = l_start_idx + local_idx
-                    if global_idx < l_end_idx and global_idx < seq_len:
-                        # 转换并缓存uint32值
-                        val = input[bx, global_idx]
-                        val_uint = convert_to_uint32(val)
-                        
-                        # 缓存uint32值（索引通过l_start_idx+local_idx计算）
+            # Step 1: 构建直方图（遍历所有数据）
+            for s in T.serial(T.ceildiv(seq_len, BLOCK_SIZE)):
+                input_idx = s * BLOCK_SIZE + tx
+                if input_idx < l_end_idx and input_idx >= l_start_idx and input_idx < seq_len:
+                    val = input[bx, input_idx]
+                    val_uint = convert_to_uint32(val)
+                    
+                    # 如果在缓存范围内，缓存uint32值
+                    local_idx = input_idx - l_start_idx
+                    if local_idx < SMEM_INPUT_SIZE:
                         s_cached_uint32[local_idx] = val_uint
-                        
-                        # 构建直方图
-                        bin_id = val_uint >> 24
-                        T.atomic_add(s_histogram[bin_id], 1)
+                    
+                    # 构建直方图
+                    bin_id = val_uint >> 24
+                    T.atomic_add(s_histogram[bin_id], 1)
             
             T.sync_threads()
 
@@ -129,27 +126,31 @@ def tl_topk_radix_large_k_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
             l_new_topk = l_new_topk - s_histogram[l_threshold_bin_id + 1]
             T.sync_threads()
 
-            # 优化2: 使用缓存的数据，避免重复转换和内存访问
-            for chunk in T.serial(T.ceildiv(smem_load_count, BLOCK_SIZE)):
+            # Step 2: 收集高于threshold的元素（智能使用缓存）
+            for s in T.serial(T.ceildiv(seq_len, BLOCK_SIZE)):
                 T.sync_threads()
-                local_idx = chunk * BLOCK_SIZE + tx
-                if local_idx < smem_load_count:
-                    # 从缓存读取，避免重复转换
-                    cached_val = s_cached_uint32[local_idx]
-                    global_idx = l_start_idx + local_idx  # 重新计算索引
+                input_idx = s * BLOCK_SIZE + tx
+                if input_idx < l_end_idx and input_idx >= l_start_idx and input_idx < seq_len:
+                    local_idx = input_idx - l_start_idx
                     
-                    bin_id = cached_val >> 24
+                    # 优化：如果在缓存范围内，使用缓存；否则重新计算
+                    if local_idx < SMEM_INPUT_SIZE:
+                        val_uint = s_cached_uint32[local_idx]
+                    else:
+                        val_uint = convert_to_uint32(input[bx, input_idx])
+                    
+                    bin_id = val_uint >> 24
                     l_bin_id32 = T.Cast(T.int32, bin_id)
                     
                     if l_bin_id32 > l_threshold_bin_id:
                         # 高于threshold - 直接输出
                         pos = T.atomic_add(s_histogram[l_bin_id32 + 1], 1, return_prev=True)
-                        index[bx, pos] = global_idx
+                        index[bx, pos] = input_idx
                     elif l_bin_id32 == l_threshold_bin_id and l_new_topk > 0:
                         # 在threshold bin - 收集到下一阶段
                         pos = T.atomic_add(s_num_input[0], 1, return_prev=True)
                         if pos < SMEM_INPUT_SIZE:  # 防止溢出
-                            s_input_idx[0, pos] = global_idx
+                            s_input_idx[0, pos] = input_idx
 
             # ========== Stage 2: Iterative Refinement ==========
             for round in T.serial(4):
