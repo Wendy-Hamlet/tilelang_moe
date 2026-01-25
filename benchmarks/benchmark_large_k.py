@@ -17,6 +17,10 @@ def benchmark_large_k(N=32768, k=2048, batch_size=64, num_runs=1000):
     """专门测试大k场景 - 与benchmark_optimizations.py保持一致的参数"""
     device = torch.device('cuda')
     
+    # 固定随机种子确保结果可重复
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    
     # 准备数据
     x = torch.randn(batch_size, N, device=device, dtype=torch.float32)
     

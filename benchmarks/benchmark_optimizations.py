@@ -15,6 +15,10 @@ def benchmark_comparison(N, k, batch_size, num_runs=100):
     """对比四个实现的性能 - 每个版本独立预热和测试，避免相互干扰"""
     device = torch.device('cuda')
     
+    # 固定随机种子确保结果可重复
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    
     # 准备数据
     x = torch.randn(batch_size, N, device=device, dtype=torch.float32)
     
