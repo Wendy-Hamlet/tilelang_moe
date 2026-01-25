@@ -12,28 +12,18 @@ from kernels.topk_radix import topk_radix_tilelang
 from kernels.topk_radix_optimized import topk_radix_optimized
 
 def benchmark_comparison(N, k, batch_size, num_runs=100):
-    """对比四个实现的性能"""
+    """对比四个实现的性能 - 每个版本独立预热和测试，避免相互干扰"""
     device = torch.device('cuda')
     
     # 准备数据
     x = torch.randn(batch_size, N, device=device, dtype=torch.float32)
     
-    # 编译torch.topk
-    def topk_wrapper(x, k):
-        return torch.topk(x, k, dim=-1).indices
-    
-    topk_compiled = torch.compile(topk_wrapper, mode='max-autotune')
-    
-    # Warmup - 10次预热确保编译完成
-    print("  预热中...")
+    # ========== 1. PyTorch baseline - 独立测试 ==========
+    print("  测试 PyTorch baseline...")
     for _ in range(10):
         _ = torch.topk(x, k, dim=-1)
-        _ = topk_compiled(x, k)
-        _ = topk_radix_tilelang(x, k)
-        _ = topk_radix_optimized(x, k)
     torch.cuda.synchronize()
     
-    # Benchmark PyTorch
     torch.cuda.synchronize()
     start = time.perf_counter()
     for _ in range(num_runs):
@@ -41,7 +31,16 @@ def benchmark_comparison(N, k, batch_size, num_runs=100):
     torch.cuda.synchronize()
     pytorch_time = (time.perf_counter() - start) / num_runs * 1000
     
-    # Benchmark PyTorch Compiled
+    # ========== 2. PyTorch Compiled - 独立测试 ==========
+    print("  测试 PyTorch Compiled...")
+    def topk_wrapper(x, k):
+        return torch.topk(x, k, dim=-1).indices
+    topk_compiled = torch.compile(topk_wrapper, mode='max-autotune')
+    
+    for _ in range(10):
+        _ = topk_compiled(x, k)
+    torch.cuda.synchronize()
+    
     torch.cuda.synchronize()
     start = time.perf_counter()
     for _ in range(num_runs):
@@ -49,7 +48,12 @@ def benchmark_comparison(N, k, batch_size, num_runs=100):
     torch.cuda.synchronize()
     compiled_time = (time.perf_counter() - start) / num_runs * 1000
     
-    # Benchmark 官方 TileLang
+    # ========== 3. TileLang Official - 独立测试 ==========
+    print("  测试 TileLang Official...")
+    for _ in range(10):
+        _ = topk_radix_tilelang(x, k)
+    torch.cuda.synchronize()
+    
     torch.cuda.synchronize()
     start = time.perf_counter()
     for _ in range(num_runs):
@@ -57,7 +61,12 @@ def benchmark_comparison(N, k, batch_size, num_runs=100):
     torch.cuda.synchronize()
     original_time = (time.perf_counter() - start) / num_runs * 1000
     
-    # Benchmark 优化版 TileLang
+    # ========== 4. TileLang Optimized - 独立测试 ==========
+    print("  测试 TileLang Optimized...")
+    for _ in range(10):
+        _ = topk_radix_optimized(x, k)
+    torch.cuda.synchronize()
+    
     torch.cuda.synchronize()
     start = time.perf_counter()
     for _ in range(num_runs):
@@ -104,7 +113,7 @@ def main():
     print("  2. PyTorch Compiled (torch.compile with max-autotune)")
     print("  3. TileLang Official (官方Radix Selection)")
     print("  4. TileLang Optimized (缓存优化版)")
-    print("\n⚙️  测试配置: 预热10次 + 测试100次取平均")
+    print("\n⚙️  测试配置: 每个版本独立预热10次 + 测试100次取平均")
     print("="*120)
     
     test_cases = [
