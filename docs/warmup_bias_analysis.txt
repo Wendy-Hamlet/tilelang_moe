@@ -1,0 +1,104 @@
+================================================================================
+大k场景优化的真相：预热方式导致的测试偏差
+================================================================================
+
+【问题回顾】
+用户看到的benchmark_large_k.py结果（联合预热）：
+  PyTorch:          0.1773 ms  (1.00x)
+  TileLang Official: 0.0687 ms  (2.58x)  
+  TileLang Optimized: 0.0470 ms  (3.77x)  ← 比Official快46%！
+  TileLang Large-k:  0.0467 ms  (3.80x)
+
+这让人误以为Optimized版本在大k场景有巨大提升。
+
+【真相揭示】
+使用稳定性测试（独立预热）：
+  PyTorch:          0.1222 ms  (1.00x)
+  TileLang Official: 0.0491 ms  (2.49x)
+  TileLang Optimized: 0.0484 ms  (2.53x)  ← 只比Official快0.94%！
+  
+差异：0.1222 vs 0.1773 (PyTorch慢45%)
+     0.0687 vs 0.0491 (Official慢40%)
+     0.0470 vs 0.0484 (Optimized基本一致)
+
+【根本原因：预热方式】
+
+联合预热（benchmark_large_k.py原始版本）：
+```python
+for _ in range(100):
+    _ = torch.topk(x, k)           # 1. PyTorch
+    _ = topk_radix_tilelang(x, k)   # 2. Official
+    _ = topk_radix_optimized(x, k)  # 3. Optimized
+    _ = topk_radix_large_k(x, k)    # 4. Large-k
+# 然后测试Official
+# 然后测试Optimized
+```
+
+问题：
+  1. Official和Optimized在预热时交替运行
+  2. CUDA内核调度器、L2缓存、GPU频率都受到影响
+  3. 可能导致Official的缓存被Optimized污染
+  4. Official在后续测试中性能下降（0.0687ms vs 0.0491ms）
+
+独立预热（正确方式）：
+```python
+# 预热Official
+for _ in range(50):
+    _ = topk_radix_tilelang(x, k)
+# 测试Official
+...
+
+# 预热Optimized
+for _ in range(50):
+    _ = topk_radix_optimized(x, k)
+# 测试Optimized
+...
+```
+
+结果：
+  - Official达到最佳性能（0.0491ms）
+  - Optimized也达到最佳性能（0.0484ms）
+  - 两者基本持平（差0.94%，在波动范围内）
+
+【为什么Official受影响更大？】
+
+猜测1：内核复杂度
+  - Official的内核更简单，直接调用convert_to_uint32()
+  - Optimized有额外的缓存逻辑，可能对GPU调度器的影响更稳定
+  
+猜测2：L2缓存竞争
+  - 联合预热时，4个版本竞争L2缓存
+  - Official依赖顺序访问的缓存命中
+  - 缓存被其他版本驱逐后，Official性能下降
+
+猜测3：GPU频率动态调整
+  - 联合预热时GPU负载波动
+  - Official可能在较低频率下被测试
+
+【Large-k版本的现状】
+
+当前有correctness问题（0% overlap）
+  - Stage 1缓存逻辑有bug
+  - 只处理部分数据
+  
+即使修复后，预期性能：
+  - 与Optimized类似（因为都是缓存策略）
+  - 可能稍快（因为SMEM_INPUT_SIZE=12288更大）
+  - 但不会有显著改进（<5%）
+
+【结论】
+
+✅ 独立预热是唯一可信的测试方式
+✅ Optimized vs Official在大k场景：基本持平（±1%）
+✅ 之前看到的46%提升是测试方法造成的假象
+❌ 联合预热会系统性地降低Official的性能
+
+【建议】
+
+1. 所有benchmark使用独立预热
+2. Large-k版本即使修复，收益也很小（<5%）
+3. 不值得继续优化大k场景
+4. 保留Optimized用于小k场景（3-8%提升）
+5. 采用AutoTune自适应选择策略
+
+================================================================================
