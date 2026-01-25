@@ -79,6 +79,7 @@ def tl_topk_radix_large_k_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
             val_uint = T.alloc_var("uint32")  # 用于跨if-else作用域
             local_idx = T.alloc_var(T.int32)
             input_idx = T.alloc_var(T.int32)
+            offset = T.alloc_var(T.int32)  # 用于直方图累加
 
             l_start_idx = starts[bx]
             l_end_idx = ends[bx]
