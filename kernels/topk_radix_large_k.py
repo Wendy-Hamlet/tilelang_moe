@@ -42,8 +42,8 @@ def tl_topk_radix_large_k_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
     batch = T.dynamic("batch")
     seq_len = T.dynamic("seq_len")
     RADIX = 1 << 8  # 256 buckets
-    BLOCK_SIZE = 2048  # 增大block size以提高并行度
-    SMEM_INPUT_SIZE = 8192  # 增大缓存以适应大k场景
+    BLOCK_SIZE = 1024  # 保持1024（CUDA限制）
+    SMEM_INPUT_SIZE = 6144  # 6K缓存（平衡性能和共享内存限制）
 
     @T.prim_func
     def tl_topk_radix_large_k_kernel(
@@ -55,15 +55,15 @@ def tl_topk_radix_large_k_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
         with T.Kernel(batch, threads=BLOCK_SIZE) as (bx,):
             tx = T.get_thread_binding()
             
-            # 共享内存分配 - 增大缓存，优化padding
-            s_histogram = T.alloc_shared([RADIX + 8], T.int32)  # +8 padding避免bank conflict
+            # 共享内存分配 - 优化padding，控制总量
+            s_histogram = T.alloc_shared([RADIX + 1], T.int32)  # 1KB
             s_threshold_bin_id = T.alloc_shared([1], T.int32)
             s_num_input = T.alloc_shared([2], T.int32)
-            s_input_idx = T.alloc_shared([2, SMEM_INPUT_SIZE], T.int32)
+            s_input_idx = T.alloc_shared([2, SMEM_INPUT_SIZE], T.int32)  # 49KB
             
-            # 大k场景优化：缓存uint32值
-            s_cached_uint32 = T.alloc_shared([SMEM_INPUT_SIZE + 8], "uint32")  # +8 padding
-            s_cached_indices = T.alloc_shared([SMEM_INPUT_SIZE + 8], T.int32)  # 缓存索引
+            # 大k场景优化：只缓存uint32值（移除索引缓存以节省空间）
+            s_cached_uint32 = T.alloc_shared([SMEM_INPUT_SIZE + 1], "uint32")  # 24KB
+            # 总共约74KB，在限制范围内
             
             # Local variables
             l_threshold_bin_id = T.alloc_var(T.int32)
