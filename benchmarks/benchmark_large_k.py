@@ -13,16 +13,16 @@ from kernels.topk_radix import topk_radix_tilelang
 from kernels.topk_radix_optimized import topk_radix_optimized
 from kernels.topk_radix_large_k import topk_radix_large_k
 
-def benchmark_large_k(N=32768, k=2048, batch_size=64, num_runs=100):
-    """专门测试大k场景"""
+def benchmark_large_k(N=32768, k=2048, batch_size=64, num_runs=1000):
+    """专门测试大k场景 - 与benchmark_optimizations.py保持一致的参数"""
     device = torch.device('cuda')
     
     # 准备数据
     x = torch.randn(batch_size, N, device=device, dtype=torch.float32)
     
-    # 预热
+    # 预热 - 100次预热确保完全消除编译开销
     print(f"预热中 (N={N}, k={k}, batch={batch_size})...")
-    for _ in range(10):
+    for _ in range(100):
         _ = torch.topk(x, k, dim=-1)
         _ = topk_radix_tilelang(x, k)
         _ = topk_radix_optimized(x, k)
@@ -63,21 +63,31 @@ def benchmark_large_k(N=32768, k=2048, batch_size=64, num_runs=100):
     torch.cuda.synchronize()
     large_k_time = (time.perf_counter() - start) / num_runs * 1000
     
-    # 验证正确性
+    # 验证正确性 - 使用更多样本
     orig_correct = True
     opt_correct = True
     large_k_correct = True
     
-    for i in range(min(2, batch_size)):
+    check_samples = min(5, batch_size)  # 检查5个样本
+    for i in range(check_samples):
         ref_set = set(indices_pt[i].cpu().to(torch.int32).numpy())
         orig_set = set(indices_orig[i].cpu().numpy())
         opt_set = set(indices_opt[i].cpu().numpy())
         large_k_set = set(indices_large_k[i].cpu().numpy())
         
-        if len(ref_set & orig_set) < len(ref_set) * 0.95:
+        overlap_orig = len(ref_set & orig_set)
+        overlap_opt = len(ref_set & opt_set)
+        overlap_large_k = len(ref_set & large_k_set)
+        
+        if overlap_orig < len(ref_set) * 0.95:
             orig_correct = False
-        if len(ref_set & opt_set) < len(ref_set) * 0.95:
+            print(f"  ⚠️  Official样本{i}重叠度: {overlap_orig}/{len(ref_set)} = {overlap_orig/len(ref_set)*100:.1f}%")
+        if overlap_opt < len(ref_set) * 0.95:
             opt_correct = False
+            print(f"  ⚠️  Optimized样本{i}重叠度: {overlap_opt}/{len(ref_set)} = {overlap_opt/len(ref_set)*100:.1f}%")
+        if overlap_large_k < len(ref_set) * 0.95:
+            large_k_correct = False
+            print(f"  ⚠️  Large-k样本{i}重叠度: {overlap_large_k}/{len(ref_set)} = {overlap_large_k/len(ref_set)*100:.1f}%")
         if len(ref_set & large_k_set) < len(ref_set) * 0.95:
             large_k_correct = False
     
@@ -105,9 +115,10 @@ def main():
     print("  - SMEM_INPUT_SIZE: 12288 (利用H100的232KB opt-in共享内存)")
     print("  - 缓存uint32值 (避免Stage 2重复float→uint32转换)")
     print("  - 共享内存使用: 约148KB (需要H100大共享内存支持)")
+    print("\n⚙️  测试配置: 预热100次 + 测试1000次取平均 (与benchmark_optimizations.py一致)")
     print("="*120)
     
-    result = benchmark_large_k(N=32768, k=2048, batch_size=64, num_runs=100)
+    result = benchmark_large_k(N=32768, k=2048, batch_size=64, num_runs=1000)
     
     print(f"\n{'版本':<30} {'时间(ms)':<12} {'加速比':<10} {'正确性'}")
     print("-"*120)
