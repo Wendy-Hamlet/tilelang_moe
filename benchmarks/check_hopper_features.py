@@ -11,11 +11,25 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import torch
-from tvm.target import Target
-import tilelang
-from tilelang.contrib.nvcc import have_tma, is_hopper, have_pdl
-from tilelang.utils.target import target_is_hopper
+# 添加TileLang路径
+tilelang_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "third_party", "tilelang")
+if os.path.exists(tilelang_path):
+    sys.path.insert(0, tilelang_path)
+
+try:
+    import torch
+    import tilelang
+    from tvm.target import Target
+    from tilelang.contrib.nvcc import have_tma, is_hopper, have_pdl
+    from tilelang.utils.target import target_is_hopper
+except ImportError as e:
+    print(f"❌ 导入失败: {e}")
+    print("\n请确保已安装所需依赖:")
+    print("  • TileLang (在 third_party/tilelang)")
+    print("  • TVM (TileLang的依赖)")
+    print("  • PyTorch")
+    print("\n提示: 可能需要先构建/安装TileLang")
+    sys.exit(1)
 
 
 def check_hopper_support():
