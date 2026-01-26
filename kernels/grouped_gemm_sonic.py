@@ -88,7 +88,9 @@ def grouped_gemm_sonic_kernel(
                     k_idx = k * block_K + i
                     n_idx = by * block_N + j
                     if k_idx < H and n_idx < I:
-                        w_val = W[0, n_idx, k_idx]  # 默认值
+                        # 在if内部、for循环外部声明可变变量
+                        w_val = T.alloc_var(dtype=dtype)
+                        w_val = W[0, n_idx, k_idx]  # 初始化为expert 0的权重
                         for e in range(E):
                             w_val = T.if_then_else(expert_id_local[0] == e, W[e, n_idx, k_idx], w_val)
                         W_shared[i, j] = w_val
