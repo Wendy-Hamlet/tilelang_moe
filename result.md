@@ -13,21 +13,23 @@ Config: B128_H512_I384_E8 - Small Test
 Expert distribution: min=3, max=52, mean=16.0
 
 [1] Correctness Verification:
-❌ Error in ours (sonic): 'BufferLoad' object does not support item assignment
+2026-01-26 21:39:31  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `grouped_gemm_sonic` with `out_idx=[-1]`
+[INFO] IR saved to grouped_gemm_sonic.ir
+2026-01-26 21:39:35  [TileLang:tilelang.jit.kernel:INFO]: TileLang completes to compile kernel `grouped_gemm_sonic`
   ✅ pytorch-loop             : max_diff = 0.000000
   ✅ pytorch-compiled         : max_diff = 0.000000
   ✅ tilelang-separate        : max_diff = 0.000000
-  ❌ ours (sonic)             : max_diff = inf
+  ❌ ours (sonic)             : max_diff = 126.500000
 
 ⚠️  Warning: Some versions have correctness issues!
 Continuing with benchmark, but results may be invalid.
 
 
 [2] Performance Benchmark (warmup=50, rep=500):
-  pytorch-loop             :   1.1222 ms
-  pytorch-compiled         :   1.2919 ms
-  tilelang-separate        :   1.5196 ms
-  ours (sonic)             : FAILED ('BufferLoad' object does not support item assignment)
+  pytorch-loop             :   1.4457 ms
+  pytorch-compiled         :   1.4588 ms
+  tilelang-separate        :   1.3146 ms
+  ours (sonic)             :   0.2246 ms
 
 ================================================================================
 Config: B256_H1024_I768_E16 - Medium Test
@@ -36,21 +38,23 @@ Config: B256_H1024_I768_E16 - Medium Test
 Expert distribution: min=3, max=73, mean=16.0
 
 [1] Correctness Verification:
-❌ Error in ours (sonic): 'BufferLoad' object does not support item assignment
+2026-01-26 21:39:39  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `grouped_gemm_sonic` with `out_idx=[3]`
+[INFO] IR saved to grouped_gemm_sonic.ir
+2026-01-26 21:39:43  [TileLang:tilelang.jit.kernel:INFO]: TileLang completes to compile kernel `grouped_gemm_sonic`
   ✅ pytorch-loop             : max_diff = 0.000000
   ✅ pytorch-compiled         : max_diff = 0.000000
   ✅ tilelang-separate        : max_diff = 0.000000
-  ❌ ours (sonic)             : max_diff = inf
+  ❌ ours (sonic)             : max_diff = 190.250000
 
 ⚠️  Warning: Some versions have correctness issues!
 Continuing with benchmark, but results may be invalid.
 
 
 [2] Performance Benchmark (warmup=50, rep=500):
-  pytorch-loop             :   2.6410 ms
-  pytorch-compiled         :   2.3400 ms
-  tilelang-separate        :   3.0599 ms
-  ours (sonic)             : FAILED ('BufferLoad' object does not support item assignment)
+  pytorch-loop             :   2.6673 ms
+  pytorch-compiled         :   2.6774 ms
+  tilelang-separate        :   2.0449 ms
+  ours (sonic)             :   0.2366 ms
 
 ================================================================================
 Config: B512_H2048_I1536_E32 - DeepSeek-V2-like
@@ -59,21 +63,23 @@ Config: B512_H2048_I1536_E32 - DeepSeek-V2-like
 Expert distribution: min=1, max=127, mean=16.0
 
 [1] Correctness Verification:
-❌ Error in ours (sonic): 'BufferLoad' object does not support item assignment
+2026-01-26 21:39:46  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `grouped_gemm_sonic` with `out_idx=[3]`
+[INFO] IR saved to grouped_gemm_sonic.ir
+2026-01-26 21:39:51  [TileLang:tilelang.jit.kernel:INFO]: TileLang completes to compile kernel `grouped_gemm_sonic`
   ✅ pytorch-loop             : max_diff = 0.000000
   ✅ pytorch-compiled         : max_diff = 0.000000
   ✅ tilelang-separate        : max_diff = 0.000000
-  ❌ ours (sonic)             : max_diff = inf
+  ❌ ours (sonic)             : max_diff = 290.500000
 
 ⚠️  Warning: Some versions have correctness issues!
 Continuing with benchmark, but results may be invalid.
 
 
 [2] Performance Benchmark (warmup=50, rep=500):
-  pytorch-loop             :   5.2651 ms
-  pytorch-compiled         :   5.2954 ms
-  tilelang-separate        :   8.8585 ms
-  ours (sonic)             : FAILED ('BufferLoad' object does not support item assignment)
+  pytorch-loop             :   5.3321 ms
+  pytorch-compiled         :   5.3325 ms
+  tilelang-separate        :   6.4534 ms
+  ours (sonic)             :   0.3162 ms
 
 ================================================================================
 Config: B1024_H4096_I3072_E64 - DeepSeek-V3-like (scaled)
@@ -82,35 +88,37 @@ Config: B1024_H4096_I3072_E64 - DeepSeek-V3-like (scaled)
 Expert distribution: min=0, max=208, mean=16.0
 
 [1] Correctness Verification:
-❌ Error in ours (sonic): 'BufferLoad' object does not support item assignment
+2026-01-26 21:39:54  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `grouped_gemm_sonic` with `out_idx=[3]`
+[INFO] IR saved to grouped_gemm_sonic.ir
+2026-01-26 21:40:00  [TileLang:tilelang.jit.kernel:INFO]: TileLang completes to compile kernel `grouped_gemm_sonic`
   ✅ pytorch-loop             : max_diff = 0.000000
   ✅ pytorch-compiled         : max_diff = 0.000000
   ❌ tilelang-separate        : max_diff = 0.250000
-  ❌ ours (sonic)             : max_diff = inf
+  ❌ ours (sonic)             : max_diff = 419.000000
 
 ⚠️  Warning: Some versions have correctness issues!
 Continuing with benchmark, but results may be invalid.
 
 
 [2] Performance Benchmark (warmup=50, rep=500):
-  pytorch-loop             :  10.8073 ms
-  pytorch-compiled         :  12.4619 ms
-  tilelang-separate        :  17.8758 ms
-  ours (sonic)             : FAILED ('BufferLoad' object does not support item assignment)
+  pytorch-loop             :  10.8541 ms
+  pytorch-compiled         :  11.8871 ms
+  tilelang-separate        :  15.0598 ms
+  ours (sonic)             :   0.5463 ms
 
 ================================================================================
 SUMMARY: Latency Comparison (ms)
 ================================================================================
 +-----------------------+-----------+------------+----------------+----------------+
-| Config                |   PyTorch |   Compiled |   TileLang-Sep | Ours (Sonic)   |
+| Config                |   PyTorch |   Compiled |   TileLang-Sep |   Ours (Sonic) |
 +=======================+===========+============+================+================+
-| B128_H512_I384_E8     |    1.1222 |     1.2919 |         1.5196 | FAILED         |
+| B128_H512_I384_E8     |    1.4457 |     1.4588 |         1.3146 |         0.2246 |
 +-----------------------+-----------+------------+----------------+----------------+
-| B256_H1024_I768_E16   |    2.641  |     2.34   |         3.0599 | FAILED         |
+| B256_H1024_I768_E16   |    2.6673 |     2.6774 |         2.0449 |         0.2366 |
 +-----------------------+-----------+------------+----------------+----------------+
-| B512_H2048_I1536_E32  |    5.2651 |     5.2954 |         8.8585 | FAILED         |
+| B512_H2048_I1536_E32  |    5.3321 |     5.3325 |         6.4534 |         0.3162 |
 +-----------------------+-----------+------------+----------------+----------------+
-| B1024_H4096_I3072_E64 |   10.8073 |    12.4619 |        17.8758 | FAILED         |
+| B1024_H4096_I3072_E64 |   10.8541 |    11.8871 |        15.0598 |         0.5463 |
 +-----------------------+-----------+------------+----------------+----------------+
 
 ================================================================================
@@ -119,17 +127,18 @@ SUMMARY: Speedup vs PyTorch Baseline
 +-----------------------+------------+----------------+----------------+
 | Config                | Compiled   | TileLang-Sep   | Ours (Sonic)   |
 +=======================+============+================+================+
-| B128_H512_I384_E8     | 0.87x      | 0.74x          | N/A            |
+| B128_H512_I384_E8     | 0.99x      | 1.10x          | 6.44x          |
 +-----------------------+------------+----------------+----------------+
-| B256_H1024_I768_E16   | 1.13x      | 0.86x          | N/A            |
+| B256_H1024_I768_E16   | 1.00x      | 1.30x          | 11.27x         |
 +-----------------------+------------+----------------+----------------+
-| B512_H2048_I1536_E32  | 0.99x      | 0.59x          | N/A            |
+| B512_H2048_I1536_E32  | 1.00x      | 0.83x          | 16.86x         |
 +-----------------------+------------+----------------+----------------+
-| B1024_H4096_I3072_E64 | 0.87x      | 0.60x          | N/A            |
+| B1024_H4096_I3072_E64 | 0.91x      | 0.72x          | 19.87x         |
 +-----------------------+------------+----------------+----------------+
 
 ================================================================================
 Average Speedup:
 ================================================================================
-  pytorch-compiled         : 0.96x
-  tilelang-separate        : 0.70x
+  pytorch-compiled         : 0.98x
+  tilelang-separate        : 0.99x
+  ours (sonic)             : 13.61x

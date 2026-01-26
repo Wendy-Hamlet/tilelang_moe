@@ -52,63 +52,69 @@ def grouped_gemm_sonic_kernel(
         expert_offsets: T.Tensor((E + 1,), T.int32),     # Expert累计offset
         Y: T.Tensor((total_tokens, I), dtype),           # 输出
     ):
-        # 注意：这是简化版本，真正的Sonic使用复杂的dynamic scheduler
-        # 这里我们为每个expert分配足够的blocks
-        # 计算总block数：每个expert的tokens向上取整到block_M
-        total_blocks = T.ceildiv(total_tokens, block_M)
+        # Sonic算法：为每个expert分配blocks（而不是按token position）
+        # 这样确保每个block只处理单个expert的tokens
+        # 总block数 = sum(ceildiv(expert_tokens[i], block_M) for i in range(E))
         
-        with T.Kernel(total_blocks, 1, threads=128) as (block_id, _):
-            # Shared memory buffers
-            X_shared = T.alloc_shared((block_M, block_K), dtype)
-            W_shared = T.alloc_shared((block_N, block_K), dtype)
-            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+        # 计算总block数（在host端预计算更好，这里简化为按token分配）
+        # 每个expert的tokens已经是连续的（因为X已排序）
+        # 我们按expert遍历，每个expert分配若干blocks
+        
+        # 简化版：先按总tokens分配blocks，然后在kernel内跳过跨expert的blocks
+        # 为每个expert单独处理
+        for expert_id in T.serial(E):
+            expert_start = expert_offsets[expert_id]
+            expert_end = expert_offsets[expert_id + 1]
+            expert_tokens = expert_end - expert_start
             
-            # 找到当前block应该处理哪个expert
-            # 由于X已按expert排序，我们可以直接计算全局token位置
-            global_token_start = block_id * block_M
-            global_token_end = T.min(global_token_start + block_M, total_tokens)
-            num_tokens = global_token_end - global_token_start
-            
-            # 找到这些tokens对应的expert (通过expert_offsets查找)
-            expert_id = T.alloc_var(T.int32)
-            expert_id = T.int32(0)
-            
-            if num_tokens > 0:
-                for e in range(E):
-                    if global_token_start >= expert_offsets[e] and global_token_start < expert_offsets[e + 1]:
-                        expert_id = T.int32(e)
-                        break
+            if expert_tokens > 0:
+                # 为当前expert分配blocks
+                expert_blocks = T.ceildiv(expert_tokens, block_M)
                 
-                # 清空累加器
-                T.clear(C_local)
-                
-                # K维度分块
-                for k in T.Pipelined(T.ceildiv(H, block_K), num_stages=2):
-                    # Load X[global_token_start:global_token_end, k*block_K:(k+1)*block_K] → X_shared
-                    for i, j in T.Parallel(block_M, block_K):
+                with T.Kernel(expert_blocks, 1, threads=128) as (block_idx, _):
+                    # Shared memory buffers
+                    X_shared = T.alloc_shared((block_M, block_K), dtype)
+                    W_shared = T.alloc_shared((block_N, block_K), dtype)
+                    C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+                    
+                    # 计算当前block在当前expert内的token范围
+                    local_token_start = block_idx * block_M
+                    local_token_end = T.min(local_token_start + block_M, expert_tokens)
+                    num_tokens = local_token_end - local_token_start
+                    
+                    # 全局token位置
+                    global_token_start = expert_start + local_token_start
+                    
+                    # 清空累加器
+                    T.clear(C_local)
+                    
+                    # K维度分块
+                    for k in T.Pipelined(T.ceildiv(H, block_K), num_stages=2):
+                        # Load X[global_token_start:global_token_start+block_M, k*block_K:(k+1)*block_K] → X_shared
+                        for i, j in T.Parallel(block_M, block_K):
+                            token_idx = global_token_start + i
+                            k_idx = k * block_K + j
+                            if i < num_tokens and k_idx < H and token_idx < total_tokens:
+                                X_shared[i, j] = X[token_idx, k_idx]
+                            else:
+                                X_shared[i, j] = T.cast(0.0, dtype)
+                        
+                        # Load W[expert_id, :, k*block_K:(k+1)*block_K] → W_shared
+                        for i, j in T.Parallel(block_N, block_K):
+                            k_idx = k * block_K + j
+                            if i < I and k_idx < H:
+                                W_shared[i, j] = W[expert_id, i, k_idx]
+                            else:
+                                W_shared[i, j] = T.cast(0.0, dtype)
+                        
+                        # GEMM: C_local += X_shared @ W_shared^T
+                        T.gemm(X_shared, W_shared, C_local, transpose_B=True)
+                    
+                    # Store结果
+                    for i, j in T.Parallel(block_M, block_N):
                         token_idx = global_token_start + i
-                        k_idx = k * block_K + j
-                        if i < num_tokens and k_idx < H and token_idx < total_tokens:
-                            X_shared[i, j] = X[token_idx, k_idx]
-                        else:
-                            X_shared[i, j] = T.cast(0.0, dtype)
-                    
-                    # Load W[expert_id, :, k*block_K:(k+1)*block_K] → W_shared
-                    for i, j in T.Parallel(block_N, block_K):
-                        k_idx = k * block_K + j
-                        if i < I and k_idx < H:
-                            W_shared[i, j] = W[expert_id, i, k_idx]
-                        else:
-                            W_shared[i, j] = T.cast(0.0, dtype)
-                    
-                    # GEMM: C_local += X_shared @ W_shared^T
-                    T.gemm(X_shared, W_shared, C_local, transpose_B=True)
-                
-                # Store结果
-                for i, j in T.Parallel(block_M, block_N):
-                    token_idx = global_token_start + i
-                    if i < num_tokens and j < I and token_idx < total_tokens:
-                        Y[token_idx, j] = T.cast(C_local[i, j], dtype)
+                        if i < num_tokens and j < I and token_idx < total_tokens:
+                            Y[token_idx, j] = T.cast(C_local[i, j], dtype)
     
     return grouped_gemm_sonic
 
