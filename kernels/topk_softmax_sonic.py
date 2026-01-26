@@ -83,6 +83,8 @@ def topk_softmax_sonic(
             # 逐个找top-k
             for k_iter in T.serial(top_k):
                 # 每个线程找自己负责范围内的最大值
+                thread_max_val = T.alloc_var(T.float32)
+                thread_max_idx = T.alloc_var(T.int32)
                 thread_max_val = T.float32(-1e38)
                 thread_max_idx = T.int32(-1)
                 
@@ -92,6 +94,7 @@ def topk_softmax_sonic(
                         val = logits[bx, idx]
                         
                         # 检查这个值是否已经在topk中
+                        already_selected = T.alloc_var(T.bool)
                         already_selected = T.bool(False)
                         for j in T.serial(k_iter):
                             if s_topk_idx[j] == idx:
