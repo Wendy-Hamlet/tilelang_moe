@@ -9,6 +9,7 @@ Grouped GEMM Sonic-style Fused Implementation
 Note: 这是简化版实现，展示核心思想，但未使用Hopper TMA等高级特性
 """
 
+import os
 import torch
 import tilelang
 import tilelang.language as T
@@ -53,6 +54,7 @@ def grouped_gemm_sonic_kernel(
         expert_offsets: T.Tensor((E + 1,), T.int32),     # Expert累计offset (token级别)
         block_offsets: T.Tensor((E + 1,), T.int32),      # Expert累计offset (block级别)
         Y: T.Tensor((total_tokens, I), dtype),           # 输出
+        debug_info: T.Tensor((total_blocks, 4), T.int32), # Debug: [expert_id, m_start, actual_rows, local_block_id]
     ):
         # Sonic算法：tokens已按expert排序，每个expert分配若干blocks
         # 参考官方grouped_gemm，使用T.if_then_else查找expert
@@ -87,6 +89,13 @@ def grouped_gemm_sonic_kernel(
             m_start = expert_start + local_block_id * block_M
             remaining_tokens = expert_tokens - local_block_id * block_M
             actual_rows = T.min(block_M, remaining_tokens)
+            
+            # Debug: 记录每个block的信息（只在by=0时写入避免重复）
+            if by == 0:
+                debug_info[bx, 0] = expert_id
+                debug_info[bx, 1] = m_start
+                debug_info[bx, 2] = actual_rows
+                debug_info[bx, 3] = local_block_id
             
             # GEMM计算
             T.clear(C_local)
@@ -211,8 +220,22 @@ def grouped_gemm_sonic(
     expert_offsets_int32 = expert_offsets.to(torch.int32)
     block_offsets_int32 = block_offsets.to(torch.int32)
     
+    # Debug tensor
+    debug_info = torch.zeros((total_blocks_value, 4), dtype=torch.int32, device=device)
+    
     # 执行kernel（jit会自动返回输出）
-    Y_sorted = kernel(X_sorted, W, expert_offsets_int32, block_offsets_int32)
+    Y_sorted = kernel(X_sorted, W, expert_offsets_int32, block_offsets_int32, debug_info)
+    
+    # Print debug info
+    if os.environ.get('DEBUG_SONIC', '0') == '1':
+        print("\n[DEBUG] Sonic kernel execution:")
+        print(f"  total_blocks: {total_blocks_value}")
+        for bx in range(total_blocks_value):
+            expert_id = debug_info[bx, 0].item()
+            m_start = debug_info[bx, 1].item()
+            actual_rows = debug_info[bx, 2].item()
+            local_block_id = debug_info[bx, 3].item()
+            print(f"  Block {bx}: expert={expert_id}, m_start={m_start}, actual_rows={actual_rows}, local_block={local_block_id}")
     
     # Scatter: 恢复原顺序
     Y = torch.zeros_like(Y_sorted)
