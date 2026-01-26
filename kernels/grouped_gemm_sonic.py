@@ -68,10 +68,9 @@ def grouped_gemm_sonic_kernel(
             # block_offsets[e] 是expert e的第一个block ID  
             # 需要找到满足 block_offsets[e] <= bx < block_offsets[e+1] 的e
             expert_id = T.alloc_var(dtype=T.int32)
-            expert_id = T.int32(0)
             
-            # 正向遍历，持续更新直到不满足条件（参考官方实现）
-            # 注意：直接使用i而非T.int32(i)
+            # 参考官方实现，不显式初始化，让T.if_then_else处理
+            # 正向遍历，持续更新直到不满足条件
             for e in range(E):
                 in_cur_expert = bx >= block_offsets[e]
                 expert_id = T.if_then_else(in_cur_expert, e, expert_id)
