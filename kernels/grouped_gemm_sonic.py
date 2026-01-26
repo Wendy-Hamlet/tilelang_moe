@@ -105,11 +105,17 @@ def grouped_gemm_sonic_kernel(
                 
                 # 加载W转置: W[expert_id, by*block_N:(by+1)*block_N, k*block_K:(k+1)*block_K] -> W_shared[block_K, block_N]
                 # 注意：W是[E, I, H]，我们需要[H, I]的转置 -> [block_K, block_N]
+                # 由于TileLang不支持用变量索引tensor，需要用if_then_else逐个处理
                 for i, j in T.Parallel(block_K, block_N):
                     k_idx = k * block_K + i
                     n_idx = by * block_N + j
                     if k_idx < H and n_idx < I:
-                        W_shared[i, j] = W[expert_id, n_idx, k_idx]
+                        # 根据expert_id选择权重
+                        w_val = T.alloc_var(dtype=dtype)
+                        for e in range(E):
+                            is_expert = expert_id == e
+                            w_val = T.if_then_else(is_expert, W[e, n_idx, k_idx], w_val)
+                        W_shared[i, j] = w_val
                     else:
                         W_shared[i, j] = T.cast(0.0, dtype)
                 
