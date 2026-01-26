@@ -157,18 +157,19 @@ def main():
     print("\n计时: CUDA Events，50 warmup + 1000 runs 平均")
     print("=" * 100)
     
-    # 测试场景
+    # 测试场景 (batch_size, num_experts, top_k)
     test_configs = [
-        (64, 160, 6, "DeepSeek-V2"),
-        (64, 256, 8, "DeepSeek-V3"),
-        (128, 512, 16, "Large-512x16"),
-        (64, 1024, 8, "N1024-K8"),
-        (64, 2048, 16, "N2048-K16"),
+        (64, 160, 6),
+        (64, 256, 8),
+        (128, 512, 16),
+        (64, 1024, 8),
+        (64, 2048, 16),
     ]
     
     all_results = {}
     
-    for batch_size, num_experts, top_k, config_name in test_configs:
+    for batch_size, num_experts, top_k in test_configs:
+        config_name = f"B{batch_size}_E{num_experts}_K{top_k}"
         try:
             results = benchmark_config(batch_size, num_experts, top_k, config_name)
             all_results[config_name] = results
