@@ -7,7 +7,7 @@ import os
 os.environ['DEBUG_SONIC'] = '1'
 
 import torch
-from kernels.grouped_gemm_baseline import grouped_gemm_baseline_loop
+from kernels.grouped_gemm_baseline import grouped_gemm_loop
 from kernels.grouped_gemm_sonic import grouped_gemm_sonic
 
 def test_weight_loading():
@@ -50,7 +50,7 @@ def test_weight_loading():
     print("  Token 3 (expert 3): X @ W[3]^T = 1*4*8 = 32.0")
     
     # Baseline
-    Y_baseline = grouped_gemm_baseline_loop(X, W, expert_indices)
+    Y_baseline = grouped_gemm_loop(X, W, expert_indices)
     print("\nBaseline results:")
     for i in range(total_tokens):
         print(f"  Token {i} (expert {expert_indices[i].item()}): {Y_baseline[i, 0].item():.1f}")
