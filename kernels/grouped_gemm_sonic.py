@@ -65,13 +65,14 @@ def grouped_gemm_sonic_kernel(
             C_local = T.alloc_fragment([block_M, block_N], accum_dtype)
             
             # 找到当前block属于哪个expert
-            # block_offsets[e] 是expert e的第一个block ID
-            # 需要找到最大的e使得 block_offsets[e] <= bx
+            # block_offsets[e] 是expert e的第一个block ID  
+            # 需要找到满足 block_offsets[e] <= bx < block_offsets[e+1] 的e
             expert_id = T.alloc_var(dtype=T.int32)
             expert_id = T.int32(0)
             
-            # 从后向前遍历，找到第一个（最大的）满足 bx >= block_offsets[e] 的e
-            for e in range(E - 1, -1, -1):
+            # 正向遍历，持续更新直到不满足条件
+            # 最终expert_id是最大的满足 bx >= block_offsets[e] 的e
+            for e in range(E):
                 in_cur_expert = bx >= block_offsets[e]
                 expert_id = T.if_then_else(in_cur_expert, T.int32(e), expert_id)
             
@@ -85,7 +86,8 @@ def grouped_gemm_sonic_kernel(
             
             # 当前block处理的token范围
             m_start = expert_start + local_block_id * block_M
-            actual_rows = T.max(T.int32(0), T.min(block_M, expert_tokens - local_block_id * block_M))
+            remaining_tokens = expert_tokens - local_block_id * block_M
+            actual_rows = T.min(block_M, remaining_tokens)
             
             # GEMM计算
             T.clear(C_local)
