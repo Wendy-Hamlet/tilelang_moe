@@ -8,7 +8,6 @@ import os
 # Add project root to path
 project_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, project_root)
-sys.path.insert(0, os.path.join(project_root, 'third_party', 'tilelang'))
 
 from kernels.grouped_gemm_baseline import grouped_gemm_loop
 from kernels.grouped_gemm_sonic import grouped_gemm_sonic
