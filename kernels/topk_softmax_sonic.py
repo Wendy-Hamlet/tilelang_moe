@@ -113,15 +113,16 @@ def topk_softmax_sonic(
                 s_thread_idx[tx] = thread_max_idx
                 T.sync_threads()
                 
-                # 树状规约
-                stride = block_size // 2
-                while stride > 0:
+                # 树状规约 - use serial loop instead of while
+                import math
+                num_reduction_steps = int(math.log2(block_size))
+                for step in T.serial(num_reduction_steps):
+                    stride = block_size >> (step + 1)  # block_size // 2, then // 4, etc.
                     if tx < stride:
                         if s_thread_vals[tx + stride] > s_thread_vals[tx]:
                             s_thread_vals[tx] = s_thread_vals[tx + stride]
                             s_thread_idx[tx] = s_thread_idx[tx + stride]
                     T.sync_threads()
-                    stride = stride // 2
                 
                 # 线程0写入结果
                 if tx == 0:
