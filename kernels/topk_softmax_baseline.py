@@ -76,10 +76,9 @@ def _topk_softmax_separate_impl(logits: torch.Tensor, k: int):
 
 
 # 在模块加载时一次性编译，后续调用自动复用缓存
+# 使用默认参数效果更好
 topk_softmax_separate_compiled = torch.compile(
     _topk_softmax_separate_impl,
-    mode='reduce-overhead',  # 针对小算子优化
-    fullgraph=False,  # 允许动态k参数，不强制单图
 )
 
 
