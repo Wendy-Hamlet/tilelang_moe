@@ -42,9 +42,8 @@ def benchmark_version(
     # Warmup
     for _ in range(num_warmup):
         if 'tilelang' in name.lower():
-            scores_out = torch.zeros(batch_size, k, device=device, dtype=torch.float32)
-            indices_out = torch.zeros(batch_size, k, device=device, dtype=torch.int32)
-            func(logits, scores_out, indices_out)
+            # TileLang kernel with out_idx returns outputs automatically
+            _ = func(logits)
         else:
             _ = func(logits, k, **kwargs)
     torch.cuda.synchronize()
@@ -55,9 +54,8 @@ def benchmark_version(
     
     for _ in range(num_runs):
         if 'tilelang' in name.lower():
-            scores_out = torch.zeros(batch_size, k, device=device, dtype=torch.float32)
-            indices_out = torch.zeros(batch_size, k, device=device, dtype=torch.int32)
-            func(logits, scores_out, indices_out)
+            # TileLang kernel with out_idx returns outputs automatically
+            scores_out, indices_out = func(logits)
         else:
             scores_out, indices_out = func(logits, k, **kwargs)
     
