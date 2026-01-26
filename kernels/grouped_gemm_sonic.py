@@ -53,76 +53,61 @@ def grouped_gemm_sonic_kernel(
         block_offsets: T.Tensor((E + 1,), T.int32),      # Expert累计offset (block级别)
         Y: T.Tensor((total_tokens, I), dtype),           # 输出
     ):
-        # Sonic核心思想：预先计算每个expert需要多少blocks
-        # block_offsets[i] = sum(ceildiv(expert_tokens[j], block_M) for j in range(i))
-        # 这样每个block可以通过block_id找到自己属于哪个expert
+        # Sonic算法：tokens已按expert排序，每个expert分配若干blocks
+        # 参考官方grouped_gemm，使用T.if_then_else查找expert
         
-        total_blocks = block_offsets[E]  # 最后一个元素是总block数
+        total_blocks = block_offsets[E]  # 总block数
         
-        with T.Kernel(total_blocks, 1, threads=128) as (block_id, _):
+        with T.Kernel(total_blocks, T.ceildiv(I, block_N), threads=128) as (bx, by):
             # Shared memory buffers
-            X_shared = T.alloc_shared((block_M, block_K), dtype)
-            W_shared = T.alloc_shared((block_N, block_K), dtype)
-            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+            X_shared = T.alloc_shared([block_M, block_K], dtype)
+            W_shared = T.alloc_shared([block_K, block_N], dtype)
+            C_local = T.alloc_fragment([block_M, block_N], accum_dtype)
             
-            # 找到当前block属于哪个expert
-            # 通过block_offsets二分查找
-            expert_id = T.alloc_var(T.int32)
+            # 找到当前block属于哪个expert（参考官方实现）
+            expert_id = T.alloc_var(dtype=T.int32)
             expert_id = T.int32(0)
-            local_block_id = T.alloc_var(T.int32)
-            local_block_id = T.int32(0)
             
-            # 线性扫描找expert (可优化为二分查找)
+            # 使用T.if_then_else逐个检查
             for e in range(E):
-                if block_id >= block_offsets[e] and block_id < block_offsets[e + 1]:
-                    expert_id = T.int32(e)
-                    local_block_id = block_id - block_offsets[e]
-                    break
+                in_cur_expert = bx >= block_offsets[e]
+                expert_id = T.if_then_else(in_cur_expert, T.int32(e), expert_id)
             
-            # 获取expert的token范围
+            # 计算当前block在expert内的局部位置
+            local_block_id = bx - block_offsets[expert_id]
+            
+            # Expert的token范围
             expert_start = expert_offsets[expert_id]
             expert_end = expert_offsets[expert_id + 1]
             expert_tokens = expert_end - expert_start
             
-            # 计算当前block在expert内的token范围
-            local_token_start = local_block_id * block_M
-            local_token_end = T.min(local_token_start + block_M, expert_tokens)
-            num_tokens = local_token_end - local_token_start
+            # 当前block处理的token范围
+            m_start = expert_start + local_block_id * block_M
+            actual_rows = T.max(T.int32(0), T.min(block_M, expert_tokens - local_block_id * block_M))
             
-            # 全局token位置
-            global_token_start = expert_start + local_token_start
+            # GEMM计算
+            T.clear(C_local)
+            for k in T.Pipelined(T.ceildiv(H, block_K), num_stages=2):
+                # 加载X: [block_M, block_K]
+                T.copy(X[m_start : m_start + block_M, k * block_K : (k + 1) * block_K], X_shared)
+                
+                # 加载W转置: W[expert_id, by*block_N:(by+1)*block_N, k*block_K:(k+1)*block_K] -> W_shared[block_K, block_N]
+                # 注意：W是[E, I, H]，我们需要[H, I]的转置 -> [block_K, block_N]
+                for i, j in T.Parallel(block_K, block_N):
+                    k_idx = k * block_K + i
+                    n_idx = by * block_N + j
+                    if k_idx < H and n_idx < I:
+                        W_shared[i, j] = W[expert_id, n_idx, k_idx]
+                    else:
+                        W_shared[i, j] = T.cast(0.0, dtype)
+                
+                # GEMM: C_local += X_shared @ W_shared (W_shared已经是转置的layout)
+                T.gemm(X_shared, W_shared, C_local)
             
-            if num_tokens > 0:
-                # 清空累加器
-                T.clear(C_local)
-                
-                # K维度分块
-                for k in T.Pipelined(T.ceildiv(H, block_K), num_stages=2):
-                    # Load X[global_token_start:global_token_start+block_M, k*block_K:(k+1)*block_K] → X_shared
-                    for i, j in T.Parallel(block_M, block_K):
-                        token_idx = global_token_start + i
-                        k_idx = k * block_K + j
-                        if i < num_tokens and k_idx < H and token_idx < total_tokens:
-                            X_shared[i, j] = X[token_idx, k_idx]
-                        else:
-                            X_shared[i, j] = T.cast(0.0, dtype)
-                    
-                    # Load W[expert_id, :, k*block_K:(k+1)*block_K] → W_shared
-                    for i, j in T.Parallel(block_N, block_K):
-                        k_idx = k * block_K + j
-                        if i < I and k_idx < H:
-                            W_shared[i, j] = W[expert_id, i, k_idx]
-                        else:
-                            W_shared[i, j] = T.cast(0.0, dtype)
-                    
-                    # GEMM: C_local += X_shared @ W_shared^T
-                    T.gemm(X_shared, W_shared, C_local, transpose_B=True)
-                
-                # Store结果
-                for i, j in T.Parallel(block_M, block_N):
-                    token_idx = global_token_start + i
-                    if i < num_tokens and j < I and token_idx < total_tokens:
-                        Y[token_idx, j] = T.cast(C_local[i, j], dtype)
+            # Store结果
+            for i, j in T.Parallel(block_M, block_N):
+                if i < actual_rows and by * block_N + j < I:
+                    Y[m_start + i, by * block_N + j] = T.cast(C_local[i, j], dtype)
     
     return grouped_gemm_sonic
 
