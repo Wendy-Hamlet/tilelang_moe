@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
 from typing import Callable, Dict
+from tilelang.profiler import do_bench
 from kernels.topk_softmax_baseline import (
     topk_softmax_separate,
     topk_softmax_separate_compiled,
@@ -25,29 +26,26 @@ from kernels.topk_softmax_sonic import topk_softmax_sonic
 def benchmark_callable(
     func: Callable[[torch.Tensor], tuple],
     logits: torch.Tensor,
-    num_warmup: int = 100,  # 增加warmup到100次，让torch.compile充分编译和优化
+    num_warmup: int = 100,
     num_runs: int = 1000,
 ) -> Dict[str, torch.Tensor | float]:
     """对一个签名为 f(logits)->(scores, indices) 的函数进行基准测试。
     
-    重要：torch.compile需要足够的warmup次数才能达到稳定性能。
+    使用TileLang do_bench以获得稳定的数值：
+    - 自动GPU同步
+    - 数值稳定的统计
+    - 完全的warmup和repeated runs
     """
-    # Warmup - 充分预热让torch.compile编译和JIT完成
-    for _ in range(num_warmup):
-        _ = func(logits)
+    # 定义测试函数（do_bench会自动处理warmup和重复）
+    def bench_fn():
+        return func(logits)
+    
+    # 使用do_bench进行基准测试（单位：ms）
+    latency_ms = do_bench(bench_fn, warmup=num_warmup, rep=num_runs, return_mode='median')
+    
+    # 获取最后一次执行的输出用于正确性检验
+    scores_out, indices_out = func(logits)
     torch.cuda.synchronize()
-
-    # GPU event timing (ms)
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-
-    start_event.record()
-    for _ in range(num_runs):
-        scores_out, indices_out = func(logits)
-    end_event.record()
-
-    torch.cuda.synchronize()
-    latency_ms = start_event.elapsed_time(end_event) / num_runs
 
     return {"latency_ms": latency_ms, "scores": scores_out, "indices": indices_out}
 
