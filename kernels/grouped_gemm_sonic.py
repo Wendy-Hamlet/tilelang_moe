@@ -61,16 +61,14 @@ def grouped_gemm_sonic_kernel(
             W_shared = T.alloc_shared([block_K, block_N], dtype)
             C_local = T.alloc_fragment([block_M, block_N], accum_dtype)
             
-            # 从预计算tensor中直接读取expert_id和m_start
-            # 这是官方推荐的方式，避免在kernel中用循环查找
-            expert_id_local = T.alloc_shared([1], T.int32)
-            expert_id_local[0] = block_expert_ids[bx]
-            
+            # 直接从预计算tensor中读取expert_id和m_start
+            # 注意：不使用shared memory，避免竞态
+            cur_expert_id = block_expert_ids[bx]
             m_start = block_m_starts[bx]
             
             # Debug: 记录每个block的信息
             if by == 0:
-                debug_info[bx, 0] = expert_id_local[0]
+                debug_info[bx, 0] = cur_expert_id
                 debug_info[bx, 1] = m_start
                 debug_info[bx, 2] = block_M  # actual_rows由host计算
                 debug_info[bx, 3] = bx
@@ -82,7 +80,7 @@ def grouped_gemm_sonic_kernel(
                 T.copy(X[m_start : m_start + block_M, k * block_K : (k + 1) * block_K], X_shared)
                 
                 # 加载W: 根据expert_id加载对应权重
-                # 由于TileLang不支持用变量直接索引（W[expert_id_local[0], ...]），
+                # 由于TileLang不支持用变量直接索引（W[cur_expert_id, ...]），
                 # 我们遍历所有expert，用if_then_else选择正确的
                 for i, j in T.Parallel(block_K, block_N):
                     k_idx = k * block_K + i
@@ -92,7 +90,7 @@ def grouped_gemm_sonic_kernel(
                         w_val = T.alloc_var(dtype=dtype)
                         w_val = W[0, n_idx, k_idx]  # 初始化为expert 0的权重
                         for e in range(E):
-                            w_val = T.if_then_else(expert_id_local[0] == e, W[e, n_idx, k_idx], w_val)
+                            w_val = T.if_then_else(cur_expert_id == e, W[e, n_idx, k_idx], w_val)
                         W_shared[i, j] = w_val
                     else:
                         W_shared[i, j] = T.cast(0.0, dtype)
