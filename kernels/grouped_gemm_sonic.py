@@ -64,12 +64,14 @@ def grouped_gemm_sonic_kernel(
             W_shared = T.alloc_shared([block_K, block_N], dtype)
             C_local = T.alloc_fragment([block_M, block_N], accum_dtype)
             
-            # 找到当前block属于哪个expert（参考官方实现）
+            # 找到当前block属于哪个expert
+            # block_offsets[e] 是expert e的第一个block ID
+            # 需要找到最大的e使得 block_offsets[e] <= bx
             expert_id = T.alloc_var(dtype=T.int32)
             expert_id = T.int32(0)
             
-            # 使用T.if_then_else逐个检查
-            for e in range(E):
+            # 从后向前遍历，找到第一个（最大的）满足 bx >= block_offsets[e] 的e
+            for e in range(E - 1, -1, -1):
                 in_cur_expert = bx >= block_offsets[e]
                 expert_id = T.if_then_else(in_cur_expert, T.int32(e), expert_id)
             
