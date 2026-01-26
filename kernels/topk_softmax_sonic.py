@@ -28,7 +28,7 @@ def topk_softmax_sonic(
     num_experts: int,
     top_k: int,
     block_size: int = 256,
-    dtype: T.typehint = T.float32,
+    dtype = T.float32,
 ):
     """
     Sonic式TopK+Softmax融合kernel
@@ -167,7 +167,7 @@ def topk_softmax_sonic_v2(
     num_experts: int,
     top_k: int,
     block_size: int = 256,
-    dtype: T.typehint = T.float32,
+    dtype = T.float32,
 ):
     """
     改进版本：更高效的TopK算法
