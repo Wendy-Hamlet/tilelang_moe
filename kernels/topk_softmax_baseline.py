@@ -88,14 +88,20 @@ def topk_softmax_fused_compiled(
     return _topk_softmax_compiled_impl(logits, k)
 
 
-# torch.compile版本（无算法版本，Baseline：全局softmax→topk）
-# 使用'reduce-overhead'模式（针对小操作优化）
-# fullgraph=False允许graph breaks，更灵活
-@torch.compile(mode='reduce-overhead', fullgraph=False)
-def _topk_softmax_separate_compiled_impl(logits: torch.Tensor, k: int):
-    scores = F.softmax(logits, dim=-1, dtype=torch.float32)
-    topk_scores, topk_indices = torch.topk(scores, k, dim=-1)
-    return topk_scores, topk_indices
+# torch.compile版本工厂（无算法版本）
+# 返回一个闭包，k被固定在编译时
+def make_topk_softmax_separate_compiled(k: int):
+    """
+    创建torch.compile优化的baseline版本。
+    k被固定为编译时常量，避免动态重编译。
+    """
+    @torch.compile(mode='reduce-overhead', fullgraph=True)
+    def compiled_fn(logits: torch.Tensor):
+        scores = F.softmax(logits, dim=-1, dtype=torch.float32)
+        topk_scores, topk_indices = torch.topk(scores, k, dim=-1)
+        return topk_scores, topk_indices
+    
+    return compiled_fn
 
 
 def topk_softmax_separate_compiled(
@@ -103,10 +109,12 @@ def topk_softmax_separate_compiled(
     k: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    无算法版本（Baseline）的torch.compile加速：
-    先全局softmax再topk，函数在模块级别编译以复用缓存。
+    torch.compile包装器 - 实际性能可能不佳因为重复编译，
+    为了一致的API设计而保留。
+    生产环境应该使用make_topk_softmax_separate_compiled工厂。
     """
-    return _topk_softmax_separate_compiled_impl(logits, k)
+    fn = make_topk_softmax_separate_compiled(k)
+    return fn(logits)
 
 
 class TopKSoftmaxRouter(torch.nn.Module):
