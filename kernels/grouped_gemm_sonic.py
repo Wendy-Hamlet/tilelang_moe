@@ -110,8 +110,8 @@ def grouped_gemm_sonic_kernel(
                     k_idx = k * block_K + i
                     n_idx = by * block_N + j
                     if k_idx < H and n_idx < I:
-                        # 根据expert_id选择权重
-                        w_val = T.alloc_var(dtype=dtype)
+                        # 根据expert_id选择权重 - 必须先初始化为默认值
+                        w_val = T.cast(0.0, dtype)
                         for e in range(E):
                             is_expert = expert_id == e
                             w_val = T.if_then_else(is_expert, W[e, n_idx, k_idx], w_val)
