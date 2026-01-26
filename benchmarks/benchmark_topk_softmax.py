@@ -129,14 +129,18 @@ def benchmark_config(
     if results.get('pytorch-baseline') is not None:
         ref_scores = results['pytorch-baseline']['scores']
         ref_indices = results['pytorch-baseline']['indices']
-        print("  正确性 (vs pytorch-baseline):", end=" ")
+        print("  正确性 (vs pytorch-baseline):")
         ok = True
         for name, res in results.items():
             if name == 'pytorch-baseline' or res is None:
                 continue
             c = verify_correctness(res['scores'], res['indices'], ref_scores, ref_indices)
-            ok = ok and (c['overlap'] > 0.95 and c['sum_valid'] > 0.95)
-        print("OK" if ok else "WARN")
+            is_ok = (c['overlap'] > 0.95 and c['sum_valid'] > 0.95)
+            ok = ok and is_ok
+            status = "✓" if is_ok else "⚠"
+            print(f"    {status} {name:<18} overlap={c['overlap']*100:>6.1f}% sum_valid={c['sum_valid']*100:>6.1f}% max_diff={c['max_diff']:.2e}")
+        print(f"  整体: {'OK' if ok else 'WARN'}")
+
     
     return results
 
