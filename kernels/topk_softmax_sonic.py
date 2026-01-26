@@ -153,8 +153,13 @@ def topk_softmax_sonic(
                 # 归一化
                 for i in T.serial(top_k):
                     s_topk_vals[i] = s_topk_vals[i] / exp_sum
-                    
-                    # 写回全局内存
+            
+            # 同步，确保线程0完成softmax计算
+            T.sync_threads()
+            
+            # 写回全局内存（线程0执行）
+            if tx == 0:
+                for i in T.serial(top_k):
                     scores[bx, i] = s_topk_vals[i]
                     indices[bx, i] = s_topk_idx[i]
     
