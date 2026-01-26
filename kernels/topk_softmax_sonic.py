@@ -116,14 +116,55 @@ def topk_softmax_sonic(
                 s_thread_idx[tx] = thread_max_idx
                 T.sync_threads()
                 
-                # 树状规约
-                for step in T.serial(num_reduction_steps):
-                    stride = block_size >> (step + 1)  # block_size // 2, then // 4, etc.
-                    if tx < stride:
-                        if s_thread_vals[tx + stride] > s_thread_vals[tx]:
-                            s_thread_vals[tx] = s_thread_vals[tx + stride]
-                            s_thread_idx[tx] = s_thread_idx[tx + stride]
-                    T.sync_threads()
+                # 树状规约 (假设block_size=256，需要8步)
+                # 手动展开避免变量捕获问题
+                if tx < 128:
+                    if s_thread_vals[tx + 128] > s_thread_vals[tx]:
+                        s_thread_vals[tx] = s_thread_vals[tx + 128]
+                        s_thread_idx[tx] = s_thread_idx[tx + 128]
+                T.sync_threads()
+                
+                if tx < 64:
+                    if s_thread_vals[tx + 64] > s_thread_vals[tx]:
+                        s_thread_vals[tx] = s_thread_vals[tx + 64]
+                        s_thread_idx[tx] = s_thread_idx[tx + 64]
+                T.sync_threads()
+                
+                if tx < 32:
+                    if s_thread_vals[tx + 32] > s_thread_vals[tx]:
+                        s_thread_vals[tx] = s_thread_vals[tx + 32]
+                        s_thread_idx[tx] = s_thread_idx[tx + 32]
+                T.sync_threads()
+                
+                if tx < 16:
+                    if s_thread_vals[tx + 16] > s_thread_vals[tx]:
+                        s_thread_vals[tx] = s_thread_vals[tx + 16]
+                        s_thread_idx[tx] = s_thread_idx[tx + 16]
+                T.sync_threads()
+                
+                if tx < 8:
+                    if s_thread_vals[tx + 8] > s_thread_vals[tx]:
+                        s_thread_vals[tx] = s_thread_vals[tx + 8]
+                        s_thread_idx[tx] = s_thread_idx[tx + 8]
+                T.sync_threads()
+                
+                if tx < 4:
+                    if s_thread_vals[tx + 4] > s_thread_vals[tx]:
+                        s_thread_vals[tx] = s_thread_vals[tx + 4]
+                        s_thread_idx[tx] = s_thread_idx[tx + 4]
+                T.sync_threads()
+                
+                if tx < 2:
+                    if s_thread_vals[tx + 2] > s_thread_vals[tx]:
+                        s_thread_vals[tx] = s_thread_vals[tx + 2]
+                        s_thread_idx[tx] = s_thread_idx[tx + 2]
+                T.sync_threads()
+                
+                if tx < 1:
+                    if s_thread_vals[tx + 1] > s_thread_vals[tx]:
+                        s_thread_vals[tx] = s_thread_vals[tx + 1]
+                        s_thread_idx[tx] = s_thread_idx[tx + 1]
+                T.sync_threads()
                 
                 # 线程0写入结果
                 if tx == 0:
