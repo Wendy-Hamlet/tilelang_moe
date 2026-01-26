@@ -221,7 +221,7 @@ def grouped_gemm_sonic(
     block_offsets_int32 = block_offsets.to(torch.int32)
     
     # 分配输出和debug tensor
-    Y_sorted = torch.empty((M, I), dtype=torch.float16, device=device)
+    Y_sorted = torch.empty((total_tokens, I), dtype=torch.float16, device=device)
     debug_info = torch.zeros((total_blocks_value, 4), dtype=torch.int32, device=device)
     
     # 执行kernel
