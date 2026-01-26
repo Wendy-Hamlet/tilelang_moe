@@ -64,24 +64,19 @@ def grouped_gemm_sonic_kernel(
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
             
             # 找到当前block应该处理哪个expert
-            # 简化版本：线性扫描找到对应的expert
-            # 使用T.alloc_var显式分配可变变量（避免作用域错误）
-            expert_id = T.alloc_var("int32")
-            expert_id[0] = T.int32(0)
-            
-            token_start_in_expert = block_id * block_M
-            
-            # 由于X已经按expert排序，我们可以直接计算全局token位置
+            # 由于X已按expert排序，我们可以直接计算全局token位置
             global_token_start = block_id * block_M
             global_token_end = T.min(global_token_start + block_M, total_tokens)
             num_tokens = global_token_end - global_token_start
             
+            # 找到这些tokens对应的expert (通过expert_offsets查找)
+            expert_id = T.alloc_var(T.int32)
+            expert_id = T.int32(0)
+            
             if num_tokens > 0:
-                # 找到这些tokens对应的expert
-                # 通过expert_offsets二分查找
                 for e in range(E):
                     if global_token_start >= expert_offsets[e] and global_token_start < expert_offsets[e + 1]:
-                        expert_id[0] = T.int32(e)
+                        expert_id = T.int32(e)
                         break
                 
                 # 清空累加器
@@ -102,7 +97,7 @@ def grouped_gemm_sonic_kernel(
                     for i, j in T.Parallel(block_N, block_K):
                         k_idx = k * block_K + j
                         if i < I and k_idx < H:
-                            W_shared[i, j] = W[expert_id[0], i, k_idx]
+                            W_shared[i, j] = W[expert_id, i, k_idx]
                         else:
                             W_shared[i, j] = T.cast(0.0, dtype)
                     
