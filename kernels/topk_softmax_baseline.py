@@ -89,7 +89,9 @@ def topk_softmax_fused_compiled(
 
 
 # torch.compile版本（无算法版本，Baseline：全局softmax→topk）
-@torch.compile(mode='max-autotune', fullgraph=True)
+# 使用'reduce-overhead'模式（针对小操作优化）
+# fullgraph=False允许graph breaks，更灵活
+@torch.compile(mode='reduce-overhead', fullgraph=False)
 def _topk_softmax_separate_compiled_impl(logits: torch.Tensor, k: int):
     scores = F.softmax(logits, dim=-1, dtype=torch.float32)
     topk_scores, topk_indices = torch.topk(scores, k, dim=-1)

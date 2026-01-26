@@ -25,11 +25,14 @@ from kernels.topk_softmax_sonic import topk_softmax_sonic
 def benchmark_callable(
     func: Callable[[torch.Tensor], tuple],
     logits: torch.Tensor,
-    num_warmup: int = 50,
+    num_warmup: int = 100,  # 增加warmup到100次，让torch.compile充分编译和优化
     num_runs: int = 1000,
 ) -> Dict[str, torch.Tensor | float]:
-    """对一个签名为 f(logits)->(scores, indices) 的函数进行基准测试。"""
-    # Warmup
+    """对一个签名为 f(logits)->(scores, indices) 的函数进行基准测试。
+    
+    重要：torch.compile需要足够的warmup次数才能达到稳定性能。
+    """
+    # Warmup - 充分预热让torch.compile编译和JIT完成
     for _ in range(num_warmup):
         _ = func(logits)
     torch.cuda.synchronize()
@@ -154,7 +157,8 @@ def main():
     print("- torch.compile: 编译优化的baseline")
     print("- tilelang-separate: 官方TopK + PyTorch对k softmax")
     print("- ours: 单kernel融合 + sonic算法")
-    print("\n计时: CUDA Events，50 warmup + 1000 runs 平均")
+    print("\n计时: CUDA Events，100 warmup + 1000 runs 平均")
+    print("注：torch.compile需要足够的warmup次数达到稳定性能")
     print("=" * 100)
     
     # 测试场景 (batch_size, num_experts, top_k)
