@@ -70,11 +70,11 @@ def grouped_gemm_sonic_kernel(
             expert_id = T.alloc_var(dtype=T.int32)
             expert_id = T.int32(0)
             
-            # 正向遍历，持续更新直到不满足条件
-            # 最终expert_id是最大的满足 bx >= block_offsets[e] 的e
+            # 正向遍历，持续更新直到不满足条件（参考官方实现）
+            # 注意：直接使用i而非T.int32(i)
             for e in range(E):
                 in_cur_expert = bx >= block_offsets[e]
-                expert_id = T.if_then_else(in_cur_expert, T.int32(e), expert_id)
+                expert_id = T.if_then_else(in_cur_expert, e, expert_id)
             
             # 计算当前block在expert内的局部位置
             local_block_id = bx - block_offsets[expert_id]
