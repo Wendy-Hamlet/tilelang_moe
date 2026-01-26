@@ -61,14 +61,14 @@ def grouped_gemm_sonic_kernel(
             W_shared = T.alloc_shared([block_K, block_N], dtype)
             C_local = T.alloc_fragment([block_M, block_N], accum_dtype)
             
-            # 使用fragment存储expert_id，确保在所有嵌套循环中正确访问
-            expert_id_frag = T.alloc_fragment([1], T.int32)
-            expert_id_frag[0] = block_expert_ids[bx]
+            # 使用shared memory存储expert_id，确保所有线程一致读取
+            expert_id_shared = T.alloc_shared([1], T.int32)
+            expert_id_shared[0] = block_expert_ids[bx]
             m_start = block_m_starts[bx]
             
             # Debug: 记录每个block的信息
             if by == 0:
-                debug_info[bx, 0] = expert_id_frag[0]
+                debug_info[bx, 0] = expert_id_shared[0]
                 debug_info[bx, 1] = m_start
                 debug_info[bx, 2] = block_M
                 debug_info[bx, 3] = bx
@@ -87,14 +87,15 @@ def grouped_gemm_sonic_kernel(
                     n_idx = by * block_N + j
                     if k_idx < H and n_idx < I:
                         # 从 expert 0 开始，依次检查每个expert
+                        # 使用 shared memory 中的 expert_id_shared[0]
                         W_shared[i, j] = T.if_then_else(
-                            expert_id_frag[0] == 0,
+                            expert_id_shared[0] == 0,
                             W[0, n_idx, k_idx],
                             T.if_then_else(
-                                expert_id_frag[0] == 1,
+                                expert_id_shared[0] == 1,
                                 W[1, n_idx, k_idx],
                                 T.if_then_else(
-                                    expert_id_frag[0] == 2,
+                                    expert_id_shared[0] == 2,
                                     W[2, n_idx, k_idx],
                                     W[3, n_idx, k_idx]  # 默认 expert 3
                                 )
