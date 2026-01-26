@@ -220,12 +220,8 @@ def grouped_gemm_sonic(
     expert_offsets_int32 = expert_offsets.to(torch.int32)
     block_offsets_int32 = block_offsets.to(torch.int32)
     
-    # 分配输出和debug tensor
-    Y_sorted = torch.empty((total_tokens, I), dtype=torch.float16, device=device)
-    debug_info = torch.zeros((total_blocks_value, 4), dtype=torch.int32, device=device)
-    
-    # 执行kernel
-    kernel(X_sorted, W, expert_offsets_int32, block_offsets_int32, Y_sorted, debug_info)
+    # 执行kernel (Y和debug_info由kernel返回)
+    Y_sorted, debug_info = kernel(X_sorted, W, expert_offsets_int32, block_offsets_int32)
     
     # Print debug info
     if os.environ.get('DEBUG_SONIC', '0') == '1':
