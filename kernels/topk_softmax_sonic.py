@@ -12,6 +12,7 @@ TileLang实现：Sonic式TopK+Softmax融合
 - 每个block处理多行
 """
 
+import math
 import tilelang
 import tilelang.language as T
 
@@ -50,8 +51,9 @@ def topk_softmax_sonic(
         scores: (batch_size, top_k) - 输出归一化分数
         indices: (batch_size, top_k) - 输出索引
     """
-    
-    @T.prim_func
+        # 预计算树状规约的步数
+    num_reduction_steps = int(math.log2(block_size))
+        @T.prim_func
     def main(
         logits: T.Tensor((batch_size, num_experts), dtype),
         scores: T.Tensor((batch_size, top_k), T.float32),
@@ -62,6 +64,10 @@ def topk_softmax_sonic(
             # 共享内存：存储当前找到的top-k值和索引
             s_topk_vals = T.alloc_shared((top_k,), T.float32)
             s_topk_idx = T.alloc_shared((top_k,), T.int32)
+            
+            # 共享内存：用于规约（固定分配，避免重复分配）
+            s_thread_vals = T.alloc_shared((block_size,), T.float32)
+            s_thread_idx = T.alloc_shared((block_size,), T.int32)
             
             # 线程局部变量
             tx = T.get_thread_binding()
@@ -105,17 +111,12 @@ def topk_softmax_sonic(
                             thread_max_val = val
                             thread_max_idx = T.int32(idx)
                 
-                # 使用共享内存规约找全局最大值
-                s_thread_vals = T.alloc_shared((block_size,), T.float32)
-                s_thread_idx = T.alloc_shared((block_size,), T.int32)
-                
+                # 写入共享内存准备规约
                 s_thread_vals[tx] = thread_max_val
                 s_thread_idx[tx] = thread_max_idx
                 T.sync_threads()
                 
-                # 树状规约 - use serial loop instead of while
-                import math
-                num_reduction_steps = int(math.log2(block_size))
+                # 树状规约
                 for step in T.serial(num_reduction_steps):
                     stride = block_size >> (step + 1)  # block_size // 2, then // 4, etc.
                     if tx < stride:
