@@ -145,8 +145,10 @@ def verify_equivalence(batch_size: int = 64, num_experts: int = 256, top_k: int 
     torch.manual_seed(42)
     logits = torch.randn(batch_size, num_experts, device='cuda')
     
-    # 分离版本
-    scores_sep, indices_sep = topk_softmax_separate(logits, top_k)
+    # 分离版本（需要重新归一化以对齐融合版本）
+    scores_sep_raw, indices_sep = topk_softmax_separate(logits, top_k)
+    # 重新归一化topk的分数，使其和为1
+    scores_sep = scores_sep_raw / scores_sep_raw.sum(dim=-1, keepdim=True)
     
     # 融合版本
     scores_fused, indices_fused = topk_softmax_fused(logits, top_k)
@@ -155,18 +157,24 @@ def verify_equivalence(batch_size: int = 64, num_experts: int = 256, top_k: int 
     indices_match = (indices_sep == indices_fused).all()
     print(f"索引一致性: {indices_match}")
     
-    # 检查分数差异
+    # 检查分数差异（重新归一化后）
     score_diff = (scores_sep - scores_fused).abs()
     max_diff = score_diff.max().item()
     mean_diff = score_diff.mean().item()
     
-    print(f"分数最大差异: {max_diff:.2e}")
-    print(f"分数平均差异: {mean_diff:.2e}")
+    print(f"分数最大差异（重归一化后）: {max_diff:.2e}")
+    print(f"分数平均差异（重归一化后）: {mean_diff:.2e}")
+    
+    # 显示原始topk分数的和
+    sum_sep_raw = scores_sep_raw.sum(dim=-1)
+    print(f"\n分离版本原始topk分数和: min={sum_sep_raw.min():.6f}, max={sum_sep_raw.max():.6f}")
+    print(f"  说明: 从全局softmax选topk，和<1是正常的")
     
     # 验证归一化
     sum_sep = scores_sep.sum(dim=-1)
     sum_fused = scores_fused.sum(dim=-1)
     
+    print(f"\n重归一化后:")
     print(f"分离版本归一化检查: min={sum_sep.min():.6f}, max={sum_sep.max():.6f}")
     print(f"融合版本归一化检查: min={sum_fused.min():.6f}, max={sum_fused.max():.6f}")
     
@@ -174,11 +182,18 @@ def verify_equivalence(batch_size: int = 64, num_experts: int = 256, top_k: int 
     # 误差来源于分母差异: Σ(1..E) exp vs Σ(1..k) exp
     with torch.no_grad():
         all_scores = F.softmax(logits, dim=-1)
-        # 计算top-k之外的概率和
-        remaining_prob = 1.0 - all_scores.gather(-1, indices_fused).sum(dim=-1)
-        print(f"\nTop-k之外的概率和: mean={remaining_prob.mean():.2e}, max={remaining_prob.max():.2e}")
-        print(f"理论误差界: O({remaining_prob.max():.2e})")
+        print("   两种方法在重归一化后得到相同结果")
+    elif max_diff < 1e-3:
+        print("✅ 融合版本与分离版本高度一致（误差<1e-3）")
+        print("   数值差异在可接受范围内")
+    else:
+        print("⚠️  融合版本与分离版本存在明显差异")
+        print("   可能的原因：浮点精度、索引选择顺序等")
     
+    print("\n注意:")
+    print("• 分离版本：全局softmax → topk → 重归一化")
+    print("• 融合版本：topk logits → 局部softmax")
+    print("• Sonic优势：避免计算所有E个expert的softmax，只计算k个")
     print("\n结论:")
     if max_diff < 1e-5:
         print("✅ 融合版本与分离版本几乎完全等价（误差<1e-5）")
