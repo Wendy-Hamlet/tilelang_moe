@@ -21,6 +21,7 @@ def grouped_gemm_sonic_kernel(
     H: int,
     I: int,
     E: int,
+    total_blocks: int,
     block_M: int = 128,
     block_N: int = 256,
     block_K: int = 32,
@@ -55,8 +56,7 @@ def grouped_gemm_sonic_kernel(
     ):
         # Sonic算法：tokens已按expert排序，每个expert分配若干blocks
         # 参考官方grouped_gemm，使用T.if_then_else查找expert
-        
-        total_blocks = block_offsets[E]  # 总block数
+        # total_blocks在编译时传入（避免运行时访问block_offsets[E]）
         
         with T.Kernel(total_blocks, T.ceildiv(I, block_N), threads=128) as (bx, by):
             # Shared memory buffers
@@ -182,6 +182,9 @@ def grouped_gemm_sonic(
     # Gather: 按expert排序后的tokens
     X_sorted = X[sorted_indices]
     
+    # 计算total_blocks (在host端)
+    total_blocks_value = int(block_offsets[-1].item())
+    
     # 编译kernel
     cache_key = (total_tokens, H, I, E)
     if cache_key not in grouped_gemm_sonic.compile_cache:
@@ -190,6 +193,7 @@ def grouped_gemm_sonic(
             H=H,
             I=I,
             E=E,
+            total_blocks=total_blocks_value,
             block_M=128,
             block_N=min(256, I),
             block_K=32,
