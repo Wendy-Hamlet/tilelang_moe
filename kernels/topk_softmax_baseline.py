@@ -182,6 +182,14 @@ def verify_equivalence(batch_size: int = 64, num_experts: int = 256, top_k: int 
     # 误差来源于分母差异: Σ(1..E) exp vs Σ(1..k) exp
     with torch.no_grad():
         all_scores = F.softmax(logits, dim=-1)
+        # 计算top-k之外的概率和
+        remaining_prob = 1.0 - all_scores.gather(-1, indices_fused).sum(dim=-1)
+        print(f"\nTop-k之外的概率和: mean={remaining_prob.mean():.2e}, max={remaining_prob.max():.2e}")
+        print(f"理论误差界: O({remaining_prob.max():.2e})")
+    
+    print("\n结论:")
+    if max_diff < 1e-5:
+        print("✅ 融合版本与分离版本几乎完全等价（误差<1e-5）")
         print("   两种方法在重归一化后得到相同结果")
     elif max_diff < 1e-3:
         print("✅ 融合版本与分离版本高度一致（误差<1e-3）")
@@ -194,14 +202,6 @@ def verify_equivalence(batch_size: int = 64, num_experts: int = 256, top_k: int 
     print("• 分离版本：全局softmax → topk → 重归一化")
     print("• 融合版本：topk logits → 局部softmax")
     print("• Sonic优势：避免计算所有E个expert的softmax，只计算k个")
-    print("\n结论:")
-    if max_diff < 1e-5:
-        print("✅ 融合版本与分离版本几乎完全等价（误差<1e-5）")
-    elif max_diff < 1e-3:
-        print("✅ 融合版本与分离版本高度一致（误差<1e-3）")
-    else:
-        print("⚠️  融合版本与分离版本存在明显差异")
-    
     print("=" * 80)
 
 
