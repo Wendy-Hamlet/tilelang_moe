@@ -136,12 +136,14 @@ def topk_softmax_sonic(
             
             # 找最大值（数值稳定性）
             if tx == 0:
+                max_val = T.alloc_var(T.float32)
                 max_val = T.float32(-1e38)
                 for i in T.serial(top_k):
                     if s_topk_vals[i] > max_val:
                         max_val = s_topk_vals[i]
                 
                 # 计算exp和sum
+                exp_sum = T.alloc_var(T.float32)
                 exp_sum = T.float32(0.0)
                 for i in T.serial(top_k):
                     s_topk_vals[i] = T.exp(s_topk_vals[i] - max_val)
