@@ -64,7 +64,7 @@ def topk_softmax_sonic(
             s_topk_idx = T.alloc_shared((top_k,), T.int32)
             
             # 线程局部变量
-            tx = T.thread_idx(0)
+            tx = T.get_thread_binding()
             
             # ============================================================
             # Stage 1: 找Top-K（使用简化的选择排序）
@@ -182,7 +182,7 @@ def topk_softmax_sonic_v2(
         indices: T.Tensor((batch_size, top_k), T.int32),
     ):
         with T.Kernel(batch_size, threads=block_size) as bx:
-            tx = T.thread_idx(0)
+            tx = T.get_thread_binding()
             
             # 共享内存
             SMEM_SIZE = 2048  # 足够存储中间结果
