@@ -1,95 +1,160 @@
-python benchmarks/benchmark_topk_softmax.py
-====================================================================================================
-TopK + Softmax 性能对比
-====================================================================================================
-版本:
-- pytorch-baseline: 全局softmax→topk
-- torch.compile: 编译优化的baseline
-- tilelang-separate: 官方TopK + PyTorch对k softmax
-- ours: 单kernel融合 + sonic算法
+python benchmarks/benchmark_grouped_gemm.py
+================================================================================
+Grouped GEMM Performance Benchmark
+4 Versions: pytorch-loop, pytorch-compiled, tilelang-separate, ours (sonic)
+================================================================================
+Device: NVIDIA H100 80GB HBM3
+PyTorch version: 2.8.0+cu129
 
-计时: CUDA Events，100 warmup + 1000 runs 平均
-注：torch.compile需要足够的warmup次数达到稳定性能
-====================================================================================================
+================================================================================
+Config: B128_H512_I384_E8 - Small Test
+  total_tokens=128, H=512, I=384, E=8
+================================================================================
+Expert distribution: min=3, max=52, mean=16.0
 
-—— Running: B64_E160_K6 (B=64, E=160, K=6)
-  ✓ pytorch-baseline: 0.0214 ms
-  ✓ torch.compile: 0.0203 ms
-  ✓ tilelang-separate: 0.0247 ms
-  ✓ ours: 0.0099 ms
-  DEBUG: pytorch-baseline scores.sum() = 0.213240 (期望 < 1.0)
-  正确性 (vs pytorch-baseline):
-    ✓ torch.compile      overlap= 100.0% sum_valid= 100.0% (scores.sum=0.213240) max_diff=1.49e-08
-    ✓ tilelang-separate  overlap= 100.0% sum_valid= 100.0% (scores.sum=0.213240) max_diff=1.75e-02
-    ✓ ours               overlap= 100.0% sum_valid= 100.0% (scores.sum=1.000000) max_diff=3.58e-01
-  整体: OK
+[1] Correctness Verification:
+2026-01-26 21:14:41  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `gemm` with `out_idx=[-1]`
+[INFO] IR saved to gemm.ir
+2026-01-26 21:14:45  [TileLang:tilelang.jit.kernel:INFO]: TileLang completes to compile kernel `gemm`
+❌ Error in tilelang-separate: Kernel expected 2 inputs, but 3 are provided.
+2026-01-26 21:14:46  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `grouped_gemm_sonic` with `out_idx=[-1]`
+[INFO] IR saved to grouped_gemm_sonic.ir
+2026-01-26 21:14:51  [TileLang:tilelang.jit.kernel:INFO]: TileLang completes to compile kernel `grouped_gemm_sonic`
+❌ Error in ours (sonic): Kernel expected 4 inputs, but 5 are provided.
+  ✅ pytorch-loop             : max_diff = 0.000000
+  ✅ pytorch-compiled         : max_diff = 0.000000
+  ❌ tilelang-separate        : max_diff = inf
+  ❌ ours (sonic)             : max_diff = inf
 
-—— Running: B64_E256_K8 (B=64, E=256, K=8)
-  ✓ pytorch-baseline: 0.0197 ms
-  ✓ torch.compile: 0.0213 ms
-  ✓ tilelang-separate: 0.0261 ms
-  ✓ ours: 0.0112 ms
-  DEBUG: pytorch-baseline scores.sum() = 0.188462 (期望 < 1.0)
-  正确性 (vs pytorch-baseline):
-    ✓ torch.compile      overlap= 100.0% sum_valid= 100.0% (scores.sum=0.188462) max_diff=7.45e-09
-    ✓ tilelang-separate  overlap= 100.0% sum_valid= 100.0% (scores.sum=0.188462) max_diff=1.81e-02
-    ✓ ours               overlap= 100.0% sum_valid= 100.0% (scores.sum=1.000000) max_diff=3.60e-01
-  整体: OK
+⚠️  Warning: Some versions have correctness issues!
+Continuing with benchmark, but results may be invalid.
 
-—— Running: B128_E512_K16 (B=128, E=512, K=16)
-  ✓ pytorch-baseline: 0.0248 ms
-  ✓ torch.compile: 0.0232 ms
-  ✓ tilelang-separate: 0.0286 ms
-  ✓ ours: 0.0186 ms
-  DEBUG: pytorch-baseline scores.sum() = 0.193001 (期望 < 1.0)
-  正确性 (vs pytorch-baseline):
-    ✓ torch.compile      overlap= 100.0% sum_valid= 100.0% (scores.sum=0.193001) max_diff=7.45e-09
-    ✓ tilelang-separate  overlap= 100.0% sum_valid= 100.0% (scores.sum=0.193001) max_diff=1.30e-02
-    ✓ ours               overlap= 100.0% sum_valid= 100.0% (scores.sum=1.000000) max_diff=2.49e-01
-  整体: OK
 
-—— Running: B64_E1024_K8 (B=64, E=1024, K=8)
-  ✓ pytorch-baseline: 0.0266 ms
-  ✓ torch.compile: 0.0262 ms
-  ✓ tilelang-separate: 0.0282 ms
-  ✓ ours: 0.0134 ms
-  DEBUG: pytorch-baseline scores.sum() = 0.077987 (期望 < 1.0)
-  正确性 (vs pytorch-baseline):
-    ✓ torch.compile      overlap= 100.0% sum_valid= 100.0% (scores.sum=0.077987) max_diff=3.73e-09
-    ✓ tilelang-separate  overlap= 100.0% sum_valid= 100.0% (scores.sum=0.077987) max_diff=6.71e-03
-    ✓ ours               overlap= 100.0% sum_valid= 100.0% (scores.sum=1.000000) max_diff=3.78e-01
-  整体: OK
+[2] Performance Benchmark (warmup=50, rep=500):
+  pytorch-loop             :   1.3612 ms
+  pytorch-compiled         :   1.3713 ms
+  tilelang-separate        : FAILED (Kernel expected 2 inputs, but 3 are provided.)
+  ours (sonic)             : FAILED (Kernel expected 4 inputs, but 5 are provided.)
 
-—— Running: B64_E2048_K16 (B=64, E=2048, K=16)
-  ✓ pytorch-baseline: 0.0352 ms
-  ✓ torch.compile: 0.0332 ms
-  ✓ tilelang-separate: 0.0325 ms
-  ✓ ours: 0.0314 ms
-  DEBUG: pytorch-baseline scores.sum() = 0.078677 (期望 < 1.0)
-  正确性 (vs pytorch-baseline):
-    ✓ torch.compile      overlap= 100.0% sum_valid= 100.0% (scores.sum=0.078677) max_diff=3.73e-09
-    ✓ tilelang-separate  overlap= 100.0% sum_valid= 100.0% (scores.sum=0.078677) max_diff=3.41e-03
-    ✓ ours               overlap= 100.0% sum_valid= 100.0% (scores.sum=1.000000) max_diff=2.24e-01
-  整体: OK
+================================================================================
+Config: B256_H1024_I768_E16 - Medium Test
+  total_tokens=256, H=1024, I=768, E=16
+================================================================================
+Expert distribution: min=3, max=73, mean=16.0
 
-====================================================================================================
-Latency (ms)
-====================================================================================================
-配置                 pytorch-baseline    torch.compile   tilelang-separate         ours
--------------------------------------------------------------------------------------
-B64_E160_K6                  0.0214           0.0203              0.0247       0.0099
-B64_E256_K8                  0.0197           0.0213              0.0261       0.0112
-B128_E512_K16                0.0248           0.0232              0.0286       0.0186
-B64_E1024_K8                 0.0266           0.0262              0.0282       0.0134
-B64_E2048_K16                0.0352           0.0332              0.0325       0.0314
+[1] Correctness Verification:
+2026-01-26 21:14:52  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `gemm` with `out_idx=[2]`
+❌ Error in tilelang-separate: Check failed: (M % kMPerWarp == 0) is false: M must be divisible by 16, but got 73
+2026-01-26 21:14:52  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `grouped_gemm_sonic` with `out_idx=[4]`
+[INFO] IR saved to grouped_gemm_sonic.ir
+2026-01-26 21:14:57  [TileLang:tilelang.jit.kernel:INFO]: TileLang completes to compile kernel `grouped_gemm_sonic`
+❌ Error in ours (sonic): Kernel expected 4 inputs, but 5 are provided.
+  ✅ pytorch-loop             : max_diff = 0.000000
+  ✅ pytorch-compiled         : max_diff = 0.000000
+  ❌ tilelang-separate        : max_diff = inf
+  ❌ ours (sonic)             : max_diff = inf
 
-====================================================================================================
-Speedup vs pytorch-baseline
-====================================================================================================
-配置                 pytorch-baseline    torch.compile   tilelang-separate         ours
--------------------------------------------------------------------------------------
-B64_E160_K6                   1.00x            1.06x               0.87x        2.18x
-B64_E256_K8                   1.00x            0.92x               0.76x        1.77x
-B128_E512_K16                 1.00x            1.07x               0.87x        1.33x
-B64_E1024_K8                  1.00x            1.02x               0.95x        1.99x
-B64_E2048_K16                 1.00x            1.06x               1.08x        1.12x
+⚠️  Warning: Some versions have correctness issues!
+Continuing with benchmark, but results may be invalid.
+
+
+[2] Performance Benchmark (warmup=50, rep=500):
+  pytorch-loop             :   2.7041 ms
+  pytorch-compiled         :   2.7457 ms
+2026-01-26 21:14:58  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `gemm` with `out_idx=[2]`
+  tilelang-separate        : FAILED (Check failed: (M % kMPerWarp == 0) is false: M must be divisible by 16, but got 73)
+  ours (sonic)             : FAILED (Kernel expected 4 inputs, but 5 are provided.)
+
+================================================================================
+Config: B512_H2048_I1536_E32 - DeepSeek-V2-like
+  total_tokens=512, H=2048, I=1536, E=32
+================================================================================
+Expert distribution: min=1, max=127, mean=16.0
+
+[1] Correctness Verification:
+2026-01-26 21:14:58  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `gemm` with `out_idx=[2]`
+❌ Error in tilelang-separate: Check failed: (M % kMPerWarp == 0) is false: M must be divisible by 16, but got 127
+2026-01-26 21:14:58  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `grouped_gemm_sonic` with `out_idx=[4]`
+[INFO] IR saved to grouped_gemm_sonic.ir
+2026-01-26 21:15:03  [TileLang:tilelang.jit.kernel:INFO]: TileLang completes to compile kernel `grouped_gemm_sonic`
+❌ Error in ours (sonic): Kernel expected 4 inputs, but 5 are provided.
+  ✅ pytorch-loop             : max_diff = 0.000000
+  ✅ pytorch-compiled         : max_diff = 0.000000
+  ❌ tilelang-separate        : max_diff = inf
+  ❌ ours (sonic)             : max_diff = inf
+
+⚠️  Warning: Some versions have correctness issues!
+Continuing with benchmark, but results may be invalid.
+
+
+[2] Performance Benchmark (warmup=50, rep=500):
+  pytorch-loop             :   3.1930 ms
+  pytorch-compiled         :   5.5421 ms
+2026-01-26 21:15:04  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `gemm` with `out_idx=[2]`
+  tilelang-separate        : FAILED (Check failed: (M % kMPerWarp == 0) is false: M must be divisible by 16, but got 127)
+  ours (sonic)             : FAILED (Kernel expected 4 inputs, but 5 are provided.)
+
+================================================================================
+Config: B1024_H4096_I3072_E64 - DeepSeek-V3-like (scaled)
+  total_tokens=1024, H=4096, I=3072, E=64
+================================================================================
+Expert distribution: min=0, max=208, mean=16.0
+
+[1] Correctness Verification:
+2026-01-26 21:15:04  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `gemm` with `out_idx=[2]`
+[INFO] IR saved to gemm.ir
+2026-01-26 21:15:09  [TileLang:tilelang.jit.kernel:INFO]: TileLang completes to compile kernel `gemm`
+❌ Error in tilelang-separate: Kernel expected 2 inputs, but 3 are provided.
+2026-01-26 21:15:10  [TileLang:tilelang.jit.kernel:INFO]: TileLang begins to compile kernel `grouped_gemm_sonic` with `out_idx=[4]`
+[INFO] IR saved to grouped_gemm_sonic.ir
+2026-01-26 21:15:15  [TileLang:tilelang.jit.kernel:INFO]: TileLang completes to compile kernel `grouped_gemm_sonic`
+❌ Error in ours (sonic): Kernel expected 4 inputs, but 5 are provided.
+  ✅ pytorch-loop             : max_diff = 0.000000
+  ✅ pytorch-compiled         : max_diff = 0.000000
+  ❌ tilelang-separate        : max_diff = inf
+  ❌ ours (sonic)             : max_diff = inf
+
+⚠️  Warning: Some versions have correctness issues!
+Continuing with benchmark, but results may be invalid.
+
+
+[2] Performance Benchmark (warmup=50, rep=500):
+  pytorch-loop             :  11.3036 ms
+  pytorch-compiled         :  12.2778 ms
+  tilelang-separate        : FAILED (Kernel expected 2 inputs, but 3 are provided.)
+  ours (sonic)             : FAILED (Kernel expected 4 inputs, but 5 are provided.)
+
+================================================================================
+SUMMARY: Latency Comparison (ms)
+================================================================================
++-----------------------+-----------+------------+----------------+----------------+
+| Config                |   PyTorch |   Compiled | TileLang-Sep   | Ours (Sonic)   |
++=======================+===========+============+================+================+
+| B128_H512_I384_E8     |    1.3612 |     1.3713 | FAILED         | FAILED         |
++-----------------------+-----------+------------+----------------+----------------+
+| B256_H1024_I768_E16   |    2.7041 |     2.7457 | FAILED         | FAILED         |
++-----------------------+-----------+------------+----------------+----------------+
+| B512_H2048_I1536_E32  |    3.193  |     5.5421 | FAILED         | FAILED         |
++-----------------------+-----------+------------+----------------+----------------+
+| B1024_H4096_I3072_E64 |   11.3036 |    12.2778 | FAILED         | FAILED         |
++-----------------------+-----------+------------+----------------+----------------+
+
+================================================================================
+SUMMARY: Speedup vs PyTorch Baseline
+================================================================================
++-----------------------+------------+----------------+----------------+
+| Config                | Compiled   | TileLang-Sep   | Ours (Sonic)   |
++=======================+============+================+================+
+| B128_H512_I384_E8     | 0.99x      | N/A            | N/A            |
++-----------------------+------------+----------------+----------------+
+| B256_H1024_I768_E16   | 0.98x      | N/A            | N/A            |
++-----------------------+------------+----------------+----------------+
+| B512_H2048_I1536_E32  | 0.58x      | N/A            | N/A            |
++-----------------------+------------+----------------+----------------+
+| B1024_H4096_I3072_E64 | 0.92x      | N/A            | N/A            |
++-----------------------+------------+----------------+----------------+
+
+================================================================================
+Average Speedup:
+================================================================================
+  pytorch-compiled         : 0.87x

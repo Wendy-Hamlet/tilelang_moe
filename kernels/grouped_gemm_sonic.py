@@ -191,14 +191,12 @@ def grouped_gemm_sonic(
     
     kernel = grouped_gemm_sonic.compile_cache[cache_key]
     
-    # 执行kernel
-    Y_sorted = torch.zeros(total_tokens, I, device=device, dtype=dtype)
-    
-    # 转换expert_offsets为int32
+    # 转换参数为int32
     expert_offsets_int32 = expert_offsets.to(torch.int32)
     expert_indices_int32 = expert_indices_sorted.to(torch.int32)
     
-    kernel(X_sorted, W, expert_indices_int32, expert_offsets_int32, Y_sorted)
+    # 执行kernel（jit会自动返回输出）
+    Y_sorted = kernel(X_sorted, W, expert_indices_int32, expert_offsets_int32)
     
     # Scatter: 恢复原顺序
     Y = torch.zeros_like(Y_sorted)

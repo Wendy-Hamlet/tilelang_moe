@@ -82,19 +82,26 @@ def grouped_gemm_tilelang_separate(
         expert_tokens = X[mask]  # (n_tokens, H)
         n_tokens = expert_tokens.shape[0]
         
+        # TileLang要求M维度是16的倍数，需要padding
+        n_tokens_padded = ((n_tokens + 15) // 16) * 16
+        if n_tokens_padded != n_tokens:
+            expert_tokens_padded = torch.zeros(n_tokens_padded, H, device=device, dtype=dtype)
+            expert_tokens_padded[:n_tokens] = expert_tokens
+            expert_tokens = expert_tokens_padded
+        
         # 准备权重（需要转置因为我们计算 X @ W^T）
         expert_weight = W[expert_id]  # (I, H)
         
         # 编译TileLang kernel（只编译一次通过缓存）
-        cache_key = (n_tokens, I, H)
+        cache_key = (n_tokens_padded, I, H)
         if cache_key not in grouped_gemm_tilelang_separate.compile_cache:
             # 使用合适的tile大小
-            block_M = min(128, n_tokens) if n_tokens >= 64 else 64
+            block_M = min(128, n_tokens_padded) if n_tokens_padded >= 64 else 64
             block_N = min(256, I) if I >= 128 else 128
             block_K = 32
             
             kernel = tilelang_gemm_kernel(
-                M=n_tokens,
+                M=n_tokens_padded,
                 N=I,
                 K=H,
                 block_M=block_M,
@@ -108,8 +115,11 @@ def grouped_gemm_tilelang_separate(
         kernel = grouped_gemm_tilelang_separate.compile_cache[cache_key]
         
         # 执行GEMM: expert_tokens @ expert_weight^T
-        expert_output = torch.zeros(n_tokens, I, device=device, dtype=dtype)
-        kernel(expert_tokens, expert_weight, expert_output)
+        # 注意：jit(out_idx=[-1])会自动返回输出，不需要显式传入
+        expert_output_padded = kernel(expert_tokens, expert_weight)
+        
+        # 去除padding，只取有效结果
+        expert_output = expert_output_padded[:n_tokens]
         
         # Scatter回输出
         Y[mask] = expert_output
