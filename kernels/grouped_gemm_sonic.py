@@ -80,18 +80,26 @@ def grouped_gemm_sonic_kernel(
                 T.copy(X[m_start : m_start + block_M, k * block_K : (k + 1) * block_K], X_shared)
                 
                 # 加载W: 根据expert_id加载对应权重
-                # 由于TileLang不支持用变量直接索引（W[expert_id_frag[0], ...]），
-                # 我们遍历所有expert，用if_then_else选择正确的
+                # 使用嵌套的if_then_else选择正确的expert权重
+                # 从expert 0开始检查，避免编译器优化问题
                 for i, j in T.Parallel(block_K, block_N):
                     k_idx = k * block_K + i
                     n_idx = by * block_N + j
                     if k_idx < H and n_idx < I:
-                        # 在if内部、for循环外部声明可变变量
-                        w_val = T.alloc_var(dtype=dtype)
-                        w_val = W[0, n_idx, k_idx]  # 初始化为expert 0的权重
-                        for e in range(E):
-                            w_val = T.if_then_else(expert_id_frag[0] == e, W[e, n_idx, k_idx], w_val)
-                        W_shared[i, j] = w_val
+                        # 从 expert 0 开始，依次检查每个expert
+                        W_shared[i, j] = T.if_then_else(
+                            expert_id_frag[0] == 0,
+                            W[0, n_idx, k_idx],
+                            T.if_then_else(
+                                expert_id_frag[0] == 1,
+                                W[1, n_idx, k_idx],
+                                T.if_then_else(
+                                    expert_id_frag[0] == 2,
+                                    W[2, n_idx, k_idx],
+                                    W[3, n_idx, k_idx]  # 默认 expert 3
+                                )
+                            )
+                        )
                     else:
                         W_shared[i, j] = T.cast(0.0, dtype)
                 
