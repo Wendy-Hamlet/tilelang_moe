@@ -66,7 +66,7 @@ def grouped_gemm_sonic_kernel(
             # 找到当前block应该处理哪个expert
             # 简化版本：线性扫描找到对应的expert
             # 使用T.alloc_var显式分配可变变量（避免作用域错误）
-            expert_id = T.alloc_var("int32", "expert_id")
+            expert_id = T.alloc_var("int32")
             expert_id[0] = T.int32(0)
             
             token_start_in_expert = block_id * block_M
