@@ -89,8 +89,8 @@ def topk_softmax_tilelang_separate(
     topk_logits = torch.gather(logits, dim=-1, index=indices)
     
     # 3) TileLang Online Softmax on k elements
+    # out_idx=[1]表示Y是输出，调用时只传入X，返回Y
     softmax_fn = online_softmax_kernel(batch, k, dtype=T.float32)
-    scores = torch.empty_like(topk_logits)
-    softmax_fn(topk_logits, scores)
+    scores = softmax_fn(topk_logits)  # 只传1个输入，kernel自动创建并返回输出
     
     return scores, indices
