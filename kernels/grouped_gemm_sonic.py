@@ -47,44 +47,50 @@ def grouped_gemm_sonic_kernel(
     """
     @T.prim_func
     def grouped_gemm_sonic(
-        X: T.Tensor((total_tokens, H), dtype),           # 输入tokens
+        X: T.Tensor((total_tokens, H), dtype),           # 输入tokens (已按expert排序)
         W: T.Tensor((E, I, H), dtype),                   # Expert权重
-        expert_indices: T.Tensor((total_tokens,), T.int32),  # Token→Expert映射
         expert_offsets: T.Tensor((E + 1,), T.int32),     # Expert累计offset
         Y: T.Tensor((total_tokens, I), dtype),           # 输出
     ):
-        # Grid: 为每个expert的每个tile分配一个block
-        # 这里简化为处理所有tokens，实际Sonic会动态调度
-        with T.Kernel(T.ceildiv(total_tokens, block_M), 1, threads=128) as (token_block_id, _):
+        # 注意：这是简化版本，真正的Sonic使用复杂的dynamic scheduler
+        # 这里我们为每个expert分配足够的blocks
+        # 计算总block数：每个expert的tokens向上取整到block_M
+        total_blocks = T.ceildiv(total_tokens, block_M)
+        
+        with T.Kernel(total_blocks, 1, threads=128) as (block_id, _):
             # Shared memory buffers
             X_shared = T.alloc_shared((block_M, block_K), dtype)
             W_shared = T.alloc_shared((block_N, block_K), dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
             
-            # 计算当前block处理的token范围
-            token_start = token_block_id * block_M
-            token_end = T.min(token_start + block_M, total_tokens)
-            num_tokens = token_end - token_start
+            # 找到当前block应该处理哪个expert
+            # 简化版本：线性扫描找到对应的expert
+            expert_id = T.int32(0)
+            token_start_in_expert = block_id * block_M
             
-            # 获取第一个token的expert_id（假设同一block内token使用相同expert）
-            # 注意：实际Sonic更复杂，这里简化
+            # 由于X已经按expert排序，我们可以直接计算全局token位置
+            global_token_start = block_id * block_M
+            global_token_end = T.min(global_token_start + block_M, total_tokens)
+            num_tokens = global_token_end - global_token_start
+            
             if num_tokens > 0:
-                # 读取expert ID
-                # 这里使用简化逻辑：每个block处理一组连续tokens
-                # 实际Sonic使用dynamic scheduler
-                first_token_idx = token_start
-                expert_id = expert_indices[first_token_idx]
+                # 找到这些tokens对应的expert
+                # 通过expert_offsets二分查找
+                for e in range(E):
+                    if global_token_start >= expert_offsets[e] and global_token_start < expert_offsets[e + 1]:
+                        expert_id = T.int32(e)
+                        break
                 
                 # 清空累加器
                 T.clear(C_local)
                 
                 # K维度分块
                 for k in T.Pipelined(T.ceildiv(H, block_K), num_stages=2):
-                    # Load X[token_start:token_end, k*block_K:(k+1)*block_K] → X_shared
+                    # Load X[global_token_start:global_token_end, k*block_K:(k+1)*block_K] → X_shared
                     for i, j in T.Parallel(block_M, block_K):
-                        token_idx = token_start + i
+                        token_idx = global_token_start + i
                         k_idx = k * block_K + j
-                        if i < num_tokens and k_idx < H:
+                        if i < num_tokens and k_idx < H and token_idx < total_tokens:
                             X_shared[i, j] = X[token_idx, k_idx]
                         else:
                             X_shared[i, j] = T.cast(0.0, dtype)
@@ -102,8 +108,8 @@ def grouped_gemm_sonic_kernel(
                 
                 # Store结果
                 for i, j in T.Parallel(block_M, block_N):
-                    token_idx = token_start + i
-                    if i < num_tokens and j < I:
+                    token_idx = global_token_start + i
+                    if i < num_tokens and j < I and token_idx < total_tokens:
                         Y[token_idx, j] = T.cast(C_local[i, j], dtype)
     
     return grouped_gemm_sonic
@@ -193,10 +199,10 @@ def grouped_gemm_sonic(
     
     # 转换参数为int32
     expert_offsets_int32 = expert_offsets.to(torch.int32)
-    expert_indices_int32 = expert_indices_sorted.to(torch.int32)
     
     # 执行kernel（jit会自动返回输出）
-    Y_sorted = kernel(X_sorted, W, expert_indices_int32, expert_offsets_int32)
+    # 注意：X_sorted已经按expert排序，kernel内部通过expert_offsets查找expert_id
+    Y_sorted = kernel(X_sorted, W, expert_offsets_int32)
     
     # Scatter: 恢复原顺序
     Y = torch.zeros_like(Y_sorted)

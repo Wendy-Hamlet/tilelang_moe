@@ -95,9 +95,16 @@ def grouped_gemm_tilelang_separate(
         # 编译TileLang kernel（只编译一次通过缓存）
         cache_key = (n_tokens_padded, I, H)
         if cache_key not in grouped_gemm_tilelang_separate.compile_cache:
-            # 使用合适的tile大小
-            block_M = min(128, n_tokens_padded) if n_tokens_padded >= 64 else 64
-            block_N = min(256, I) if I >= 128 else 128
+            # 使用合适的tile大小，确保满足TileLang约束
+            # block_M: 必须是16的倍数
+            block_M = 64 if n_tokens_padded < 128 else 128
+            # block_N: 选择128或256，避免odd numbers导致warp_row_tiles问题
+            if I >= 256:
+                block_N = 256
+            elif I >= 128:
+                block_N = 128
+            else:
+                block_N = 64
             block_K = 32
             
             kernel = tilelang_gemm_kernel(
