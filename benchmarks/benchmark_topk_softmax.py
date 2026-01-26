@@ -16,7 +16,7 @@ import torch
 from typing import Callable, Dict
 from kernels.topk_softmax_baseline import (
     topk_softmax_separate,
-    topk_softmax_separate_compiled,
+    make_topk_softmax_separate_compiled,
 )
 from kernels.topk_softmax_tilelang_separate import topk_softmax_tilelang_separate
 from kernels.topk_softmax_sonic import topk_softmax_sonic
@@ -120,12 +120,14 @@ def benchmark_config(
 
     # Build runners with unified signature f(logits)->(scores, indices)
     sonic_kernel = topk_softmax_sonic(batch_size, num_experts, top_k)
+    # 预先创建compiled function并缓存（避免每次调用都重新编译）
+    compiled_fn = make_topk_softmax_separate_compiled(top_k)
 
     runners: Dict[str, Callable[[torch.Tensor], tuple]] = {
         # 1) pytorch baseline（无算法版本）
         'pytorch-baseline': lambda x: topk_softmax_separate(x, top_k),
-        # 2) torch.compile（无算法版本）
-        'torch.compile': lambda x: topk_softmax_separate_compiled(x, top_k),
+        # 2) torch.compile（无算法版本，已预编译缓存）
+        'torch.compile': compiled_fn,
         # 3) tilelang（无算法版本，两个算子分开，官方TopK）
         'tilelang-separate': lambda x: topk_softmax_tilelang_separate(x, top_k),
         # 4) ours（融合+sonic算法，单kernel）

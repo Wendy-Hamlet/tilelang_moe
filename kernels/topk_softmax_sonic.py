@@ -20,8 +20,9 @@ import tilelang.language as T
 @tilelang.jit(
     out_idx=[1, 2],
     pass_configs={
-        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        # 启用Hopper TMA (Tensor Memory Accelerator)以提升内存访问性能
+        # tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,  # 注释掉以启用TMA
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,  # 当前实现不支持warp specialization
     }
 )
 def topk_softmax_sonic(
