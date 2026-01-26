@@ -66,6 +66,15 @@ def topk_softmax_fused(
     return topk_scores, topk_indices
 
 
+# torch.compile版本：在模块级别定义，避免重复编译
+@torch.compile(mode='max-autotune', fullgraph=True)
+def _topk_softmax_compiled_impl(logits: torch.Tensor, k: int):
+    """编译后的实现，会被缓存复用"""
+    topk_logits, topk_indices = torch.topk(logits, k, dim=-1)
+    topk_scores = F.softmax(topk_logits, dim=-1, dtype=torch.float32)
+    return topk_scores, topk_indices
+
+
 def topk_softmax_fused_compiled(
     logits: torch.Tensor,
     k: int,
@@ -73,15 +82,10 @@ def topk_softmax_fused_compiled(
     """
     torch.compile优化的融合版本
     
-    使用max-autotune模式获得最佳性能
+    使用max-autotune模式获得最佳性能。
+    编译后的函数会被缓存，避免重复编译开销。
     """
-    @torch.compile(mode='max-autotune', fullgraph=True)
-    def _compiled(logits, k):
-        topk_logits, topk_indices = torch.topk(logits, k, dim=-1)
-        topk_scores = F.softmax(topk_logits, dim=-1, dtype=torch.float32)
-        return topk_scores, topk_indices
-    
-    return _compiled(logits, k)
+    return _topk_softmax_compiled_impl(logits, k)
 
 
 class TopKSoftmaxRouter(torch.nn.Module):
