@@ -1,7 +1,7 @@
 """
 TileLang无融合版本（两个算子分开）：
-1) 用TileLang官方TopK (Radix Selection) 选出k个索引
-2) 用PyTorch对选出的k个logit做softmax（k很小，PyTorch已足够快）
+1) 对所有logits做全局softmax
+2) 用TileLang官方TopK (Radix Selection) 选出top-k
 """
 import torch
 from typing import Tuple
@@ -13,12 +13,11 @@ def topk_softmax_tilelang_separate(
     k: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    TileLang无融合版本（两个算子分开）：
-    1) 用TileLang官方TopK (Radix Selection) 选出k个索引
-    2) 用PyTorch对选出的k个logit做softmax
+    TileLang无融合版本（两个算子分开，方式A：标准MoE路由）：
+    1) 对所有E个logits做全局softmax（得到权重分布，sum=1）
+    2) 用TileLang官方TopK (Radix Selection) 选出top-k个
     
-    注：原计划使用TileLang online_softmax，但其对小N值（k=6）有padding bug。
-        由于k很小（6-16），PyTorch softmax已经很快且正确。
+    注：与pytorch-baseline和torch.compile对齐，用方式A（sum<1.0）。
     
     Args:
         logits: (batch, num_experts) float32
@@ -26,11 +25,14 @@ def topk_softmax_tilelang_separate(
     Returns:
         (scores, indices): both shape (batch, k)
     """
-    # 1) TileLang TopK (indices)
-    indices = topk_radix_tilelang(logits, k)
+    # 1) 全局softmax
+    import torch.nn.functional as F
+    scores = F.softmax(logits, dim=-1, dtype=torch.float32)
     
-    # 2) Gather logits and PyTorch softmax
-    topk_logits = torch.gather(logits, dim=-1, index=indices)
-    scores = torch.softmax(topk_logits, dim=-1, dtype=torch.float32)
+    # 2) TileLang TopK
+    topk_indices = topk_radix_tilelang(logits, k)
     
-    return scores, indices
+    # 3) Gather top-k scores
+    topk_scores = torch.gather(scores, dim=-1, index=topk_indices)
+    
+    return topk_scores, topk_indices
