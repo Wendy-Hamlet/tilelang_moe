@@ -45,15 +45,15 @@ def topk_softmax_sonic(
         top_k: 选取的top-k数量
         block_size: 线程块大小
         dtype: 数据类型
-    
     Memory:
         logits: (batch_size, num_experts) - 输入logits
         scores: (batch_size, top_k) - 输出归一化分数
         indices: (batch_size, top_k) - 输出索引
     """
-        # 预计算树状规约的步数
+    # 预计算树状规约的步数
     num_reduction_steps = int(math.log2(block_size))
-        @T.prim_func
+    
+    @T.prim_func
     def main(
         logits: T.Tensor((batch_size, num_experts), dtype),
         scores: T.Tensor((batch_size, top_k), T.float32),
