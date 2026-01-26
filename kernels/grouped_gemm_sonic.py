@@ -49,72 +49,80 @@ def grouped_gemm_sonic_kernel(
     def grouped_gemm_sonic(
         X: T.Tensor((total_tokens, H), dtype),           # 输入tokens (已按expert排序)
         W: T.Tensor((E, I, H), dtype),                   # Expert权重
-        expert_offsets: T.Tensor((E + 1,), T.int32),     # Expert累计offset
+        expert_offsets: T.Tensor((E + 1,), T.int32),     # Expert累计offset (token级别)
+        block_offsets: T.Tensor((E + 1,), T.int32),      # Expert累计offset (block级别)
         Y: T.Tensor((total_tokens, I), dtype),           # 输出
     ):
-        # Sonic算法：为每个expert分配blocks（而不是按token position）
-        # 这样确保每个block只处理单个expert的tokens
-        # 总block数 = sum(ceildiv(expert_tokens[i], block_M) for i in range(E))
+        # Sonic核心思想：预先计算每个expert需要多少blocks
+        # block_offsets[i] = sum(ceildiv(expert_tokens[j], block_M) for j in range(i))
+        # 这样每个block可以通过block_id找到自己属于哪个expert
         
-        # 计算总block数（在host端预计算更好，这里简化为按token分配）
-        # 每个expert的tokens已经是连续的（因为X已排序）
-        # 我们按expert遍历，每个expert分配若干blocks
+        total_blocks = block_offsets[E]  # 最后一个元素是总block数
         
-        # 简化版：先按总tokens分配blocks，然后在kernel内跳过跨expert的blocks
-        # 为每个expert单独处理
-        for expert_id in T.serial(E):
+        with T.Kernel(total_blocks, 1, threads=128) as (block_id, _):
+            # Shared memory buffers
+            X_shared = T.alloc_shared((block_M, block_K), dtype)
+            W_shared = T.alloc_shared((block_N, block_K), dtype)
+            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+            
+            # 找到当前block属于哪个expert
+            # 通过block_offsets二分查找
+            expert_id = T.alloc_var(T.int32)
+            expert_id = T.int32(0)
+            local_block_id = T.alloc_var(T.int32)
+            local_block_id = T.int32(0)
+            
+            # 线性扫描找expert (可优化为二分查找)
+            for e in range(E):
+                if block_id >= block_offsets[e] and block_id < block_offsets[e + 1]:
+                    expert_id = T.int32(e)
+                    local_block_id = block_id - block_offsets[e]
+                    break
+            
+            # 获取expert的token范围
             expert_start = expert_offsets[expert_id]
             expert_end = expert_offsets[expert_id + 1]
             expert_tokens = expert_end - expert_start
             
-            if expert_tokens > 0:
-                # 为当前expert分配blocks
-                expert_blocks = T.ceildiv(expert_tokens, block_M)
+            # 计算当前block在expert内的token范围
+            local_token_start = local_block_id * block_M
+            local_token_end = T.min(local_token_start + block_M, expert_tokens)
+            num_tokens = local_token_end - local_token_start
+            
+            # 全局token位置
+            global_token_start = expert_start + local_token_start
+            
+            if num_tokens > 0:
+                # 清空累加器
+                T.clear(C_local)
                 
-                with T.Kernel(expert_blocks, 1, threads=128) as (block_idx, _):
-                    # Shared memory buffers
-                    X_shared = T.alloc_shared((block_M, block_K), dtype)
-                    W_shared = T.alloc_shared((block_N, block_K), dtype)
-                    C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
-                    
-                    # 计算当前block在当前expert内的token范围
-                    local_token_start = block_idx * block_M
-                    local_token_end = T.min(local_token_start + block_M, expert_tokens)
-                    num_tokens = local_token_end - local_token_start
-                    
-                    # 全局token位置
-                    global_token_start = expert_start + local_token_start
-                    
-                    # 清空累加器
-                    T.clear(C_local)
-                    
-                    # K维度分块
-                    for k in T.Pipelined(T.ceildiv(H, block_K), num_stages=2):
-                        # Load X[global_token_start:global_token_start+block_M, k*block_K:(k+1)*block_K] → X_shared
-                        for i, j in T.Parallel(block_M, block_K):
-                            token_idx = global_token_start + i
-                            k_idx = k * block_K + j
-                            if i < num_tokens and k_idx < H and token_idx < total_tokens:
-                                X_shared[i, j] = X[token_idx, k_idx]
-                            else:
-                                X_shared[i, j] = T.cast(0.0, dtype)
-                        
-                        # Load W[expert_id, :, k*block_K:(k+1)*block_K] → W_shared
-                        for i, j in T.Parallel(block_N, block_K):
-                            k_idx = k * block_K + j
-                            if i < I and k_idx < H:
-                                W_shared[i, j] = W[expert_id, i, k_idx]
-                            else:
-                                W_shared[i, j] = T.cast(0.0, dtype)
-                        
-                        # GEMM: C_local += X_shared @ W_shared^T
-                        T.gemm(X_shared, W_shared, C_local, transpose_B=True)
-                    
-                    # Store结果
-                    for i, j in T.Parallel(block_M, block_N):
+                # K维度分块
+                for k in T.Pipelined(T.ceildiv(H, block_K), num_stages=2):
+                    # Load X[global_token_start:global_token_start+block_M, k*block_K:(k+1)*block_K] → X_shared
+                    for i, j in T.Parallel(block_M, block_K):
                         token_idx = global_token_start + i
-                        if i < num_tokens and j < I and token_idx < total_tokens:
-                            Y[token_idx, j] = T.cast(C_local[i, j], dtype)
+                        k_idx = k * block_K + j
+                        if i < num_tokens and k_idx < H and token_idx < total_tokens:
+                            X_shared[i, j] = X[token_idx, k_idx]
+                        else:
+                            X_shared[i, j] = T.cast(0.0, dtype)
+                    
+                    # Load W[expert_id, :, k*block_K:(k+1)*block_K] → W_shared
+                    for i, j in T.Parallel(block_N, block_K):
+                        k_idx = k * block_K + j
+                        if i < I and k_idx < H:
+                            W_shared[i, j] = W[expert_id, i, k_idx]
+                        else:
+                            W_shared[i, j] = T.cast(0.0, dtype)
+                    
+                    # GEMM: C_local += X_shared @ W_shared^T
+                    T.gemm(X_shared, W_shared, C_local, transpose_B=True)
+                
+                # Store结果
+                for i, j in T.Parallel(block_M, block_N):
+                    token_idx = global_token_start + i
+                    if i < num_tokens and j < I and token_idx < total_tokens:
+                        Y[token_idx, j] = T.cast(C_local[i, j], dtype)
     
     return grouped_gemm_sonic
 
@@ -177,11 +185,17 @@ def grouped_gemm_sonic(
     # 准备metadata
     sorted_indices, expert_offsets = prepare_expert_metadata(expert_indices, E)
     
+    # 计算block_offsets: 每个expert需要多少blocks
+    block_M = 128
+    expert_counts = expert_offsets[1:] - expert_offsets[:-1]  # 每个expert的token数
+    expert_blocks = torch.ceil(expert_counts.float() / block_M).to(torch.int32)  # 每个expert的block数
+    block_offsets = torch.cat([
+        torch.tensor([0], device=device, dtype=torch.int32),
+        torch.cumsum(expert_blocks, dim=0, dtype=torch.int32)
+    ])
+    
     # Gather: 按expert排序后的tokens
     X_sorted = X[sorted_indices]
-    
-    # 准备expert_indices (sorted)
-    expert_indices_sorted = expert_indices[sorted_indices]
     
     # 编译kernel
     cache_key = (total_tokens, H, I, E)
@@ -203,10 +217,10 @@ def grouped_gemm_sonic(
     
     # 转换参数为int32
     expert_offsets_int32 = expert_offsets.to(torch.int32)
+    block_offsets_int32 = block_offsets.to(torch.int32)
     
     # 执行kernel（jit会自动返回输出）
-    # 注意：X_sorted已经按expert排序，kernel内部通过expert_offsets查找expert_id
-    Y_sorted = kernel(X_sorted, W, expert_offsets_int32)
+    Y_sorted = kernel(X_sorted, W, expert_offsets_int32, block_offsets_int32)
     
     # Scatter: 恢复原顺序
     Y = torch.zeros_like(Y_sorted)
