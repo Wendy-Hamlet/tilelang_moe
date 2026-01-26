@@ -1,152 +1,95 @@
-(tilelang) root@xhluo1-0:/cephfs/xhluo/tilelang_moe# python benchmarks/benchmark_large_k.py 
-========================================================================================================================
-大k场景 (N=32768, k=2048) 专项优化测试
-========================================================================================================================
+python benchmarks/benchmark_topk_softmax.py
+====================================================================================================
+TopK + Softmax 性能对比
+====================================================================================================
+版本:
+- pytorch-baseline: 全局softmax→topk
+- torch.compile: 编译优化的baseline
+- tilelang-separate: 官方TopK + PyTorch对k softmax
+- ours: 单kernel融合 + sonic算法
 
-对比四个实现：
-  1. PyTorch baseline
-  2. TileLang Official (官方Radix Selection)
-  3. TileLang Optimized (通用优化版 - 小k场景优化)
-  4. TileLang Large-k (大k场景专门优化)
+计时: CUDA Events，100 warmup + 1000 runs 平均
+注：torch.compile需要足够的warmup次数达到稳定性能
+====================================================================================================
 
-优化策略：
-  - BLOCK_SIZE: 1024 (CUDA标准限制)
-  - SMEM_INPUT_SIZE: 12288 (利用H100的232KB opt-in共享内存)
-  - 缓存uint32值 (避免Stage 2重复float→uint32转换)
-  - 共享内存使用: 约148KB (需要H100大共享内存支持)
+—— Running: B64_E160_K6 (B=64, E=160, K=6)
+  ✓ pytorch-baseline: 0.0258 ms
+  ✓ torch.compile: 1.2739 ms
+  ✓ tilelang-separate: 0.0565 ms
+  ✓ ours: 0.0153 ms
+  DEBUG: pytorch-baseline scores.sum() = 0.213240 (期望 < 1.0)
+  正确性 (vs pytorch-baseline):
+    ✓ torch.compile      overlap= 100.0% sum_valid= 100.0% (scores.sum=0.213240) max_diff=1.49e-08
+    ✓ tilelang-separate  overlap= 100.0% sum_valid= 100.0% (scores.sum=1.000000) max_diff=3.58e-01
+    ✓ ours               overlap= 100.0% sum_valid= 100.0% (scores.sum=1.000000) max_diff=3.58e-01
+  整体: OK
 
-⚙️  测试配置: 预热100次 + 测试1000次取平均 (与benchmark_optimizations.py一致)
-========================================================================================================================
-开始性能测试 (N=32768, k=2048, batch=64)...
-使用独立预热避免版本间干扰
-  测试 PyTorch baseline... 0.1277ms
-  测试 TileLang Official... 0.0443ms
-  测试 TileLang Optimized... 0.0440ms
-  测试 TileLang Large-k... 0.0436ms
+—— Running: B64_E256_K8 (B=64, E=256, K=8)
+  ✓ pytorch-baseline: 0.0280 ms
+  ✓ torch.compile: 1.0038 ms
+  ✓ tilelang-separate: 0.0414 ms
+  ✓ ours: 0.0093 ms
+  DEBUG: pytorch-baseline scores.sum() = 0.188462 (期望 < 1.0)
+  正确性 (vs pytorch-baseline):
+    ✓ torch.compile      overlap= 100.0% sum_valid= 100.0% (scores.sum=0.188462) max_diff=7.45e-09
+    ✓ tilelang-separate  overlap= 100.0% sum_valid= 100.0% (scores.sum=1.000000) max_diff=3.60e-01
+    ✓ ours               overlap= 100.0% sum_valid= 100.0% (scores.sum=1.000000) max_diff=3.60e-01
+  整体: OK
 
-版本                             时间(ms)       加速比        正确性
-------------------------------------------------------------------------------------------------------------------------
-PyTorch baseline               0.1277       1.00x      ✓
-TileLang Official              0.0443       2.88      x ✓
-TileLang Optimized (通用)        0.0440       2.90      x ✓
-TileLang Large-k (大k优化)        0.0436       2.93      x ✓
+—— Running: B128_E512_K16 (B=128, E=512, K=16)
+  ✓ pytorch-baseline: 0.0242 ms
+  ✓ torch.compile: 0.7219 ms
+  ✓ tilelang-separate: 0.0390 ms
+  ✓ ours: 0.0156 ms
+  DEBUG: pytorch-baseline scores.sum() = 0.193001 (期望 < 1.0)
+  正确性 (vs pytorch-baseline):
+    ✓ torch.compile      overlap= 100.0% sum_valid= 100.0% (scores.sum=0.193001) max_diff=7.45e-09
+    ✓ tilelang-separate  overlap= 100.0% sum_valid= 100.0% (scores.sum=1.000000) max_diff=2.49e-01
+    ✓ ours               overlap= 100.0% sum_valid= 100.0% (scores.sum=1.000000) max_diff=2.49e-01
+  整体: OK
 
-========================================================================================================================
-性能对比
-========================================================================================================================
-✅ Large-k优化版相比官方版提升: 1.50%
-✅ Large-k优化版相比通用优化版提升: 0.92%
-(tilelang) root@xhluo1-0:/cephfs/xhluo/tilelang_moe# python benchmarks/benchmark_large_k.py 
-========================================================================================================================
-大k场景 (N=32768, k=2048) 专项优化测试
-========================================================================================================================
+—— Running: B64_E1024_K8 (B=64, E=1024, K=8)
+  ✓ pytorch-baseline: 0.0250 ms
+  ✓ torch.compile: 0.7110 ms
+  ✓ tilelang-separate: 0.0360 ms
+  ✓ ours: 0.0099 ms
+  DEBUG: pytorch-baseline scores.sum() = 0.077987 (期望 < 1.0)
+  正确性 (vs pytorch-baseline):
+    ✓ torch.compile      overlap= 100.0% sum_valid= 100.0% (scores.sum=0.077987) max_diff=3.73e-09
+    ✓ tilelang-separate  overlap= 100.0% sum_valid= 100.0% (scores.sum=1.000000) max_diff=3.78e-01
+    ✓ ours               overlap= 100.0% sum_valid= 100.0% (scores.sum=1.000000) max_diff=3.78e-01
+  整体: OK
 
-对比四个实现：
-  1. PyTorch baseline
-  2. TileLang Official (官方Radix Selection)
-  3. TileLang Optimized (通用优化版 - 小k场景优化)
-  4. TileLang Large-k (大k场景专门优化)
+—— Running: B64_E2048_K16 (B=64, E=2048, K=16)
+  ✓ pytorch-baseline: 0.0311 ms
+  ✓ torch.compile: 0.7241 ms
+  ✓ tilelang-separate: 0.0378 ms
+  ✓ ours: 0.0283 ms
+  DEBUG: pytorch-baseline scores.sum() = 0.078677 (期望 < 1.0)
+  正确性 (vs pytorch-baseline):
+    ✓ torch.compile      overlap= 100.0% sum_valid= 100.0% (scores.sum=0.078677) max_diff=3.73e-09
+    ✓ tilelang-separate  overlap= 100.0% sum_valid= 100.0% (scores.sum=1.000000) max_diff=2.24e-01
+    ✓ ours               overlap= 100.0% sum_valid= 100.0% (scores.sum=1.000000) max_diff=2.24e-01
+  整体: OK
 
-优化策略：
-  - BLOCK_SIZE: 1024 (CUDA标准限制)
-  - SMEM_INPUT_SIZE: 12288 (利用H100的232KB opt-in共享内存)
-  - 缓存uint32值 (避免Stage 2重复float→uint32转换)
-  - 共享内存使用: 约148KB (需要H100大共享内存支持)
+====================================================================================================
+Latency (ms)
+====================================================================================================
+配置                 pytorch-baseline    torch.compile   tilelang-separate         ours
+-------------------------------------------------------------------------------------
+B64_E160_K6                  0.0258           1.2739              0.0565       0.0153
+B64_E256_K8                  0.0280           1.0038              0.0414       0.0093
+B128_E512_K16                0.0242           0.7219              0.0390       0.0156
+B64_E1024_K8                 0.0250           0.7110              0.0360       0.0099
+B64_E2048_K16                0.0311           0.7241              0.0378       0.0283
 
-⚙️  测试配置: 预热100次 + 测试1000次取平均 (与benchmark_optimizations.py一致)
-========================================================================================================================
-开始性能测试 (N=32768, k=2048, batch=64)...
-使用独立预热避免版本间干扰
-  测试 PyTorch baseline... 0.0997ms
-  测试 TileLang Official... 0.0380ms
-  测试 TileLang Optimized... 0.0384ms
-  测试 TileLang Large-k... 0.0414ms
-
-版本                             时间(ms)       加速比        正确性
-------------------------------------------------------------------------------------------------------------------------
-PyTorch baseline               0.0997       1.00x      ✓
-TileLang Official              0.0380       2.62      x ✓
-TileLang Optimized (通用)        0.0384       2.60      x ✓
-TileLang Large-k (大k优化)        0.0414       2.41      x ✓
-
-========================================================================================================================
-性能对比
-========================================================================================================================
-❌ Large-k优化版相比官方版退化: 8.88%
-❌ Large-k优化版相比通用优化版退化: 7.80%
-(tilelang) root@xhluo1-0:/cephfs/xhluo/tilelang_moe# python benchmarks/benchmark_large_k.py 
-========================================================================================================================
-大k场景 (N=32768, k=2048) 专项优化测试
-========================================================================================================================
-
-对比四个实现：
-  1. PyTorch baseline
-  2. TileLang Official (官方Radix Selection)
-  3. TileLang Optimized (通用优化版 - 小k场景优化)
-  4. TileLang Large-k (大k场景专门优化)
-
-优化策略：
-  - BLOCK_SIZE: 1024 (CUDA标准限制)
-  - SMEM_INPUT_SIZE: 12288 (利用H100的232KB opt-in共享内存)
-  - 缓存uint32值 (避免Stage 2重复float→uint32转换)
-  - 共享内存使用: 约148KB (需要H100大共享内存支持)
-
-⚙️  测试配置: 预热100次 + 测试1000次取平均 (与benchmark_optimizations.py一致)
-========================================================================================================================
-开始性能测试 (N=32768, k=2048, batch=64)...
-使用独立预热避免版本间干扰
-  测试 PyTorch baseline... 0.0998ms
-  测试 TileLang Official... 0.0356ms
-  测试 TileLang Optimized... 0.0368ms
-  测试 TileLang Large-k... 0.0413ms
-
-版本                             时间(ms)       加速比        正确性
-------------------------------------------------------------------------------------------------------------------------
-PyTorch baseline               0.0998       1.00x      ✓
-TileLang Official              0.0356       2.80      x ✓
-TileLang Optimized (通用)        0.0368       2.71      x ✓
-TileLang Large-k (大k优化)        0.0413       2.41      x ✓
-
-========================================================================================================================
-性能对比
-========================================================================================================================
-❌ Large-k优化版相比官方版退化: 16.17%
-❌ Large-k优化版相比通用优化版退化: 12.37%
-(tilelang) root@xhluo1-0:/cephfs/xhluo/tilelang_moe# python benchmarks/benchmark_large_k.py 
-========================================================================================================================
-大k场景 (N=32768, k=2048) 专项优化测试
-========================================================================================================================
-
-对比四个实现：
-  1. PyTorch baseline
-  2. TileLang Official (官方Radix Selection)
-  3. TileLang Optimized (通用优化版 - 小k场景优化)
-  4. TileLang Large-k (大k场景专门优化)
-
-优化策略：
-  - BLOCK_SIZE: 1024 (CUDA标准限制)
-  - SMEM_INPUT_SIZE: 12288 (利用H100的232KB opt-in共享内存)
-  - 缓存uint32值 (避免Stage 2重复float→uint32转换)
-  - 共享内存使用: 约148KB (需要H100大共享内存支持)
-
-⚙️  测试配置: 预热100次 + 测试1000次取平均 (与benchmark_optimizations.py一致)
-========================================================================================================================
-开始性能测试 (N=32768, k=2048, batch=64)...
-使用独立预热避免版本间干扰
-  测试 PyTorch baseline... 0.1025ms
-  测试 TileLang Official... 0.0344ms
-  测试 TileLang Optimized... 0.0370ms
-  测试 TileLang Large-k... 0.0447ms
-
-版本                             时间(ms)       加速比        正确性
-------------------------------------------------------------------------------------------------------------------------
-PyTorch baseline               0.1025       1.00x      ✓
-TileLang Official              0.0344       2.98      x ✓
-TileLang Optimized (通用)        0.0370       2.77      x ✓
-TileLang Large-k (大k优化)        0.0447       2.29      x ✓
-
-========================================================================================================================
-性能对比
-========================================================================================================================
-❌ Large-k优化版相比官方版退化: 29.93%
-❌ Large-k优化版相比通用优化版退化: 20.83%
+====================================================================================================
+Speedup vs pytorch-baseline
+====================================================================================================
+配置                 pytorch-baseline    torch.compile   tilelang-separate         ours
+-------------------------------------------------------------------------------------
+B64_E160_K6                   1.00x            0.02x               0.46x        1.69x
+B64_E256_K8                   1.00x            0.03x               0.68x        3.01x
+B128_E512_K16                 1.00x            0.03x               0.62x        1.54x
+B64_E1024_K8                  1.00x            0.04x               0.69x        2.52x
+B64_E2048_K16                 1.00x            0.04x               0.82x        1.10x

@@ -66,55 +66,21 @@ def topk_softmax_fused(
     return topk_scores, topk_indices
 
 
-# torch.compile版本：在模块级别定义，避免重复编译
-@torch.compile(mode='max-autotune', fullgraph=True)
-def _topk_softmax_compiled_impl(logits: torch.Tensor, k: int):
-    """编译后的实现，会被缓存复用"""
-    topk_logits, topk_indices = torch.topk(logits, k, dim=-1)
-    topk_scores = F.softmax(topk_logits, dim=-1, dtype=torch.float32)
+# torch.compile版本：在模块级别定义基础函数，然后编译
+# 关键：先定义函数，再在循环外编译，避免重复编译
+def _topk_softmax_separate_impl(logits: torch.Tensor, k: int):
+    """基础实现：先全局softmax，再topk（无算法版本）"""
+    scores = F.softmax(logits, dim=-1, dtype=torch.float32)
+    topk_scores, topk_indices = torch.topk(scores, k, dim=-1)
     return topk_scores, topk_indices
 
 
-def topk_softmax_fused_compiled(
-    logits: torch.Tensor,
-    k: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    torch.compile优化的融合版本
-    
-    使用max-autotune模式获得最佳性能。
-    编译后的函数会被缓存，避免重复编译开销。
-    """
-    return _topk_softmax_compiled_impl(logits, k)
-
-
-# torch.compile版本工厂（无算法版本）
-# 返回一个闭包，k被固定在编译时
-def make_topk_softmax_separate_compiled(k: int):
-    """
-    创建torch.compile优化的baseline版本。
-    k被固定为编译时常量，避免动态重编译。
-    """
-    @torch.compile(mode='reduce-overhead', fullgraph=True)
-    def compiled_fn(logits: torch.Tensor):
-        scores = F.softmax(logits, dim=-1, dtype=torch.float32)
-        topk_scores, topk_indices = torch.topk(scores, k, dim=-1)
-        return topk_scores, topk_indices
-    
-    return compiled_fn
-
-
-def topk_softmax_separate_compiled(
-    logits: torch.Tensor,
-    k: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    torch.compile包装器 - 实际性能可能不佳因为重复编译，
-    为了一致的API设计而保留。
-    生产环境应该使用make_topk_softmax_separate_compiled工厂。
-    """
-    fn = make_topk_softmax_separate_compiled(k)
-    return fn(logits)
+# 在模块加载时一次性编译，后续调用自动复用缓存
+topk_softmax_separate_compiled = torch.compile(
+    _topk_softmax_separate_impl,
+    mode='reduce-overhead',  # 针对小算子优化
+    fullgraph=False,  # 允许动态k参数，不强制单图
+)
 
 
 class TopKSoftmaxRouter(torch.nn.Module):
