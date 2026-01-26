@@ -58,10 +58,26 @@ try:
     else:
         print(f"\n❌ FAIL: Large difference detected!")
         
-        # Debug: print first few values
-        print("\nFirst expert (tokens 0-3):")
-        print("  Baseline[0]:", Y_baseline[0, :8].tolist())
-        print("  Sonic[0]:   ", Y_sonic[0, :8].tolist())
+        # Debug: print more details for each expert
+        print("\nDetailed comparison by expert:")
+        for expert_id in range(E):
+            mask = expert_indices == expert_id
+            indices = torch.where(mask)[0]
+            if len(indices) == 0:
+                continue
+            
+            expert_baseline = Y_baseline[mask]
+            expert_sonic = Y_sonic[mask]
+            expert_diff = (expert_sonic - expert_baseline).abs()
+            
+            print(f"\n  Expert {expert_id} (tokens {indices.tolist()}):")
+            print(f"    Max diff: {expert_diff.max().item():.6f}")
+            print(f"    Mean diff: {expert_diff.mean().item():.6f}")
+            print(f"    Baseline[{indices[0].item()}][0:4]: {expert_baseline[0, :4].tolist()}")
+            print(f"    Sonic[{indices[0].item()}][0:4]:    {expert_sonic[0, :4].tolist()}")
+            if len(indices) > 1:
+                print(f"    Baseline[{indices[-1].item()}][0:4]: {expert_baseline[-1, :4].tolist()}")
+                print(f"    Sonic[{indices[-1].item()}][0:4]:    {expert_sonic[-1, :4].tolist()}")
         
 except Exception as e:
     print(f"\n❌ ERROR: {e}")
