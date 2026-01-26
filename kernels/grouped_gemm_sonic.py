@@ -32,10 +32,9 @@ def grouped_gemm_sonic_kernel(
     """
     Sonic-style Grouped GEMM Kernel
     
-    关键特性：
-    1. 单kernel处理所有expert
-    2. 每个block根据expert_offset动态选择任务
-    3. Shared memory缓存权重和输入
+    关键变化（参考官方example_dequant_groupedgemm_bf16_mxfp4_hopper.py）：
+    - 使用预计算的block_expert_ids tensor，直接查表获取expert_id
+    - 不再在kernel中循环计算expert归属
     
     Args:
         total_tokens: 总token数
@@ -51,51 +50,30 @@ def grouped_gemm_sonic_kernel(
     def grouped_gemm_sonic(
         X: T.Tensor((total_tokens, H), dtype),           # 输入tokens (已按expert排序)
         W: T.Tensor((E, I, H), dtype),                   # Expert权重
-        expert_offsets: T.Tensor((E + 1,), T.int32),     # Expert累计offset (token级别)
-        block_offsets: T.Tensor((E + 1,), T.int32),      # Expert累计offset (block级别)
+        block_expert_ids: T.Tensor((total_blocks,), T.int32),  # 预计算：每个block对应的expert_id
+        block_m_starts: T.Tensor((total_blocks,), T.int32),    # 预计算：每个block的m_start
         Y: T.Tensor((total_tokens, I), dtype),           # 输出
-        debug_info: T.Tensor((total_blocks, 4), T.int32), # Debug: [expert_id, m_start, actual_rows, local_block_id]
+        debug_info: T.Tensor((total_blocks, 4), T.int32), # Debug
     ):
-        # Sonic算法：tokens已按expert排序，每个expert分配若干blocks
-        # 参考官方grouped_gemm，使用T.if_then_else查找expert
-        # total_blocks在编译时传入（避免运行时访问block_offsets[E]）
-        
         with T.Kernel(total_blocks, T.ceildiv(I, block_N), threads=128) as (bx, by):
             # Shared memory buffers
             X_shared = T.alloc_shared([block_M, block_K], dtype)
             W_shared = T.alloc_shared([block_K, block_N], dtype)
             C_local = T.alloc_fragment([block_M, block_N], accum_dtype)
             
-            # 找到当前block属于哪个expert
-            # block_offsets[e] 是expert e的第一个block ID  
-            # 需要找到满足 block_offsets[e] <= bx < block_offsets[e+1] 的e
-            expert_id = T.alloc_var(dtype=T.int32)
+            # 从预计算tensor中直接读取expert_id和m_start
+            # 这是官方推荐的方式，避免在kernel中用循环查找
+            expert_id_local = T.alloc_shared([1], T.int32)
+            expert_id_local[0] = block_expert_ids[bx]
             
-            # 参考官方实现，不显式初始化，让T.if_then_else处理
-            # 正向遍历，持续更新直到不满足条件
-            for e in range(E):
-                in_cur_expert = bx >= block_offsets[e]
-                expert_id = T.if_then_else(in_cur_expert, e, expert_id)
+            m_start = block_m_starts[bx]
             
-            # 计算当前block在expert内的局部位置
-            local_block_id = bx - block_offsets[expert_id]
-            
-            # Expert的token范围
-            expert_start = expert_offsets[expert_id]
-            expert_end = expert_offsets[expert_id + 1]
-            expert_tokens = expert_end - expert_start
-            
-            # 当前block处理的token范围
-            m_start = expert_start + local_block_id * block_M
-            remaining_tokens = expert_tokens - local_block_id * block_M
-            actual_rows = T.min(block_M, remaining_tokens)
-            
-            # Debug: 记录每个block的信息（只在by=0时写入避免重复）
+            # Debug: 记录每个block的信息
             if by == 0:
-                debug_info[bx, 0] = expert_id
+                debug_info[bx, 0] = expert_id_local[0]
                 debug_info[bx, 1] = m_start
-                debug_info[bx, 2] = actual_rows
-                debug_info[bx, 3] = local_block_id
+                debug_info[bx, 2] = block_M  # actual_rows由host计算
+                debug_info[bx, 3] = bx
             
             # GEMM计算
             T.clear(C_local)
@@ -103,29 +81,26 @@ def grouped_gemm_sonic_kernel(
                 # 加载X: [block_M, block_K]
                 T.copy(X[m_start : m_start + block_M, k * block_K : (k + 1) * block_K], X_shared)
                 
-                # 加载W转置: W[expert_id, by*block_N:(by+1)*block_N, k*block_K:(k+1)*block_K] -> W_shared[block_K, block_N]
-                # 注意：W是[E, I, H]，我们需要[H, I]的转置 -> [block_K, block_N]
-                # 由于TileLang不支持用变量索引tensor，需要用if_then_else逐个处理
+                # 加载W: 根据expert_id加载对应权重
+                # 由于TileLang不支持用变量直接索引（W[expert_id_local[0], ...]），
+                # 我们遍历所有expert，用if_then_else选择正确的
                 for i, j in T.Parallel(block_K, block_N):
                     k_idx = k * block_K + i
                     n_idx = by * block_N + j
                     if k_idx < H and n_idx < I:
-                        # 根据expert_id选择权重 - 在if内部声明可变变量
-                        w_val = T.alloc_var(dtype=dtype)
-                        w_val = T.cast(0.0, dtype)
+                        w_val = W[0, n_idx, k_idx]  # 默认值
                         for e in range(E):
-                            is_expert = expert_id == e
-                            w_val = T.if_then_else(is_expert, W[e, n_idx, k_idx], w_val)
+                            w_val = T.if_then_else(expert_id_local[0] == e, W[e, n_idx, k_idx], w_val)
                         W_shared[i, j] = w_val
                     else:
                         W_shared[i, j] = T.cast(0.0, dtype)
                 
-                # GEMM: C_local += X_shared @ W_shared (W_shared已经是转置的layout)
+                # GEMM: C_local += X_shared @ W_shared
                 T.gemm(X_shared, W_shared, C_local)
             
             # Store结果
             for i, j in T.Parallel(block_M, block_N):
-                if i < actual_rows and by * block_N + j < I:
+                if m_start + i < total_tokens and by * block_N + j < I:
                     Y[m_start + i, by * block_N + j] = T.cast(C_local[i, j], dtype)
     
     return grouped_gemm_sonic
@@ -189,23 +164,31 @@ def grouped_gemm_sonic(
     # 准备metadata
     sorted_indices, expert_offsets = prepare_expert_metadata(expert_indices, E)
     
-    # 计算block_offsets: 每个expert需要多少blocks
+    # 计算block调度信息
     block_M = 128
     expert_counts = expert_offsets[1:] - expert_offsets[:-1]  # 每个expert的token数
     expert_blocks = torch.ceil(expert_counts.float() / block_M).to(torch.int32)  # 每个expert的block数
-    block_offsets = torch.cat([
-        torch.tensor([0], device=device, dtype=torch.int32),
-        torch.cumsum(expert_blocks, dim=0, dtype=torch.int32)
-    ])
+    
+    # 预计算每个block的expert_id和m_start（参考官方实现）
+    # 这是关键：不在kernel中计算，而是预先准备好
+    block_expert_ids = []
+    block_m_starts = []
+    for e in range(E):
+        num_blocks = int(expert_blocks[e].item())
+        expert_start = int(expert_offsets[e].item())
+        for b in range(num_blocks):
+            block_expert_ids.append(e)
+            block_m_starts.append(expert_start + b * block_M)
+    
+    block_expert_ids = torch.tensor(block_expert_ids, dtype=torch.int32, device=device)
+    block_m_starts = torch.tensor(block_m_starts, dtype=torch.int32, device=device)
+    total_blocks_value = len(block_expert_ids)
     
     # Gather: 按expert排序后的tokens
     X_sorted = X[sorted_indices]
     
-    # 计算total_blocks (在host端)
-    total_blocks_value = int(block_offsets[-1].item())
-    
     # 编译kernel
-    cache_key = (total_tokens, H, I, E)
+    cache_key = (total_tokens, H, I, E, total_blocks_value)
     if cache_key not in grouped_gemm_sonic.compile_cache:
         kernel = grouped_gemm_sonic_kernel(
             total_tokens=total_tokens,
@@ -223,23 +206,19 @@ def grouped_gemm_sonic(
     
     kernel = grouped_gemm_sonic.compile_cache[cache_key]
     
-    # 转换参数为int32
-    expert_offsets_int32 = expert_offsets.to(torch.int32)
-    block_offsets_int32 = block_offsets.to(torch.int32)
-    
     # 执行kernel (Y和debug_info由kernel返回)
-    Y_sorted, debug_info = kernel(X_sorted, W, expert_offsets_int32, block_offsets_int32)
+    Y_sorted, debug_info = kernel(X_sorted, W, block_expert_ids, block_m_starts)
     
     # Print debug info
     if os.environ.get('DEBUG_SONIC', '0') == '1':
         print("\n[DEBUG] Sonic kernel execution:")
         print(f"  total_blocks: {total_blocks_value}")
+        print(f"  block_expert_ids (precomputed): {block_expert_ids.tolist()}")
+        print(f"  block_m_starts (precomputed): {block_m_starts.tolist()}")
         for bx in range(total_blocks_value):
             expert_id = debug_info[bx, 0].item()
             m_start = debug_info[bx, 1].item()
-            actual_rows = debug_info[bx, 2].item()
-            local_block_id = debug_info[bx, 3].item()
-            print(f"  Block {bx}: expert={expert_id}, m_start={m_start}, actual_rows={actual_rows}, local_block={local_block_id}")
+            print(f"  Block {bx}: expert={expert_id}, m_start={m_start}")
     
     # Scatter: 恢复原顺序
     Y = torch.zeros_like(Y_sorted)
