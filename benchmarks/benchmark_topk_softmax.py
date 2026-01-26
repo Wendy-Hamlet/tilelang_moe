@@ -57,8 +57,15 @@ def verify_correctness(
     indices: torch.Tensor,
     ref_scores: torch.Tensor,
     ref_indices: torch.Tensor,
+    is_renormalized: bool = False,
 ) -> dict:
-    """验证正确性"""
+    """验证正确性
+    
+    Args:
+        is_renormalized: 是否对topk结果重新归一化
+            - False: baseline/compile方法（先全局softmax→topk，sum<1）
+            - True: tilelang/ours方法（先topk→局部softmax，sum=1）
+    """
     
     # 索引匹配率（考虑相同值可能有不同索引）
     batch_size, k = indices.shape
@@ -78,9 +85,16 @@ def verify_correctness(
     max_diff = score_diff.max().item()
     mean_diff = score_diff.mean().item()
     
-    # 归一化检查
-    sum_scores = scores.sum(dim=-1)
-    sum_valid = ((sum_scores - 1.0).abs() < 1e-4).float().mean().item()
+    # 归一化检查：根据方法类型判断期望的sum值
+    if is_renormalized:
+        # tilelang/ours: 期望sum=1.0（对k个元素重新归一化）
+        sum_scores = scores.sum(dim=-1)
+        sum_valid = ((sum_scores - 1.0).abs() < 1e-4).float().mean().item()
+    else:
+        # baseline/compile: 期望与参考baseline一致（都是从归一化分布中选k个，sum<1）
+        ref_sum = ref_scores.sum(dim=-1)
+        test_sum = scores.sum(dim=-1)
+        sum_valid = ((ref_sum - test_sum).abs() < 1e-4).float().mean().item()
     
     return {
         'overlap': avg_overlap,
@@ -142,7 +156,9 @@ def benchmark_config(
         for name, res in results.items():
             if name == 'pytorch-baseline' or res is None:
                 continue
-            c = verify_correctness(res['scores'], res['indices'], ref_scores, ref_indices)
+            # 判断是否重新归一化：tilelang-separate和ours对k个元素重新softmax
+            is_renormalized = name in ['tilelang-separate', 'ours']
+            c = verify_correctness(res['scores'], res['indices'], ref_scores, ref_indices, is_renormalized)
             is_ok = (c['overlap'] > 0.95 and c['sum_valid'] > 0.95)
             ok = ok and is_ok
             status = "✓" if is_ok else "⚠"
