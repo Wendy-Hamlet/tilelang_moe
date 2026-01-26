@@ -1,10 +1,11 @@
 """
-TopK+Softmax性能对比测试
+TopK + Softmax 性能对比基准
 
-对比三个实现：
-1. PyTorch Baseline (分离版本)
-2. PyTorch Fused (融合版本)
-3. TileLang Sonic (Sonic优化)
+对比四个版本：
+1) pytorch baseline（无算法版本：全局softmax→topk）
+2) torch.compile（无算法版本：1) 的编译优化）
+3) tilelang（无算法版本：两个算子分开，TopK用TileLang官方Radix实现 + PyTorch对k做softmax）
+4) ours（融合+sonic算法：单kernel完成topk+softmax）
 """
 
 import sys
@@ -12,63 +13,40 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
-import time
+from typing import Callable, Dict
 from kernels.topk_softmax_baseline import (
     topk_softmax_separate,
-    topk_softmax_fused,
-    topk_softmax_fused_compiled,
+    topk_softmax_separate_compiled,
 )
+from kernels.topk_softmax_tilelang_separate import topk_softmax_tilelang_separate
 from kernels.topk_softmax_sonic import topk_softmax_sonic
 
 
-def benchmark_version(
-    name: str,
-    func,
+def benchmark_callable(
+    func: Callable[[torch.Tensor], tuple],
     logits: torch.Tensor,
-    k: int,
     num_warmup: int = 50,
     num_runs: int = 1000,
-    **kwargs
-) -> dict:
-    """
-    Benchmark单个版本
-    
-    Returns:
-        dict with 'latency_ms', 'scores', 'indices'
-    """
-    device = logits.device
-    batch_size, num_experts = logits.shape
-    
+) -> Dict[str, torch.Tensor | float]:
+    """对一个签名为 f(logits)->(scores, indices) 的函数进行基准测试。"""
     # Warmup
     for _ in range(num_warmup):
-        if 'tilelang' in name.lower():
-            # TileLang kernel with out_idx returns outputs automatically
-            _ = func(logits)
-        else:
-            _ = func(logits, k, **kwargs)
+        _ = func(logits)
     torch.cuda.synchronize()
-    
-    # Benchmark using CUDA events for accurate GPU timing
+
+    # GPU event timing (ms)
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
-    
+
     start_event.record()
     for _ in range(num_runs):
-        if 'tilelang' in name.lower():
-            # TileLang kernel with out_idx returns outputs automatically
-            scores_out, indices_out = func(logits)
-        else:
-            scores_out, indices_out = func(logits, k, **kwargs)
+        scores_out, indices_out = func(logits)
     end_event.record()
-    
+
     torch.cuda.synchronize()
     latency_ms = start_event.elapsed_time(end_event) / num_runs
-    
-    return {
-        'latency_ms': latency_ms,
-        'scores': scores_out,
-        'indices': indices_out,
-    }
+
+    return {"latency_ms": latency_ms, "scores": scores_out, "indices": indices_out}
 
 
 def verify_correctness(
@@ -115,140 +93,73 @@ def benchmark_config(
     top_k: int,
     config_name: str,
 ):
-    """测试单个配置"""
-    print(f"\n{'=' * 100}")
-    print(f"{config_name}: batch={batch_size}, experts={num_experts}, k={top_k}")
-    print(f"{'=' * 100}")
-    
-    # 准备数据
+    """测试单个配置，返回四个版本的结果。"""
+    print(f"\n—— Running: {config_name} (B={batch_size}, E={num_experts}, K={top_k})")
+
+    # Data
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
     logits = torch.randn(batch_size, num_experts, device='cuda', dtype=torch.float32)
+
+    # Build runners with unified signature f(logits)->(scores, indices)
+    sonic_kernel = topk_softmax_sonic(batch_size, num_experts, top_k)
+
+    runners: Dict[str, Callable[[torch.Tensor], tuple]] = {
+        # 1) pytorch baseline（无算法版本）
+        'pytorch-baseline': lambda x: topk_softmax_separate(x, top_k),
+        # 2) torch.compile（无算法版本）
+        'torch.compile': lambda x: topk_softmax_separate_compiled(x, top_k),
+        # 3) tilelang（无算法版本，两个算子分开，官方TopK）
+        'tilelang-separate': lambda x: topk_softmax_tilelang_separate(x, top_k),
+        # 4) ours（融合+sonic算法，单kernel）
+        'ours': lambda x: sonic_kernel(x),
+    }
+
+    results: Dict[str, Dict] = {}
+    for name, fn in runners.items():
+        try:
+            out = benchmark_callable(fn, logits)
+            results[name] = out
+            print(f"  ✓ {name}: {out['latency_ms']:.4f} ms")
+        except Exception as e:
+            print(f"  ✗ {name}: {e}")
+            results[name] = None
     
-    results = {}
-    
-    # 1. PyTorch Baseline (分离)
-    print("\n[1/4] PyTorch Baseline (Separate)...")
-    try:
-        results['baseline'] = benchmark_version(
-            "PyTorch Baseline",
-            topk_softmax_separate,
-            logits,
-            top_k,
-        )
-        print(f"  ✓ Latency: {results['baseline']['latency_ms']:.4f} ms")
-    except Exception as e:
-        print(f"  ✗ Failed: {e}")
-        results['baseline'] = None
-    
-    # 2. PyTorch Fused
-    print("\n[2/4] PyTorch Fused...")
-    try:
-        results['fused'] = benchmark_version(
-            "PyTorch Fused",
-            topk_softmax_fused,
-            logits,
-            top_k,
-        )
-        print(f"  ✓ Latency: {results['fused']['latency_ms']:.4f} ms")
-    except Exception as e:
-        print(f"  ✗ Failed: {e}")
-        results['fused'] = None
-    
-    # 3. PyTorch Compiled
-    print("\n[3/4] PyTorch Compiled...")
-    try:
-        results['compiled'] = benchmark_version(
-            "PyTorch Compiled",
-            topk_softmax_fused_compiled,
-            logits,
-            top_k,
-        )
-        print(f"  ✓ Latency: {results['compiled']['latency_ms']:.4f} ms")
-    except Exception as e:
-        print(f"  ✗ Failed: {e}")
-        results['compiled'] = None
-    
-    # 4. TileLang Sonic
-    print("\n[4/4] TileLang Sonic...")
-    try:
-        kernel = topk_softmax_sonic(batch_size, num_experts, top_k)
-        results['sonic'] = benchmark_version(
-            "TileLang Sonic",
-            kernel,
-            logits,
-            top_k,
-        )
-        print(f"  ✓ Latency: {results['sonic']['latency_ms']:.4f} ms")
-    except Exception as e:
-        print(f"  ✗ Failed: {e}")
-        import traceback
-        traceback.print_exc()
-        results['sonic'] = None
-    
-    # 验证正确性
-    if results['baseline'] is not None:
-        ref_scores = results['baseline']['scores']
-        ref_indices = results['baseline']['indices']
-        
-        print(f"\n{'─' * 100}")
-        print("正确性验证 (vs Baseline)")
-        print(f"{'─' * 100}")
-        print(f"{'版本':<20} {'Overlap':<12} {'MaxDiff':<12} {'MeanDiff':<12} {'SumValid':<12}")
-        print(f"{'─' * 100}")
-        
-        for name, result in results.items():
-            if result is not None and name != 'baseline':
-                correctness = verify_correctness(
-                    result['scores'],
-                    result['indices'],
-                    ref_scores,
-                    ref_indices,
-                )
-                print(f"{name:<20} {correctness['overlap']*100:>10.2f}% "
-                      f"{correctness['max_diff']:>10.2e} "
-                      f"{correctness['mean_diff']:>10.2e} "
-                      f"{correctness['sum_valid']*100:>10.2f}%")
-    
-    # 性能总结
-    print(f"\n{'─' * 100}")
-    print("性能总结")
-    print(f"{'─' * 100}")
-    print(f"{'版本':<20} {'Latency (ms)':<15} {'加速比':<12} {'状态':<10}")
-    print(f"{'─' * 100}")
-    
-    baseline_time = results['baseline']['latency_ms'] if results['baseline'] else None
-    
-    for name, result in results.items():
-        if result is not None:
-            speedup = baseline_time / result['latency_ms'] if baseline_time else 1.0
-            status = "✓"
-            print(f"{name:<20} {result['latency_ms']:<15.4f} {speedup:<12.2f}x {status:<10}")
-        else:
-            print(f"{name:<20} {'N/A':<15} {'N/A':<12} {'✗':<10}")
-    
-    print(f"{'=' * 100}\n")
+    # 正确性（对照pytorch-baseline）
+    if results.get('pytorch-baseline') is not None:
+        ref_scores = results['pytorch-baseline']['scores']
+        ref_indices = results['pytorch-baseline']['indices']
+        print("  正确性 (vs pytorch-baseline):", end=" ")
+        ok = True
+        for name, res in results.items():
+            if name == 'pytorch-baseline' or res is None:
+                continue
+            c = verify_correctness(res['scores'], res['indices'], ref_scores, ref_indices)
+            ok = ok and (c['overlap'] > 0.95 and c['sum_valid'] > 0.95)
+        print("OK" if ok else "WARN")
     
     return results
 
 
 def main():
     print("=" * 100)
-    print("TopK + Softmax 性能对比测试")
+    print("TopK + Softmax 性能对比")
     print("=" * 100)
-    print("\n对比版本:")
-    print("  1. PyTorch Baseline    - 先全局softmax再topk")
-    print("  2. PyTorch Fused       - 先topk再局部softmax（Sonic策略）")
-    print("  3. PyTorch Compiled    - torch.compile优化的融合版本")
-    print("  4. TileLang Sonic      - TileLang手写融合kernel")
-    print("\n测试配置: 50次预热 + 1000次测试取平均")
+    print("版本:")
+    print("- pytorch-baseline: 全局softmax→topk")
+    print("- torch.compile: 编译优化的baseline")
+    print("- tilelang-separate: 官方TopK + PyTorch对k softmax")
+    print("- ours: 单kernel融合 + sonic算法")
+    print("\n计时: CUDA Events，50 warmup + 1000 runs 平均")
     print("=" * 100)
     
     # 测试场景
     test_configs = [
-        (64, 160, 6, "DeepSeek-V2 (小规模)"),
-        (64, 256, 8, "DeepSeek-V3 (标准)"),
-        (128, 512, 16, "大规模"),
+        (64, 160, 6, "DeepSeek-V2"),
+        (64, 256, 8, "DeepSeek-V3"),
+        (128, 512, 16, "Large-512x16"),
+        (64, 1024, 8, "N1024-K8"),
+        (64, 2048, 16, "N2048-K16"),
     ]
     
     all_results = {}
@@ -262,34 +173,33 @@ def main():
             import traceback
             traceback.print_exc()
     
-    # 最终总结
+    # 输出表格：Latency
     print("\n" + "=" * 100)
-    print("跨配置性能对比")
+    print("Latency (ms)")
     print("=" * 100)
-    print(f"{'配置':<25} {'Baseline':<12} {'Fused':<12} {'Compiled':<12} {'Sonic':<12}")
-    print("=" * 100)
-    
-    for config_name, results in all_results.items():
-        row = f"{config_name:<25}"
-        for key in ['baseline', 'fused', 'compiled', 'sonic']:
-            if results.get(key):
-                row += f"{results[key]['latency_ms']:<12.4f}"
-            else:
-                row += f"{'N/A':<12}"
-        print(row)
-    
-    print("=" * 100)
-    
-    # 最佳实现总结
+    header = f"{'配置':<18} {'pytorch-baseline':>16} {'torch.compile':>16} {'tilelang-separate':>19} {'ours':>12}"
+    print(header)
+    print("-" * len(header))
+    for cfg, results in all_results.items():
+        def get_ms(name):
+            r = results.get(name)
+            return f"{r['latency_ms']:.4f}" if r else "N/A"
+        print(f"{cfg:<18} {get_ms('pytorch-baseline'):>16} {get_ms('torch.compile'):>16} {get_ms('tilelang-separate'):>19} {get_ms('ours'):>12}")
+
+    # 输出表格：Speedup vs pytorch-baseline
     print("\n" + "=" * 100)
-    print("结论")
+    print("Speedup vs pytorch-baseline")
     print("=" * 100)
-    print("预期性能排名（基于Sonic论文）:")
-    print("  1. TileLang Sonic    - 3.0x vs Baseline (融合+优化算法)")
-    print("  2. PyTorch Compiled  - 1.5x vs Baseline (编译器优化)")
-    print("  3. PyTorch Fused     - 1.2x vs Baseline (减少内存访问)")
-    print("  4. PyTorch Baseline  - 1.0x (基准)")
-    print("=" * 100)
+    print(header)
+    print("-" * len(header))
+    for cfg, results in all_results.items():
+        base = results.get('pytorch-baseline')
+        def sp(name):
+            r = results.get(name)
+            if not base or not r:
+                return "N/A"
+            return f"{base['latency_ms']/r['latency_ms']:.2f}x"
+        print(f"{cfg:<18} {'1.00x':>16} {sp('torch.compile'):>16} {sp('tilelang-separate'):>19} {sp('ours'):>12}")
 
 
 if __name__ == "__main__":

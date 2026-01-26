@@ -88,6 +88,25 @@ def topk_softmax_fused_compiled(
     return _topk_softmax_compiled_impl(logits, k)
 
 
+# torch.compile版本（无算法版本，Baseline：全局softmax→topk）
+@torch.compile(mode='max-autotune', fullgraph=True)
+def _topk_softmax_separate_compiled_impl(logits: torch.Tensor, k: int):
+    scores = F.softmax(logits, dim=-1, dtype=torch.float32)
+    topk_scores, topk_indices = torch.topk(scores, k, dim=-1)
+    return topk_scores, topk_indices
+
+
+def topk_softmax_separate_compiled(
+    logits: torch.Tensor,
+    k: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    无算法版本（Baseline）的torch.compile加速：
+    先全局softmax再topk，函数在模块级别编译以复用缓存。
+    """
+    return _topk_softmax_separate_compiled_impl(logits, k)
+
+
 class TopKSoftmaxRouter(torch.nn.Module):
     """
     MoE Router模块 - 封装topk+softmax逻辑
