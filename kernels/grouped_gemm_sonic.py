@@ -16,7 +16,7 @@ import tilelang.language as T
 from typing import Tuple
 
 
-@tilelang.jit(out_idx=[-1])
+@tilelang.jit(out_idx=[4, 5])
 def grouped_gemm_sonic_kernel(
     total_tokens: int,
     H: int,
@@ -200,7 +200,7 @@ def grouped_gemm_sonic(
     # 编译kernel
     cache_key = (total_tokens, H, I, E)
     if cache_key not in grouped_gemm_sonic.compile_cache:
-        kernel_func = grouped_gemm_sonic_kernel(
+        kernel = grouped_gemm_sonic_kernel(
             total_tokens=total_tokens,
             H=H,
             I=I,
@@ -212,8 +212,6 @@ def grouped_gemm_sonic(
             dtype=T.float16,
             accum_dtype=T.float32
         )
-        # JIT编译，指定Y和debug_info为输出（索引4和5）
-        kernel = T.jit(kernel_func, out_idx=[4, 5], name="grouped_gemm_sonic")
         grouped_gemm_sonic.compile_cache[cache_key] = kernel
     
     kernel = grouped_gemm_sonic.compile_cache[cache_key]
