@@ -48,19 +48,21 @@ def benchmark_version(
             _ = func(logits, k, **kwargs)
     torch.cuda.synchronize()
     
-    # Benchmark
-    torch.cuda.synchronize()
-    start = time.perf_counter()
+    # Benchmark using CUDA events for accurate GPU timing
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
     
+    start_event.record()
     for _ in range(num_runs):
         if 'tilelang' in name.lower():
             # TileLang kernel with out_idx returns outputs automatically
             scores_out, indices_out = func(logits)
         else:
             scores_out, indices_out = func(logits, k, **kwargs)
+    end_event.record()
     
     torch.cuda.synchronize()
-    latency_ms = (time.perf_counter() - start) / num_runs * 1000
+    latency_ms = start_event.elapsed_time(end_event) / num_runs
     
     return {
         'latency_ms': latency_ms,
