@@ -268,7 +268,7 @@ def main():
         latencies = result["latencies"]
         
         row = [config]
-        for version in ["pytorch-loop", "pytorch-compiled", "tilelang-separate", "ours (sonic)"]:
+        for version in ["pytorch-loop", "pytorch-compiled", "tilelang-separate", "tilelang-official", "ours (sonic)"]:
             lat = latencies.get(version, float('inf'))
             if lat == float('inf'):
                 row.append("FAILED")
@@ -277,10 +277,10 @@ def main():
         
         latency_table.append(row)
     
-    headers = ["Config", "PyTorch", "Compiled", "TileLang-Sep", "Ours (Sonic)"]
+    headers = ["Config", "PyTorch", "Compiled", "TL-Separate", "TL-Official", "Ours (Sonic)"]
     print(tabulate(latency_table, headers=headers, tablefmt="grid"))
     
-    # 加速比表格
+    # 加速比表格（vs PyTorch）
     print("\n" + "="*80)
     print("SUMMARY: Speedup vs PyTorch Baseline")
     print("="*80)
@@ -295,7 +295,7 @@ def main():
             continue
         
         row = [config]
-        for version in ["pytorch-compiled", "tilelang-separate", "ours (sonic)"]:
+        for version in ["pytorch-compiled", "tilelang-separate", "tilelang-official", "ours (sonic)"]:
             lat = latencies.get(version, float('inf'))
             if lat == float('inf') or lat == 0:
                 row.append("N/A")
@@ -305,15 +305,44 @@ def main():
         
         speedup_table.append(row)
     
-    headers = ["Config", "Compiled", "TileLang-Sep", "Ours (Sonic)"]
+    headers = ["Config", "Compiled", "TL-Separate", "TL-Official", "Ours (Sonic)"]
     print(tabulate(speedup_table, headers=headers, tablefmt="grid"))
+    
+    # ============ Ours vs TileLang Official 对比 ============
+    print("\n" + "="*80)
+    print("SUMMARY: Ours (Sonic) vs TileLang Official")
+    print("="*80)
+    
+    compare_table = []
+    for result in all_results:
+        config = result["config"]
+        latencies = result["latencies"]
+        
+        official = latencies.get("tilelang-official", float('inf'))
+        ours = latencies.get("ours (sonic)", float('inf'))
+        
+        if official == float('inf') or ours == float('inf'):
+            continue
+        
+        diff_pct = (ours - official) / official * 100
+        if ours < official:
+            status = "✅ Faster"
+        elif ours > official * 1.05:
+            status = "❌ Slower"
+        else:
+            status = "≈ Same"
+        
+        compare_table.append([config, f"{official:.4f}", f"{ours:.4f}", f"{diff_pct:+.1f}%", status])
+    
+    headers = ["Config", "TL-Official (ms)", "Ours (ms)", "Diff", "Status"]
+    print(tabulate(compare_table, headers=headers, tablefmt="grid"))
     
     # ============ 计算平均加速 ============
     print("\n" + "="*80)
-    print("Average Speedup:")
+    print("Average Speedup vs PyTorch:")
     print("="*80)
     
-    for version in ["pytorch-compiled", "tilelang-separate", "ours (sonic)"]:
+    for version in ["pytorch-compiled", "tilelang-separate", "tilelang-official", "ours (sonic)"]:
         speedups = []
         for result in all_results:
             latencies = result["latencies"]
