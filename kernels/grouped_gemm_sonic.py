@@ -125,13 +125,16 @@ def grouped_gemm_forward(
             B_shared = T.alloc_shared([block_K, block_N], dtype)
             C_local = T.alloc_fragment([block_M, block_N], accum_dtype)
             
-            # Group index tracking
+            # Group index tracking - MUST initialize to 0
             cur_batch_idx = T.alloc_var(dtype=T.int32)
+            cur_batch_idx = 0  # Initialize to first expert
 
             # Compute M offset from block index
             m_start_padded = bx * block_M
 
             # Find which group this block belongs to (linear search)
+            # Note: When experts have 0 tokens, batch_padded_offsets may have repeated values
+            # The >= comparison ensures we find the correct (last matching) expert
             for i in range(batch_count):
                 in_cur_batch_idx = m_start_padded >= batch_padded_offsets[i]
                 cur_batch_idx = T.if_then_else(in_cur_batch_idx, i, cur_batch_idx)
@@ -217,10 +220,13 @@ def grouped_gemm_forward_with_silu(
             gate_local = T.alloc_fragment([block_M, block_N], accum_dtype)
             up_local = T.alloc_fragment([block_M, block_N], accum_dtype)
             
+            # Group index tracking - MUST initialize to 0
             cur_batch_idx = T.alloc_var(dtype=T.int32)
+            cur_batch_idx = 0  # Initialize to first expert
 
             m_start_padded = bx * block_M
 
+            # Find which group this block belongs to (linear search)
             for i in range(batch_count):
                 in_cur_batch_idx = m_start_padded >= batch_padded_offsets[i]
                 cur_batch_idx = T.if_then_else(in_cur_batch_idx, i, cur_batch_idx)
@@ -482,10 +488,13 @@ def grouped_gemm_forward_fused_moe(
             gate_local = T.alloc_fragment([block_M, block_N], accum_dtype)
             up_local = T.alloc_fragment([block_M, block_N], accum_dtype)
             
+            # Group index tracking - MUST initialize to 0
             cur_batch_idx = T.alloc_var(dtype=T.int32)
+            cur_batch_idx = 0  # Initialize to first expert
 
             m_start_padded = bx * block_M
 
+            # Find which group this block belongs to (linear search)
             for i in range(batch_count):
                 in_cur_batch_idx = m_start_padded >= batch_padded_offsets[i]
                 cur_batch_idx = T.if_then_else(in_cur_batch_idx, i, cur_batch_idx)
@@ -574,10 +583,13 @@ def grouped_gemm_forward_hopper(
             data_is_ready = T.alloc_barrier(arrive_count=128)
             compute_is_done = T.alloc_barrier(arrive_count=128)
             
+            # Group index tracking - MUST initialize to 0
             cur_batch_idx = T.alloc_var(dtype=T.int32)
+            cur_batch_idx = 0  # Initialize to first expert
 
             m_start_padded = bx * block_M
 
+            # Find which group this block belongs to (linear search)
             for i in range(batch_count):
                 in_cur_batch_idx = m_start_padded >= batch_padded_offsets[i]
                 cur_batch_idx = T.if_then_else(in_cur_batch_idx, i, cur_batch_idx)
