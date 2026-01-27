@@ -17,6 +17,7 @@ from .grouped_gemm_baseline import (
     grouped_gemm_padded,
 )
 from .grouped_gemm_tilelang_separate import grouped_gemm_tilelang_separate
+from .grouped_gemm_tilelang_official import grouped_gemm_tilelang_official
 from .grouped_gemm_sonic import grouped_gemm_sonic
 
 __all__ = [
@@ -32,5 +33,6 @@ __all__ = [
     'grouped_gemm_loop_compiled',
     'grouped_gemm_padded',
     'grouped_gemm_tilelang_separate',
+    'grouped_gemm_tilelang_official',
     'grouped_gemm_sonic',
 ]

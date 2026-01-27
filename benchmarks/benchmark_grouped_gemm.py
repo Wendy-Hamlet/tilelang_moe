@@ -29,6 +29,7 @@ from kernels.grouped_gemm_baseline import (
     grouped_gemm_loop_compiled
 )
 from kernels.grouped_gemm_tilelang_separate import grouped_gemm_tilelang_separate
+from kernels.grouped_gemm_tilelang_official import grouped_gemm_tilelang_official
 from kernels.grouped_gemm_sonic import grouped_gemm_sonic
 
 
@@ -179,6 +180,7 @@ def run_benchmark_config(
         "pytorch-loop": grouped_gemm_loop,
         "pytorch-compiled": grouped_gemm_loop_compiled,
         "tilelang-separate": grouped_gemm_tilelang_separate,
+        "tilelang-official": grouped_gemm_tilelang_official,
         "ours (sonic)": grouped_gemm_sonic,
     }
     
@@ -225,7 +227,7 @@ def main():
     """主Benchmark函数"""
     print("="*80)
     print("Grouped GEMM Performance Benchmark")
-    print("4 Versions: pytorch-loop, pytorch-compiled, tilelang-separate, ours (sonic)")
+    print("5 Versions: pytorch-loop, pytorch-compiled, tilelang-separate, tilelang-official, ours (sonic)")
     print("="*80)
     
     # 检查CUDA
