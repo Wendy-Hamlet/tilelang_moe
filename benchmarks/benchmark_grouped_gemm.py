@@ -74,10 +74,28 @@ except ImportError:
 # ============ Benchmark配置 ============
 BENCHMARK_CONFIGS = [
     # (name, total_tokens, H, I, E, description)
+    # Original configs
     ("B128_H512_I384_E8", 128, 512, 384, 8, "Small Test"),
     ("B256_H1024_I768_E16", 256, 1024, 768, 16, "Medium Test"),
     ("B512_H2048_I1536_E32", 512, 2048, 1536, 32, "DeepSeek-V2-like"),
     ("B1024_H4096_I3072_E64", 1024, 4096, 3072, 64, "DeepSeek-V3-like (scaled)"),
+    
+    # Additional configs for debugging - varying E (num experts)
+    ("B1024_H4096_I3072_E8", 1024, 4096, 3072, 8, "Large tokens, few experts"),
+    ("B1024_H4096_I3072_E16", 1024, 4096, 3072, 16, "Large tokens, medium experts"),
+    ("B1024_H4096_I3072_E32", 1024, 4096, 3072, 32, "Large tokens, many experts"),
+    
+    # Additional configs - varying H and I dimensions
+    ("B1024_H2048_I1536_E64", 1024, 2048, 1536, 64, "Large E, smaller H/I"),
+    ("B1024_H1024_I768_E64", 1024, 1024, 768, 64, "Large E, small H/I"),
+    
+    # Additional configs - varying total_tokens with E=64
+    ("B512_H4096_I3072_E64", 512, 4096, 3072, 64, "Fewer tokens, E=64"),
+    ("B2048_H4096_I3072_E64", 2048, 4096, 3072, 64, "More tokens, E=64"),
+    
+    # Test non-power-of-2 dimensions
+    ("B1000_H4096_I3072_E64", 1000, 4096, 3072, 64, "Non-pow2 tokens, E=64"),
+    ("B1024_H4000_I3000_E64", 1024, 4000, 3000, 64, "Non-pow2 H/I, E=64"),
 ]
 
 
