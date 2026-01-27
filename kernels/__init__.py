@@ -19,6 +19,7 @@ from .grouped_gemm_baseline import (
 from .grouped_gemm_tilelang_separate import grouped_gemm_tilelang_separate
 from .grouped_gemm_tilelang_official import grouped_gemm_tilelang_official
 from .grouped_gemm_sonic import grouped_gemm_sonic
+from .grouped_gemm_optimized import grouped_gemm_optimized
 
 __all__ = [
     # TopK + Softmax
@@ -35,4 +36,5 @@ __all__ = [
     'grouped_gemm_tilelang_separate',
     'grouped_gemm_tilelang_official',
     'grouped_gemm_sonic',
+    'grouped_gemm_optimized',
 ]
