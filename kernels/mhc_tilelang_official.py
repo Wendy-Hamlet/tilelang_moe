@@ -134,7 +134,7 @@ def mhc_pre_gemm_sqrsum_kernel(
     hc_hidden_size: int,
     token_block: int = 32,
     hidden_block: int = 256,
-):
+) -> tilelang.JITKernel:
     """TileLang官方的GEMM+sqrsum融合kernel"""
     assert hc_mult3 <= 32
     num_tokens = T.dynamic("num_tokens")
