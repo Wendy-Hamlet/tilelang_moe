@@ -19,7 +19,18 @@ from .grouped_gemm_baseline import (
 from .grouped_gemm_tilelang_separate import grouped_gemm_tilelang_separate
 from .grouped_gemm_tilelang_official import grouped_gemm_tilelang_official
 from .grouped_gemm_sonic import grouped_gemm_sonic
-from .grouped_gemm_optimized import grouped_gemm_optimized
+
+# mHC (Multi-Head Cache) kernels
+from .mhc_baseline import (
+    mhc_pre_pytorch,
+    mhc_pre_pytorch_compiled,
+    mhc_post_pytorch,
+    mhc_post_pytorch_compiled,
+)
+from .mhc_tilelang_official import (
+    mhc_pre_tilelang_official,
+    mhc_post_tilelang_official,
+)
 
 __all__ = [
     # TopK + Softmax
@@ -36,5 +47,11 @@ __all__ = [
     'grouped_gemm_tilelang_separate',
     'grouped_gemm_tilelang_official',
     'grouped_gemm_sonic',
-    'grouped_gemm_optimized',
+    # mHC
+    'mhc_pre_pytorch',
+    'mhc_pre_pytorch_compiled',
+    'mhc_post_pytorch',
+    'mhc_post_pytorch_compiled',
+    'mhc_pre_tilelang_official',
+    'mhc_post_tilelang_official',
 ]
