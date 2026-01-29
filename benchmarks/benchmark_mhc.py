@@ -13,7 +13,6 @@ python benchmarks/benchmark_mhc.py
 import torch
 import torch.utils.benchmark as benchmark
 from typing import List, Dict, Tuple
-import pandas as pd
 import sys
 import os
 

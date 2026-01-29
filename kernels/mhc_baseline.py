@@ -158,7 +158,7 @@ def mhc_post_pytorch(
     # comb_res_mix: (num_tokens, hc_mult, hc_mult) -> transpose -> (num_tokens, hc_mult, hc_mult)
     # residual: (num_tokens, hc_mult, hidden_size)
     # bmm: (num_tokens, hc_mult, hc_mult) @ (num_tokens, hc_mult, hidden_size) = (num_tokens, hc_mult, hidden_size)
-    term2 = torch.bmm(comb_res_mix.mT, residual.float())
+    term2 = torch.bmm(comb_res_mix.transpose(1, 2), residual.float())
     
     return (term1 + term2).bfloat16()
 
