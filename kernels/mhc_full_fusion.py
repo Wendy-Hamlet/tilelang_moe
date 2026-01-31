@@ -181,13 +181,11 @@ def mhc_pre_full_fusion_kernel(
         # layer_input = (residual * pre_mix).sum(dim=-2)
         # 需要重新加载residual数据
         for h_blk in T.Pipelined(hidden_size // hidden_block, num_stages=2):
-            res_smem = T.alloc_shared((hc_mult, hidden_block), T.float32)
-            for i in T.Parallel(hc_mult):
-                for j in T.Parallel(hidden_block):
-                    res_smem[i, j] = residual[token_idx, i, h_blk * hidden_block + j].to(T.float32)
+            res_bf16 = T.alloc_shared((hc_mult, hidden_block), T.bfloat16)
+            T.copy(residual[token_idx, 0, h_blk * hidden_block], res_bf16)
             
             res_local = T.alloc_fragment((hc_mult, hidden_block), T.float32)
-            T.copy(res_smem, res_local)
+            T.copy(res_bf16, res_local)
             
             out_local = T.alloc_fragment(hidden_block, T.float32)
             T.clear(out_local)
@@ -197,9 +195,11 @@ def mhc_pre_full_fusion_kernel(
                 for i_h in T.Parallel(hidden_block):
                     out_local[i_h] += pre * res_local[i_hc, i_h]
             
-            # Output layer_input
+            # Output layer_input (convert to bfloat16)
+            out_bf16 = T.alloc_fragment(hidden_block, T.bfloat16)
+            T.copy(out_local, out_bf16)
             for i_h in T.Parallel(hidden_block):
-                layer_input_out[token_idx, h_blk * hidden_block + i_h] = out_local[i_h].to(T.bfloat16)
+                layer_input_out[token_idx, h_blk * hidden_block + i_h] = out_bf16[i_h]
 
 
 def mhc_pre_full_fusion(
@@ -421,8 +421,10 @@ def mhc_pre_full_fusion_v2_kernel(
                         res_val = residual[token_idx, i_hc, h_blk * 64 + i_h]
                         out_local[i_h] += pre * res_val
                 
+                out_bf16 = T.alloc_fragment(64, T.bfloat16)
+                T.copy(out_local, out_bf16)
                 for i_h in T.Parallel(64):
-                    layer_input_out[token_idx, h_blk * 64 + i_h] = out_local[i_h].to(T.bfloat16)
+                    layer_input_out[token_idx, h_blk * 64 + i_h] = out_bf16[i_h]
 
 
 def mhc_pre_full_fusion_v2(
