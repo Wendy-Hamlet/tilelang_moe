@@ -367,16 +367,16 @@ def mhc_pre_gemm_sqrsum_optimized_v2_kernel(
     hc_mult3: int,
     hc_hidden_size: int,
     token_block: int = 48,    # 优化4: 增加token_block 32->48
-    hidden_block: int = 96,   # 对应调整hidden_block 128->96以控制共享内存
+    hidden_block: int = 128,  # 保持128以确保整除（10240%128=0, 20480%128=0）
 ) -> tilelang.JITKernel:
     """
     优化版v2 mHC Pre GEMM+sqrsum kernel - 增加并行度
     
     优化4改进:
     1. 增加token_block: 32 -> 48 (提升50%并行度)
-    2. 调整hidden_block: 128 -> 96 (保持共享内存在99KB以内)
-    3. 共享内存估算: 48*96*2 + 32*96*4 = 9216 + 12288 = ~21KB (每stage)
-       3-stage pipeline: 21KB * 3 = 63KB < 99KB ✅
+    2. 保持hidden_block=128 (确保能整除hc_hidden_size)
+    3. 共享内存估算: 48*128*2 + 32*128*4 = 12KB + 16KB = 28KB (每stage)
+       3-stage pipeline: 28KB * 3 = 84KB < 99KB ✅
     """
     assert hc_mult3 <= 32
     num_tokens = T.dynamic("num_tokens")
