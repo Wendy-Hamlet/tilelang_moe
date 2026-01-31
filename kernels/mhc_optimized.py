@@ -8,12 +8,13 @@ DeepSeek mHC Optimized TileLang Implementation
 ❌ 优化1: mhc_post调整参数 - 效果不明显（1.03x）- 已回退
 ❌ 优化3: Sinkhorn迭代优化 - 反而降低性能 - 已回退
 ❌ 优化4: token_block=48 - TensorCore要求16倍数 - 放弃
+❌ 优化5: token_block=64, hidden_block=64 - 严重倒退(0.69x)- 已回退
 
-当前优化:
-🔧 优化5: token_block=64 (TensorCore兼容) + hidden_block=64
-  - token_block: 32 -> 64 (+100%并行度，满足16倍数要求)
-  - hidden_block: 128 -> 64 (控制共享内存)
-  - 共享内存: 64*64*2 + 32*64*4 = 48KB < 99KB ✅
+最终版本:
+✅ mhc_pre GEMM: token_block=32, hidden_block=128, 3-stage pipeline
+✅ mhc_pre big_fuse: 使用官方实现
+✅ mhc_post: 使用官方实现
+✅ 综合性能: 1.10x vs 官方实现
 """
 
 import math
@@ -112,80 +113,6 @@ def mhc_post_gemm_kernel(
                     hidden_idx = by * hidden_block + h
                     if token_idx < num_tokens and hidden_idx < hidden:
                         output[token_idx, i, hidden_idx] = out_frag[t, i, h].to(T.bfloat16)
-
-
-@tilelang.jit(
-    pass_configs={
-        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-    },
-)
-def mhc_post_optimized_v2_kernel(
-    comb_res_mix,    # (n, hc, hc), float32
-    residual,        # (n, hc, hidden), bfloat16
-    post_layer_mix,  # (n, hc), float32
-    x,               # (n, hidden), bfloat16
-    output,          # (n, hc, hidden), bfloat16
-    hc: int,
-    hidden: int,
-    n_thr: int = 256,
-    h_blk: int = 256,
-) -> tilelang.JITKernel:
-    """
-    优化版mHC Post v2: 优化内存访问模式
-    
-    相比官方版本:
-    1. 增加thread数量 (256 vs 128)
-    2. 调整h_blk大小
-    3. 更好的数据复用
-    """
-    n = T.dynamic("num_tokens")
-    h = hidden
-    h_blk = math.gcd(hidden, h_blk)
-    
-    comb_res_mix: T.Tensor((n, hc, hc), T.float32)
-    residual: T.Tensor((n, hc, h), T.bfloat16)
-    post_layer_mix: T.Tensor((n, hc), T.float32)
-    x: T.Tensor((n, h), T.bfloat16)
-    output: T.Tensor((n, hc, h), T.bfloat16)
-    
-    with T.Kernel(n, threads=n_thr) as i_n:
-        # Shared memory
-        out_shared = T.alloc_shared((hc, h_blk), T.bfloat16)
-        res_shared = T.alloc_shared((hc, h_blk), T.bfloat16)
-        x_shared = T.alloc_shared(h_blk, T.bfloat16)
-        
-        # Local fragments
-        out_local = T.alloc_fragment((hc, h_blk), T.float32)
-        res_local = T.alloc_fragment((hc, h_blk), T.float32)
-        x_local = T.alloc_fragment(h_blk, T.float32)
-        
-        # Load comb_res_mix once (small, fits in registers)
-        comb_local = T.alloc_fragment((hc, hc), T.float32)
-        post_local = T.alloc_fragment(hc, T.float32)
-        T.copy(comb_res_mix[i_n, 0, 0], comb_local)
-        T.copy(post_layer_mix[i_n, 0], post_local)
-        
-        # Pipeline over hidden dimension
-        for i0_h in T.Pipelined(T.ceildiv(h, h_blk), num_stages=2):
-            # Load residual and x tiles
-            T.copy(residual[i_n, 0, i0_h * h_blk], res_shared)
-            T.copy(x[i_n, i0_h * h_blk], x_shared)
-            
-            T.copy(res_shared, res_local)
-            T.copy(x_shared, x_local)
-            
-            # Compute output tile
-            # out[hc_out, h] = post[hc_out] * x[h] + sum_hc_in(comb[hc_in, hc_out] * res[hc_in, h])
-            for i_hco, i1_h in T.Parallel(hc, h_blk):
-                # Term 1: outer product
-                out_local[i_hco, i1_h] = post_local[i_hco] * x_local[i1_h]
-                # Term 2: matrix multiply (transposed)
-                for i_hci in T.serial(hc):
-                    out_local[i_hco, i1_h] += comb_local[i_hci, i_hco] * res_local[i_hci, i1_h]
-            
-            T.copy(out_local, out_shared)
-            T.copy(out_shared, output[i_n, 0, i0_h * h_blk])
 
 
 def mhc_post_optimized(
@@ -304,80 +231,6 @@ def mhc_pre_gemm_sqrsum_optimized_kernel(
     3. 移除pass_configs限制，让编译器自动优化
     
     Note: 后续在H100上可以改回token_block=64, hidden_block=256
-    """
-    assert hc_mult3 <= 32
-    num_tokens = T.dynamic("num_tokens")
-    assert hc_hidden_size % hidden_block == 0
-
-    x: T.Tensor((num_tokens, hc_hidden_size), T.bfloat16)
-    fn: T.Tensor((hc_mult3, hc_hidden_size), T.float32)
-    out: T.Tensor((num_tokens, hc_mult3), T.float32)
-    sqrsum: T.Tensor((num_tokens), T.float32)
-
-    with T.Kernel(T.ceildiv(num_tokens, token_block)) as px:
-        out_frag = T.alloc_fragment((token_block, 32), T.float32)
-        sqrsum_part = T.alloc_fragment((token_block, 4), T.float32)
-        T.clear(out_frag)
-        T.clear(sqrsum_part)
-        
-        for pz in T.Pipelined(hc_hidden_size // hidden_block, num_stages=3):
-            x_smem = T.alloc_shared((token_block, hidden_block), T.bfloat16)
-            fn_smem = T.alloc_shared((32, hidden_block), T.float32)
-
-            T.annotate_layout({x_smem: tilelang.layout.make_swizzled_layout(x_smem)})
-
-            T.copy(x[px * token_block, pz * hidden_block], x_smem)
-            T.copy(fn[0, pz * hidden_block], fn_smem)
-
-            x_frag_16 = T.alloc_fragment((token_block, hidden_block), T.bfloat16)
-            T.copy(x_smem, x_frag_16)
-            x_frag = T.alloc_fragment((token_block, hidden_block), T.float32)
-            T.copy(x_frag_16, x_frag)
-
-            # sqrsum计算
-            for jj in T.serial(hidden_block // 4):
-                for i, j in T.Parallel(token_block, 4):
-                    sqrsum_part[i, j] += x_frag[i, jj * 4 + j] * x_frag[i, jj * 4 + j]
-
-            # GEMM
-            T.gemm(
-                x_frag,
-                fn_smem,
-                out_frag,
-                transpose_A=False,
-                transpose_B=True,
-                wg_wait=0,
-                clear_accum=False,
-            )
-        
-        sqrsum_l = T.alloc_fragment(token_block, T.float32)
-        T.reduce_sum(sqrsum_part, sqrsum_l)
-        for i in T.Parallel(token_block):
-            sqrsum[px * token_block + i] = sqrsum_l[i]
-        for i, j in T.Parallel(token_block, 32):
-            if j < hc_mult3:
-                out[px * token_block + i, j] = out_frag[i, j]
-
-
-@tilelang.jit
-def mhc_pre_gemm_sqrsum_optimized_v2_kernel(
-    x,
-    fn,
-    out,
-    sqrsum,
-    hc_mult3: int,
-    hc_hidden_size: int,
-    token_block: int = 64,    # 优化5: token_block=64 (16的倍数，TensorCore兼容)
-    hidden_block: int = 64,   # 减小hidden_block以控制共享内存
-) -> tilelang.JITKernel:
-    """
-    优化版v2 mHC Pre GEMM+sqrsum kernel - token_block=64
-    
-    优化5改进:
-    1. token_block=64 (16的倍数，满足TensorCore要求)
-    2. hidden_block=64 (控制共享内存)
-    3. 共享内存估算: 64*64*2 + 32*64*4 = 8KB + 8KB = 16KB (每stage)
-       3-stage pipeline: 16KB * 3 = 48KB < 99KB ✅
     """
     assert hc_mult3 <= 32
     num_tokens = T.dynamic("num_tokens")
@@ -756,77 +609,6 @@ def mhc_pre_official(
         hc_hidden_size,
     )
     
-    mhc_pre_big_fuse_official_kernel(
-        gemm_out_mul,
-        gemm_out_sqrsum,
-        hc_scale,
-        hc_base,
-        residual,
-        post_mix,
-        comb_mix,
-        layer_input,
-        hidden_size,
-        rms_eps,
-        hc_pre_eps,
-        hc_sinkhorn_eps,
-        hc_post_mult_value,
-        sinkhorn_repeat,
-        n_splits,
-        hc_mult,
-    )
-    
-    post_mix = post_mix.view(num_tokens, hc_mult, 1)
-    comb_mix = comb_mix.view(num_tokens, hc_mult, hc_mult)
-    
-    return post_mix, comb_mix, layer_input
-
-
-def mhc_pre_optimized_v2(
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    rms_eps: float = 1e-6,
-    hc_pre_eps: float = 1e-6,
-    hc_sinkhorn_eps: float = 1e-6,
-    hc_post_mult_value: float = 1.0,
-    sinkhorn_repeat: int = 10,
-    n_splits: int = 1,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    优化版v2 mHC Pre封装 - 增加并行度
-    
-    优化4改进:
-    - 使用token_block=48, hidden_block=96 (vs v1的32/128)
-    - 提升50%的token并行度
-    """
-    hc_mult = residual.shape[-2]
-    hidden_size = residual.shape[-1]
-    hc_mult3 = hc_mult * 2 + hc_mult * hc_mult
-    hc_hidden_size = hc_mult * hidden_size
-    
-    num_tokens = residual.shape[0]
-    device = residual.device
-    
-    post_mix = torch.empty(num_tokens, hc_mult, dtype=torch.float32, device=device)
-    comb_mix = torch.empty(num_tokens, hc_mult * hc_mult, dtype=torch.float32, device=device)
-    layer_input = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
-    
-    gemm_out_mul = torch.empty(n_splits, num_tokens, hc_mult3, dtype=torch.float32, device=device)
-    gemm_out_sqrsum = torch.empty(n_splits, num_tokens, dtype=torch.float32, device=device)
-    
-    assert n_splits == 1
-    # 使用优化v2的GEMM kernel (token_block=48)
-    mhc_pre_gemm_sqrsum_optimized_v2_kernel(
-        residual.view(num_tokens, hc_hidden_size),
-        fn,
-        gemm_out_mul.squeeze(0),
-        gemm_out_sqrsum.squeeze(0),
-        hc_mult3,
-        hc_hidden_size,
-    )
-    
-    # 使用官方big_fuse
     mhc_pre_big_fuse_official_kernel(
         gemm_out_mul,
         gemm_out_sqrsum,
