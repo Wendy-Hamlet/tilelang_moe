@@ -433,6 +433,9 @@ def print_summary(results: List[Dict], title: str):
     print("-" * 85)
     print(f"\nSummary: Optimized wins {wins}, Official wins {loses}, Ties {len(results) - wins - loses}")
     
+    # Average speedup
+    avg_vs_official = avg_v1_vs_official
+    
     # Decision
     print("\n" + "=" * 80)
     if avg_vs_official > 1.1:
