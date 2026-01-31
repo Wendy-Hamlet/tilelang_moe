@@ -295,16 +295,18 @@ def mhc_pre_gemm_sqrsum_optimized_kernel(
     sqrsum,
     hc_mult3: int,
     hc_hidden_size: int,
-    token_block: int = 64,    # 增大token block
-    hidden_block: int = 256,
+    token_block: int = 32,    # 保持32以适应5090的99KB共享内存限制
+    hidden_block: int = 128,  # 减小hidden_block: 256 -> 128
 ) -> tilelang.JITKernel:
     """
     优化版mHC Pre GEMM+sqrsum kernel
     
     优化点:
-    1. 增大token_block: 32 -> 64，提高并行度
-    2. 移除pass_configs限制，让编译器自动优化
-    3. 使用3-stage pipeline
+    1. 减小hidden_block以适应5090的共享内存限制(99KB vs H100的224KB)
+    2. 使用3-stage pipeline
+    3. 移除pass_configs限制，让编译器自动优化
+    
+    Note: 后续在H100上可以改回token_block=64, hidden_block=256
     """
     assert hc_mult3 <= 32
     num_tokens = T.dynamic("num_tokens")
