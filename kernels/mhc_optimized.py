@@ -5,14 +5,15 @@ DeepSeek mHC Optimized TileLang Implementation
 
 已完成优化:
 ✅ 优化2: mhc_pre GEMM优化 - 成功！（1.10x）- 已保留
-❌ 优化1: mhc_post调整参数 - 效果不明显（1.03x）- 已回退到官方实现
-❌ 优化3: Sinkhorn迭代优化 - 反而降低性能（1.10x→1.04x）- 已回退
+❌ 优化1: mhc_post调整参数 - 效果不明显（1.03x）- 已回退
+❌ 优化3: Sinkhorn迭代优化 - 反而降低性能 - 已回退
+❌ 优化4: token_block=48 - TensorCore要求16倍数 - 放弃
 
 当前优化:
-🔧 优化4: 增加token_block提升GEMM并行度
-  - 尝试 token_block: 32 -> 48
-  - 优化shared memory布局以避免超出99KB限制
-  - 预期提升: 3-8% (更好的GPU占用率)
+🔧 优化5: token_block=64 (TensorCore兼容) + hidden_block=64
+  - token_block: 32 -> 64 (+100%并行度，满足16倍数要求)
+  - hidden_block: 128 -> 64 (控制共享内存)
+  - 共享内存: 64*64*2 + 32*64*4 = 48KB < 99KB ✅
 """
 
 import math
@@ -366,17 +367,17 @@ def mhc_pre_gemm_sqrsum_optimized_v2_kernel(
     sqrsum,
     hc_mult3: int,
     hc_hidden_size: int,
-    token_block: int = 48,    # 优化4: 增加token_block 32->48
-    hidden_block: int = 128,  # 保持128以确保整除（10240%128=0, 20480%128=0）
+    token_block: int = 64,    # 优化5: token_block=64 (16的倍数，TensorCore兼容)
+    hidden_block: int = 64,   # 减小hidden_block以控制共享内存
 ) -> tilelang.JITKernel:
     """
-    优化版v2 mHC Pre GEMM+sqrsum kernel - 增加并行度
+    优化版v2 mHC Pre GEMM+sqrsum kernel - token_block=64
     
-    优化4改进:
-    1. 增加token_block: 32 -> 48 (提升50%并行度)
-    2. 保持hidden_block=128 (确保能整除hc_hidden_size)
-    3. 共享内存估算: 48*128*2 + 32*128*4 = 12KB + 16KB = 28KB (每stage)
-       3-stage pipeline: 28KB * 3 = 84KB < 99KB ✅
+    优化5改进:
+    1. token_block=64 (16的倍数，满足TensorCore要求)
+    2. hidden_block=64 (控制共享内存)
+    3. 共享内存估算: 64*64*2 + 32*64*4 = 8KB + 8KB = 16KB (每stage)
+       3-stage pipeline: 16KB * 3 = 48KB < 99KB ✅
     """
     assert hc_mult3 <= 32
     num_tokens = T.dynamic("num_tokens")
@@ -866,16 +867,60 @@ def mhc_pre_optimized(
     """
     优化版mHC Pre封装
     
-    优化内容:
+    当前优化:
     - ✅ 优化2: GEMM kernel (hidden_block=128, 3-stage pipeline) - 1.10x
-    - 🔧 优化4: 增加token_block (32->48) 测试中...
+    - ❌ 优化4: token_block增加 - TensorCore要求16倍数，放弃
     """
-    # 调用v2版本进行测试
-    return mhc_pre_optimized_v2(
-        residual, fn, hc_scale, hc_base,
-        rms_eps, hc_pre_eps, hc_sinkhorn_eps,
-        hc_post_mult_value, sinkhorn_repeat, n_splits
+    hc_mult = residual.shape[-2]
+    hidden_size = residual.shape[-1]
+    hc_mult3 = hc_mult * 2 + hc_mult * hc_mult
+    hc_hidden_size = hc_mult * hidden_size
+    
+    num_tokens = residual.shape[0]
+    device = residual.device
+    
+    post_mix = torch.empty(num_tokens, hc_mult, dtype=torch.float32, device=device)
+    comb_mix = torch.empty(num_tokens, hc_mult * hc_mult, dtype=torch.float32, device=device)
+    layer_input = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+    
+    gemm_out_mul = torch.empty(n_splits, num_tokens, hc_mult3, dtype=torch.float32, device=device)
+    gemm_out_sqrsum = torch.empty(n_splits, num_tokens, dtype=torch.float32, device=device)
+    
+    assert n_splits == 1
+    # 使用优化的GEMM kernel (v1: token_block=32, hidden_block=128)
+    mhc_pre_gemm_sqrsum_optimized_kernel(
+        residual.view(num_tokens, hc_hidden_size),
+        fn,
+        gemm_out_mul.squeeze(0),
+        gemm_out_sqrsum.squeeze(0),
+        hc_mult3,
+        hc_hidden_size,
     )
+    
+    # 使用官方big_fuse
+    mhc_pre_big_fuse_official_kernel(
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        residual,
+        post_mix,
+        comb_mix,
+        layer_input,
+        hidden_size,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+        hc_mult,
+    )
+    
+    post_mix = post_mix.view(num_tokens, hc_mult, 1)
+    comb_mix = comb_mix.view(num_tokens, hc_mult, hc_mult)
+    
+    return post_mix, comb_mix, layer_input
 
 # ============ Test ============
 
