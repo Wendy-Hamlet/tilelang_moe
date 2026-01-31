@@ -351,19 +351,20 @@ def mhc_pre_full_fusion_v2_kernel(
             
             # Apply scale, base, and sigmoid for pre_mix
             pre_mix = T.alloc_fragment(hc_mult, T.float32)
-            for k in T.Parallel(hc_mult):
+            for k in T.serial(hc_mult):
                 val = gemm_out[t, k] * rms_scale * scale_0 + hc_base[k]
                 pre_mix[k] = T.sigmoid(val) + hc_pre_eps
             
             # Apply scale, base, and sigmoid for post_mix, then output
-            for k in T.Parallel(hc_mult):
+            for k in T.serial(hc_mult):
                 val = gemm_out[t, hc_mult + k] * rms_scale * scale_1 + hc_base[hc_mult + k]
                 post_mix_out[token_idx, k] = T.sigmoid(val) * hc_post_mult_value
             
-            # Sinkhorn for comb_mix
+            # Sinkhorn for comb_mix - use serial loops to avoid layout inference issues
             cm = T.alloc_fragment((hc_mult, hc_mult), T.float32)
-            for j, k in T.Parallel(hc_mult, hc_mult):
-                cm[j, k] = gemm_out[t, 2 * hc_mult + j * hc_mult + k] * rms_scale * scale_2 + hc_base[2 * hc_mult + j * hc_mult + k]
+            for j in T.serial(hc_mult):
+                for k in T.serial(hc_mult):
+                    cm[j, k] = gemm_out[t, 2 * hc_mult + j * hc_mult + k] * rms_scale * scale_2 + hc_base[2 * hc_mult + j * hc_mult + k]
             
             row_sum = T.alloc_fragment(hc_mult, T.float32)
             col_sum = T.alloc_fragment(hc_mult, T.float32)
@@ -371,23 +372,28 @@ def mhc_pre_full_fusion_v2_kernel(
             
             # 初始softmax + eps + col norm
             T.reduce_max(cm, row_max, dim=1)
-            for j, k in T.Parallel(hc_mult, hc_mult):
-                cm[j, k] = T.exp(cm[j, k] - row_max[j])
+            for j in T.serial(hc_mult):
+                for k in T.serial(hc_mult):
+                    cm[j, k] = T.exp(cm[j, k] - row_max[j])
             T.reduce_sum(cm, row_sum, dim=1)
-            for j, k in T.Parallel(hc_mult, hc_mult):
-                cm[j, k] = cm[j, k] / row_sum[j] + hc_sinkhorn_eps
+            for j in T.serial(hc_mult):
+                for k in T.serial(hc_mult):
+                    cm[j, k] = cm[j, k] / row_sum[j] + hc_sinkhorn_eps
             T.reduce_sum(cm, col_sum, dim=0)
-            for j, k in T.Parallel(hc_mult, hc_mult):
-                cm[j, k] = cm[j, k] / (col_sum[k] + hc_sinkhorn_eps)
+            for j in T.serial(hc_mult):
+                for k in T.serial(hc_mult):
+                    cm[j, k] = cm[j, k] / (col_sum[k] + hc_sinkhorn_eps)
             
             # Sinkhorn iterations
             for _ in T.serial(sinkhorn_repeat - 1):
                 T.reduce_sum(cm, row_sum, dim=1)
-                for j, k in T.Parallel(hc_mult, hc_mult):
-                    cm[j, k] = cm[j, k] / (row_sum[j] + hc_sinkhorn_eps)
+                for j in T.serial(hc_mult):
+                    for k in T.serial(hc_mult):
+                        cm[j, k] = cm[j, k] / (row_sum[j] + hc_sinkhorn_eps)
                 T.reduce_sum(cm, col_sum, dim=0)
-                for j, k in T.Parallel(hc_mult, hc_mult):
-                    cm[j, k] = cm[j, k] / (col_sum[k] + hc_sinkhorn_eps)
+                for j in T.serial(hc_mult):
+                    for k in T.serial(hc_mult):
+                        cm[j, k] = cm[j, k] / (col_sum[k] + hc_sinkhorn_eps)
             
             # Output comb_mix
             for j, k in T.Parallel(hc_mult, hc_mult):
