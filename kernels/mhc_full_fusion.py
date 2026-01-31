@@ -78,12 +78,16 @@ def mhc_pre_full_fusion_kernel(
         for h_blk in T.Pipelined(hc_hidden_size // hidden_block, num_stages=2):
             # Load residual block: (hc_mult, hidden_block)
             x_smem = T.alloc_shared((hc_mult, hidden_block), T.float32)
+            x_local_load = T.alloc_fragment((hc_mult, hidden_block), T.float32)
             for i in T.Parallel(hc_mult):
                 for j in T.Parallel(hidden_block):
                     h_idx = h_blk * hidden_block + j
                     hc_idx = h_idx // hidden_size
                     h_local = h_idx % hidden_size
-                    x_smem[i, j] = residual[token_idx, hc_idx, h_local].to(T.float32)
+                    x_val = residual[token_idx, hc_idx, h_local]
+                    x_local_load[i, j] = x_val
+            
+            T.copy(x_local_load, x_smem)
             
             # Load fn block: (hc_mult3, hidden_block)
             fn_smem = T.alloc_shared((hc_mult3, hidden_block), T.float32)
@@ -412,8 +416,10 @@ def mhc_pre_full_fusion_v2_kernel(
                 
                 for i_hc in T.serial(hc_mult):
                     pre = pre_mix[i_hc]
+                    # Load residual和计算
                     for i_h in T.Parallel(64):
-                        out_local[i_h] += pre * residual[token_idx, i_hc, h_blk * 64 + i_h].to(T.float32)
+                        res_val = residual[token_idx, i_hc, h_blk * 64 + i_h]
+                        out_local[i_h] += pre * res_val
                 
                 for i_h in T.Parallel(64):
                     layer_input_out[token_idx, h_blk * 64 + i_h] = out_local[i_h].to(T.bfloat16)
