@@ -30,6 +30,7 @@ from kernels.mhc_baseline import (
 from kernels.mhc_optimized import (
     mhc_pre_official,
     mhc_pre_optimized,
+    mhc_pre_optimized_v2,
     mhc_post_official,
     mhc_post_optimized,
 )

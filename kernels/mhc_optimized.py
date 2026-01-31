@@ -8,16 +8,11 @@ DeepSeek mHC Optimized TileLang Implementation
 ❌ 优化1: mhc_post调整参数 - 效果不明显（1.03x）- 已回退到官方实现
 ❌ 优化3: Sinkhorn迭代优化 - 反而降低性能（1.10x→1.04x）- 已回退
 
-当前状态:
-- mHC Pre: 仅保留GEMM优化（hidden_block=128, 3-stage pipeline）
-- mHC Post: 使用官方实现
-- Sinkhorn: 使用官方实现（10次迭代）
-
-分析:
-- Sinkhorn迭代减少(10→6)反而降低性能，可能原因:
-  1. Sinkhorn部分时间占比很小，优化效果不明显
-  2. 减少迭代可能影响收敛精度，导致后续计算开销增加
-  3. 需要profiling确定真正的性能瓶颈
+当前优化:
+🔧 优化4: 增加token_block提升GEMM并行度
+  - 尝试 token_block: 32 -> 48
+  - 优化shared memory布局以避免超出99KB限制
+  - 预期提升: 3-8% (更好的GPU占用率)
 """
 
 import math
@@ -308,6 +303,80 @@ def mhc_pre_gemm_sqrsum_optimized_kernel(
     3. 移除pass_configs限制，让编译器自动优化
     
     Note: 后续在H100上可以改回token_block=64, hidden_block=256
+    """
+    assert hc_mult3 <= 32
+    num_tokens = T.dynamic("num_tokens")
+    assert hc_hidden_size % hidden_block == 0
+
+    x: T.Tensor((num_tokens, hc_hidden_size), T.bfloat16)
+    fn: T.Tensor((hc_mult3, hc_hidden_size), T.float32)
+    out: T.Tensor((num_tokens, hc_mult3), T.float32)
+    sqrsum: T.Tensor((num_tokens), T.float32)
+
+    with T.Kernel(T.ceildiv(num_tokens, token_block)) as px:
+        out_frag = T.alloc_fragment((token_block, 32), T.float32)
+        sqrsum_part = T.alloc_fragment((token_block, 4), T.float32)
+        T.clear(out_frag)
+        T.clear(sqrsum_part)
+        
+        for pz in T.Pipelined(hc_hidden_size // hidden_block, num_stages=3):
+            x_smem = T.alloc_shared((token_block, hidden_block), T.bfloat16)
+            fn_smem = T.alloc_shared((32, hidden_block), T.float32)
+
+            T.annotate_layout({x_smem: tilelang.layout.make_swizzled_layout(x_smem)})
+
+            T.copy(x[px * token_block, pz * hidden_block], x_smem)
+            T.copy(fn[0, pz * hidden_block], fn_smem)
+
+            x_frag_16 = T.alloc_fragment((token_block, hidden_block), T.bfloat16)
+            T.copy(x_smem, x_frag_16)
+            x_frag = T.alloc_fragment((token_block, hidden_block), T.float32)
+            T.copy(x_frag_16, x_frag)
+
+            # sqrsum计算
+            for jj in T.serial(hidden_block // 4):
+                for i, j in T.Parallel(token_block, 4):
+                    sqrsum_part[i, j] += x_frag[i, jj * 4 + j] * x_frag[i, jj * 4 + j]
+
+            # GEMM
+            T.gemm(
+                x_frag,
+                fn_smem,
+                out_frag,
+                transpose_A=False,
+                transpose_B=True,
+                wg_wait=0,
+                clear_accum=False,
+            )
+        
+        sqrsum_l = T.alloc_fragment(token_block, T.float32)
+        T.reduce_sum(sqrsum_part, sqrsum_l)
+        for i in T.Parallel(token_block):
+            sqrsum[px * token_block + i] = sqrsum_l[i]
+        for i, j in T.Parallel(token_block, 32):
+            if j < hc_mult3:
+                out[px * token_block + i, j] = out_frag[i, j]
+
+
+@tilelang.jit
+def mhc_pre_gemm_sqrsum_optimized_v2_kernel(
+    x,
+    fn,
+    out,
+    sqrsum,
+    hc_mult3: int,
+    hc_hidden_size: int,
+    token_block: int = 48,    # 优化4: 增加token_block 32->48
+    hidden_block: int = 96,   # 对应调整hidden_block 128->96以控制共享内存
+) -> tilelang.JITKernel:
+    """
+    优化版v2 mHC Pre GEMM+sqrsum kernel - 增加并行度
+    
+    优化4改进:
+    1. 增加token_block: 32 -> 48 (提升50%并行度)
+    2. 调整hidden_block: 128 -> 96 (保持共享内存在99KB以内)
+    3. 共享内存估算: 48*96*2 + 32*96*4 = 9216 + 12288 = ~21KB (每stage)
+       3-stage pipeline: 21KB * 3 = 63KB < 99KB ✅
     """
     assert hc_mult3 <= 32
     num_tokens = T.dynamic("num_tokens")
@@ -711,7 +780,7 @@ def mhc_pre_official(
     return post_mix, comb_mix, layer_input
 
 
-def mhc_pre_optimized(
+def mhc_pre_optimized_v2(
     residual: torch.Tensor,
     fn: torch.Tensor,
     hc_scale: torch.Tensor,
@@ -724,11 +793,11 @@ def mhc_pre_optimized(
     n_splits: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    优化版mHC Pre封装
+    优化版v2 mHC Pre封装 - 增加并行度
     
-    优化内容:
-    - ✅ GEMM kernel优化: hidden_block=128, 3-stage pipeline (1.10x提升)
-    - ❌ Sinkhorn优化已回退: 减少迭代反而降低性能
+    优化4改进:
+    - 使用token_block=48, hidden_block=96 (vs v1的32/128)
+    - 提升50%的token并行度
     """
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]
@@ -746,8 +815,8 @@ def mhc_pre_optimized(
     gemm_out_sqrsum = torch.empty(n_splits, num_tokens, dtype=torch.float32, device=device)
     
     assert n_splits == 1
-    # 使用优化的GEMM kernel
-    mhc_pre_gemm_sqrsum_optimized_kernel(
+    # 使用优化v2的GEMM kernel (token_block=48)
+    mhc_pre_gemm_sqrsum_optimized_v2_kernel(
         residual.view(num_tokens, hc_hidden_size),
         fn,
         gemm_out_mul.squeeze(0),
@@ -756,7 +825,7 @@ def mhc_pre_optimized(
         hc_hidden_size,
     )
     
-    # 暂时回退到官方big_fuse（Sinkhorn优化反而降低性能）
+    # 使用官方big_fuse
     mhc_pre_big_fuse_official_kernel(
         gemm_out_mul,
         gemm_out_sqrsum,
@@ -771,7 +840,7 @@ def mhc_pre_optimized(
         hc_pre_eps,
         hc_sinkhorn_eps,
         hc_post_mult_value,
-        sinkhorn_repeat,  # 使用官方的10次迭代
+        sinkhorn_repeat,
         n_splits,
         hc_mult,
     )
@@ -781,6 +850,32 @@ def mhc_pre_optimized(
     
     return post_mix, comb_mix, layer_input
 
+
+def mhc_pre_optimized(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 10,
+    n_splits: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    优化版mHC Pre封装
+    
+    优化内容:
+    - ✅ 优化2: GEMM kernel (hidden_block=128, 3-stage pipeline) - 1.10x
+    - 🔧 优化4: 增加token_block (32->48) 测试中...
+    """
+    # 调用v2版本进行测试
+    return mhc_pre_optimized_v2(
+        residual, fn, hc_scale, hc_base,
+        rms_eps, hc_pre_eps, hc_sinkhorn_eps,
+        hc_post_mult_value, sinkhorn_repeat, n_splits
+    )
 
 # ============ Test ============
 
