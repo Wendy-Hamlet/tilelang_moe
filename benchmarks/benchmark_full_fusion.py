@@ -10,6 +10,11 @@ Benchmark for mHC Full Fusion Implementation
 import torch
 import time
 import argparse
+import sys
+import os
+
+# Add kernels directory to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 
 def benchmark_mhc_pre_full_fusion():
