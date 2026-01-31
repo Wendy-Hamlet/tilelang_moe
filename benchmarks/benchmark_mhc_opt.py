@@ -351,6 +351,19 @@ def benchmark_mhc_pre(
     result = timer.timeit(BENCHMARK_ITERS)
     results["optimized"] = result.mean * 1000
     
+    # ========== TileLang optimized v2 ==========
+    for _ in range(WARMUP_ITERS):
+        _ = mhc_pre_optimized_v2(residual, fn, hc_scale, hc_base, **params)
+    torch.cuda.synchronize()
+    
+    timer = benchmark.Timer(
+        stmt="mhc_pre_optimized_v2(residual, fn, hc_scale, hc_base, **params)",
+        globals={"mhc_pre_optimized_v2": mhc_pre_optimized_v2,
+                 "residual": residual, "fn": fn, "hc_scale": hc_scale, "hc_base": hc_base, "params": params},
+    )
+    result = timer.timeit(BENCHMARK_ITERS)
+    results["optimized_v2"] = result.mean * 1000
+    
     return results
 
 
@@ -362,45 +375,45 @@ def print_summary(results: List[Dict], title: str):
     
     # Table 1: All implementations vs PyTorch
     print("\n--- All Implementations vs PyTorch ---")
-    print(f"{'Config':20} | {'PyTorch':>10} | {'Compile':>10} | {'Official':>10} | {'Optimized':>10} | "
-          f"{'Speedup':>8} | {'Opt/Off':>8}")
+    print(f"{'Config':20} | {'PyTorch':>10} | {'Compile':>10} | {'Official':>10} | {'Opt-v1':>10} | {'Opt-v2':>10} | "
+          f"{'v1/Off':>8} | {'v2/Off':>8}")
     print("-" * 100)
     
     for r in results:
-        speedup_vs_pytorch = r['pytorch'] / r['optimized']
-        opt_vs_official = r['official'] / r['optimized']
+        v1_vs_official = r['official'] / r['optimized']
+        v2_vs_official = r['official'] / r['optimized_v2']
         
         line = (f"{r['config']:20} | {r['pytorch']:>10.3f} | {r['torch.compile']:>10.3f} | "
-                f"{r['official']:>10.3f} | {r['optimized']:>10.3f} | "
-                f"{speedup_vs_pytorch:>7.2f}x | {opt_vs_official:>7.2f}x")
+                f"{r['official']:>10.3f} | {r['optimized']:>10.3f} | {r['optimized_v2']:>10.3f} | "
+                f"{v1_vs_official:>7.2f}x | {v2_vs_official:>7.2f}x")
         print(line)
     
     # 计算平均值
-    avg_speedup_pytorch = sum(r['pytorch'] / r['optimized'] for r in results) / len(results)
-    avg_opt_vs_official = sum(r['official'] / r['optimized'] for r in results) / len(results)
+    avg_v1_vs_official = sum(r['official'] / r['optimized'] for r in results) / len(results)
+    avg_v2_vs_official = sum(r['official'] / r['optimized_v2'] for r in results) / len(results)
     
     print("-" * 100)
-    print(f"{'Average':20} | {'-':>10} | {'-':>10} | {'-':>10} | {'-':>10} | "
-          f"{avg_speedup_pytorch:>7.2f}x | {avg_opt_vs_official:>7.2f}x")
+    print(f"{'Average':20} | {'-':>10} | {'-':>10} | {'-':>10} | {'-':>10} | {'-':>10} | "
+          f"{avg_v1_vs_official:>7.2f}x | {avg_v2_vs_official:>7.2f}x")
     
-    # Table 2: Optimized vs Official detailed comparison
-    print("\n--- Optimized vs Official Detailed Comparison ---")
-    print(f"{'Config':20} | {'Official':>10} | {'Optimized':>10} | {'Diff (ms)':>10} | {'Ratio':>10} | {'Winner':>10}")
+    # Table 2: Optimized v1 vs Official
+    print("\n--- Optimized v1 vs Official Detailed Comparison ---")
+    print(f"{'Config':20} | {'Official':>10} | {'Opt-v1':>10} | {'Diff (ms)':>10} | {'Ratio':>10} | {'Winner':>10}")
     print("-" * 85)
     
-    opt_wins = 0
-    official_wins = 0
+    v1_wins = 0
+    v1_loses = 0
     
     for r in results:
         diff = r['official'] - r['optimized']
         ratio = r['official'] / r['optimized']
         
         if ratio > 1.05:
-            winner = "Optimized"
-            opt_wins += 1
+            winner = "Opt-v1"
+            v1_wins += 1
         elif ratio < 0.95:
             winner = "Official"
-            official_wins += 1
+            v1_loses += 1
         else:
             winner = "Tie"
         
@@ -409,22 +422,54 @@ def print_summary(results: List[Dict], title: str):
         print(line)
     
     print("-" * 85)
-    print(f"\nSummary: Optimized wins {opt_wins}, Official wins {official_wins}, Ties {len(results) - opt_wins - official_wins}")
+    print(f"\nSummary: v1 wins {v1_wins}, Official wins {v1_loses}, Ties {len(results) - v1_wins - v1_loses}")
+    
+    # Table 3: Optimized v2 vs Official
+    print("\n--- Optimized v2 vs Official Detailed Comparison ---")
+    print(f"{'Config':20} | {'Official':>10} | {'Opt-v2':>10} | {'Diff (ms)':>10} | {'Ratio':>10} | {'Winner':>10}")
+    print("-" * 85)
+    
+    v2_wins = 0
+    v2_loses = 0
+    
+    for r in results:
+        diff = r['official'] - r['optimized_v2']
+        ratio = r['official'] / r['optimized_v2']
+        
+        if ratio > 1.05:
+            winner = "Opt-v2"
+            v2_wins += 1
+        elif ratio < 0.95:
+            winner = "Official"
+            v2_loses += 1
+        else:
+            winner = "Tie"
+        
+        line = (f"{r['config']:20} | {r['official']:>10.3f} | {r['optimized_v2']:>10.3f} | "
+                f"{diff:>+10.3f} | {ratio:>9.2f}x | {winner:>10}")
+        print(line)
+    
+    print("-" * 85)
+    print(f"\nSummary: v2 wins {v2_wins}, Official wins {v2_loses}, Ties {len(results) - v2_wins - v2_loses}")
     
     # Decision
     print("\n" + "=" * 80)
-    if avg_opt_vs_official > 1.1:
-        print(f"✅ OPTIMIZATION SUCCESS: Optimized version is {avg_opt_vs_official:.2f}x faster than official!")
-        print("   Recommendation: Keep the optimized version.")
-    elif avg_opt_vs_official < 0.9:
-        print(f"❌ OPTIMIZATION FAILED: Optimized version is {1/avg_opt_vs_official:.2f}x slower than official.")
-        print("   Recommendation: Revert to official and try next optimization.")
+    if avg_v1_vs_official > 1.1:
+        print(f"✅ OPTIMIZATION v1 SUCCESS: {avg_v1_vs_official:.2f}x faster than official!")
+    elif avg_v1_vs_official > 0.9:
+        print(f"⚠️ MARGINAL DIFFERENCE v1: {avg_v1_vs_official:.2f}x vs official.")
     else:
-        print(f"⚠️ MARGINAL DIFFERENCE: Optimized version is {avg_opt_vs_official:.2f}x vs official.")
-        print("   Recommendation: Consider other optimizations.")
+        print(f"❌ REGRESSION v1: {avg_v1_vs_official:.2f}x vs official (slower).")
+    
+    if avg_v2_vs_official > 1.1:
+        print(f"✅ OPTIMIZATION v2 SUCCESS: {avg_v2_vs_official:.2f}x faster than official!")
+    elif avg_v2_vs_official > 0.9:
+        print(f"⚠️ MARGINAL DIFFERENCE v2: {avg_v2_vs_official:.2f}x vs official.")
+    else:
+        print(f"❌ REGRESSION v2: {avg_v2_vs_official:.2f}x vs official (slower).")
     print("=" * 80)
     
-    return avg_opt_vs_official
+    return avg_v1_vs_official, avg_v2_vs_official
 
 
 # ============ Main ============
@@ -492,7 +537,7 @@ def run_benchmarks():
             
             # 打印简要结果
             print(f"  Pre:  pytorch={pre_perf['pytorch']:.3f}ms, compile={pre_perf['torch.compile']:.3f}ms, "
-                  f"official={pre_perf['official']:.3f}ms, optimized={pre_perf['optimized']:.3f}ms")
+                  f"official={pre_perf['official']:.3f}ms, opt-v1={pre_perf['optimized']:.3f}ms, opt-v2={pre_perf['optimized_v2']:.3f}ms")
             print(f"  Post: pytorch={post_perf['pytorch']:.3f}ms, compile={post_perf['torch.compile']:.3f}ms, "
                   f"official={post_perf['official']:.3f}ms, optimized={post_perf['optimized']:.3f}ms")
             
@@ -524,7 +569,7 @@ if __name__ == "__main__":
     
     # 打印汇总
     if pre_results:
-        pre_ratio = print_summary(pre_results, "mHC Pre")
+        pre_v1_ratio, pre_v2_ratio = print_summary(pre_results, "mHC Pre")
     if post_results:
         post_ratio = print_summary(post_results, "mHC Post")
     
@@ -533,7 +578,8 @@ if __name__ == "__main__":
     print("FINAL SUMMARY")
     print("=" * 80)
     if pre_results:
-        print(f"mHC Pre Optimization: {pre_ratio:.2f}x vs official")
+        print(f"mHC Pre Optimization v1: {pre_v1_ratio:.2f}x vs official")
+        print(f"mHC Pre Optimization v2: {pre_v2_ratio:.2f}x vs official")
     if post_results:
         avg_post = sum(r['official'] / r['optimized'] for r in post_results) / len(post_results)
         print(f"mHC Post Optimization: {avg_post:.2f}x vs official")
