@@ -6,12 +6,18 @@ DeepSeek mHC Optimized TileLang Implementation
 已完成优化:
 ✅ 优化2: mhc_pre GEMM优化 - 成功！（1.10x）- 已保留
 ❌ 优化1: mhc_post调整参数 - 效果不明显（1.03x）- 已回退到官方实现
+❌ 优化3: Sinkhorn迭代优化 - 反而降低性能（1.10x→1.04x）- 已回退
 
-当前优化:
-🔧 优化3: Sinkhorn迭代优化 - 减少迭代次数(10->6) + warp-level reduce
-  - 减少迭代次数从10次到6次（研究表明6次足够收敛）
-  - 使用warp shuffle优化reduce操作
-  - 预期提升: 5-15%
+当前状态:
+- mHC Pre: 仅保留GEMM优化（hidden_block=128, 3-stage pipeline）
+- mHC Post: 使用官方实现
+- Sinkhorn: 使用官方实现（10次迭代）
+
+分析:
+- Sinkhorn迭代减少(10→6)反而降低性能，可能原因:
+  1. Sinkhorn部分时间占比很小，优化效果不明显
+  2. 减少迭代可能影响收敛精度，导致后续计算开销增加
+  3. 需要profiling确定真正的性能瓶颈
 """
 
 import math
@@ -720,7 +726,9 @@ def mhc_pre_optimized(
     """
     优化版mHC Pre封装
     
-    使用优化的GEMM kernel，big_fuse保持不变
+    优化内容:
+    - ✅ GEMM kernel优化: hidden_block=128, 3-stage pipeline (1.10x提升)
+    - ❌ Sinkhorn优化已回退: 减少迭代反而降低性能
     """
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]
@@ -748,8 +756,8 @@ def mhc_pre_optimized(
         hc_hidden_size,
     )
     
-    # 使用优化的big_fuse (Sinkhorn优化)
-    mhc_pre_big_fuse_optimized_kernel(
+    # 暂时回退到官方big_fuse（Sinkhorn优化反而降低性能）
+    mhc_pre_big_fuse_official_kernel(
         gemm_out_mul,
         gemm_out_sqrsum,
         hc_scale,
@@ -763,7 +771,7 @@ def mhc_pre_optimized(
         hc_pre_eps,
         hc_sinkhorn_eps,
         hc_post_mult_value,
-        6,  # 优化: sinkhorn_repeat = 6 (vs 10)
+        sinkhorn_repeat,  # 使用官方的10次迭代
         n_splits,
         hc_mult,
     )
