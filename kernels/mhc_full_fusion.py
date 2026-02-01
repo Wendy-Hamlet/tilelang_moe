@@ -336,6 +336,14 @@ def mhc_pre_full_fusion_v2_kernel(
         sqrsum_l = T.alloc_fragment(token_block, T.float32)
         T.reduce_sum(sqrsum_part, sqrsum_l)
         
+        # Copy gemm_out to shared memory to break TensorCore layout dependency
+        gemm_smem = T.alloc_shared((token_block, 32), T.float32)
+        T.copy(gemm_out, gemm_smem)
+        
+        # Read back to a new fragment for serial access
+        gemm_local = T.alloc_fragment((token_block, 32), T.float32)
+        T.copy(gemm_smem, gemm_local)
+        
         # ============ Stage 2-5: RMS + Scale + Sigmoid + Sinkhorn ============
         # 每个token独立处理后续计算
         for t in T.serial(token_block):
@@ -352,19 +360,19 @@ def mhc_pre_full_fusion_v2_kernel(
             # Apply scale, base, and sigmoid for pre_mix
             pre_mix = T.alloc_fragment(hc_mult, T.float32)
             for k in T.serial(hc_mult):
-                val = gemm_out[t, k] * rms_scale * scale_0 + hc_base[k]
+                val = gemm_local[t, k] * rms_scale * scale_0 + hc_base[k]
                 pre_mix[k] = T.sigmoid(val) + hc_pre_eps
             
             # Apply scale, base, and sigmoid for post_mix, then output
             for k in T.serial(hc_mult):
-                val = gemm_out[t, hc_mult + k] * rms_scale * scale_1 + hc_base[hc_mult + k]
+                val = gemm_local[t, hc_mult + k] * rms_scale * scale_1 + hc_base[hc_mult + k]
                 post_mix_out[token_idx, k] = T.sigmoid(val) * hc_post_mult_value
             
             # Sinkhorn for comb_mix - use serial loops to avoid layout inference issues
             cm = T.alloc_fragment((hc_mult, hc_mult), T.float32)
             for j in T.serial(hc_mult):
                 for k in T.serial(hc_mult):
-                    cm[j, k] = gemm_out[t, 2 * hc_mult + j * hc_mult + k] * rms_scale * scale_2 + hc_base[2 * hc_mult + j * hc_mult + k]
+                    cm[j, k] = gemm_local[t, 2 * hc_mult + j * hc_mult + k] * rms_scale * scale_2 + hc_base[2 * hc_mult + j * hc_mult + k]
             
             row_sum = T.alloc_fragment(hc_mult, T.float32)
             col_sum = T.alloc_fragment(hc_mult, T.float32)
@@ -411,8 +419,8 @@ def mhc_pre_full_fusion_v2_kernel(
             # 重新计算pre_mix (因为上面的scope不共享)
             rms_scale = T.rsqrt(sqrsum_l[t] / hc_hidden_size + rms_eps)
             pre_mix = T.alloc_fragment(hc_mult, T.float32)
-            for k in T.Parallel(hc_mult):
-                val = gemm_out[t, k] * rms_scale * hc_scale[0] + hc_base[k]
+            for k in T.serial(hc_mult):
+                val = gemm_local[t, k] * rms_scale * hc_scale[0] + hc_base[k]
                 pre_mix[k] = T.sigmoid(val) + hc_pre_eps
             
             # 分块计算layer_input
