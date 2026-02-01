@@ -19,25 +19,25 @@
 
 #### 延迟对比 (ms)
 
-| 配置 | PyTorch | torch.compile | TL-Official | Ours |
-|------|---------|---------------|-------------|------|
-| DeepSeek-V2 (M=320, N=128, K=6) | 0.0143 | 0.0147 | 0.0268 | **0.0078** |
-| DeepSeek-V3 (M=8192, N=8, K=4) | 0.0225 | 0.0290 | 0.0922 | **0.0082** |
+| 配置 | Params | PyTorch | torch.compile | TL-Official | Ours |
+|------|--------|---------|---------------|-------------|------|
+| DeepSeek-V2 | M=320, N=128, K=6 | 0.0143 | 0.0144 | 0.0267 | **0.0082** |
+| DeepSeek-V3 | M=64, N=32768, K=2048 | 0.1062 | 0.1779 | 0.0594 | **0.0594** |
 
 #### Ours vs 最强其他方案
 
 | 配置 | 最强其他 | Ours | 加速比 | 状态 |
 |------|----------|------|--------|------|
-| DeepSeek-V2 | PyTorch (0.0143 ms) | 0.0078 ms | **1.84x** | ✅ |
-| DeepSeek-V3 | PyTorch (0.0225 ms) | 0.0082 ms | **2.75x** | ✅ |
+| DeepSeek-V2 | PyTorch (0.0143 ms) | 0.0082 ms | **1.75x** | ✅ |
+| DeepSeek-V3 | TL-Official (0.0594 ms) | 0.0594 ms | 1.00x | ≈ |
 
-**平均加速**: **2.30x** (vs 最强其他方案)
+**平均加速**: **1.37x** (vs 最强其他方案)
 
 **自动选择策略**:
 ```
-E <= 64:           Bitonic Sort (高并行度)
-E in [65, 512]:    Selection Sort (低padding开销)
-E > 512:           Radix TopK + Softmax (大规模高效)
+N <= 64:           Bitonic Sort (高并行度)
+N in [65, 512]:    Selection Sort (低padding开销)
+N > 512:           Radix TopK + Softmax (大规模高效)
 ```
 
 ### Grouped GEMM
