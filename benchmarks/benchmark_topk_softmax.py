@@ -27,9 +27,11 @@ from kernels.topk_softmax_baseline import (
     topk_softmax_separate,
     topk_softmax_separate_compiled,
 )
-from kernels.topk_softmax_tilelang_separate import topk_softmax_tilelang_separate
-from kernels.topk_softmax_sonic import topk_softmax_sonic
-from kernels.topk_softmax_best import topk_softmax_best
+from kernels.topk_softmax_tilelang import (
+    topk_softmax_tilelang_separate,
+    topk_softmax_sonic_kernel,
+    topk_softmax_best,
+)
 
 
 def benchmark_callable(
@@ -126,7 +128,7 @@ def benchmark_config(
     logits = torch.randn(batch_size, num_experts, device='cuda', dtype=torch.float32)
 
     # Build runners with unified signature f(logits)->(scores, indices)
-    sonic_kernel = topk_softmax_sonic(batch_size, num_experts, top_k)
+    sonic_kernel = topk_softmax_sonic_kernel(batch_size, num_experts, top_k)
 
     runners: Dict[str, Callable[[torch.Tensor], tuple]] = {
         # 1) pytorch baseline（无算法版本）
