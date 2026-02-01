@@ -9,12 +9,20 @@ TopK + Softmax 性能对比基准
 """
 
 import sys
+import warnings
 from pathlib import Path
+
+# 过滤torch.compile的警告
+warnings.filterwarnings('ignore', category=UserWarning, module='torch._inductor')
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
 from typing import Callable, Dict
 from tilelang.profiler import do_bench
+
+# 启用TF32以获得更好的float32矩阵乘法性能
+torch.set_float32_matmul_precision('high')
 from kernels.topk_softmax_baseline import (
     topk_softmax_separate,
     topk_softmax_separate_compiled,

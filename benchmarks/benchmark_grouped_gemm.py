@@ -12,7 +12,11 @@ Grouped GEMM Performance Benchmark
 
 import sys
 import os
+import warnings
 from pathlib import Path
+
+# 过滤torch.compile的警告
+warnings.filterwarnings('ignore', category=UserWarning, module='torch._inductor')
 
 # 添加项目根目录到Python路径
 project_root = Path(__file__).parent.parent
@@ -22,6 +26,9 @@ import torch
 import time
 from typing import Dict, List, Tuple
 from tabulate import tabulate
+
+# 启用TF32以获得更好的float32矩阵乘法性能
+torch.set_float32_matmul_precision('high')
 
 # 导入所有实现
 from kernels.grouped_gemm_baseline import (

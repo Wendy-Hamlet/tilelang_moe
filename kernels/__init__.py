@@ -27,9 +27,13 @@ from .mhc_baseline import (
     mhc_post_pytorch,
     mhc_post_pytorch_compiled,
 )
-from .mhc_tilelang_official import (
+from .mhc_tilelang import (
     mhc_pre_tilelang_official,
+    mhc_pre_tilelang_optimized,
+    mhc_pre_tilelang_splitk,
+    mhc_pre,
     mhc_post_tilelang_official,
+    mhc_post,
 )
 
 __all__ = [
@@ -53,5 +57,9 @@ __all__ = [
     'mhc_post_pytorch',
     'mhc_post_pytorch_compiled',
     'mhc_pre_tilelang_official',
+    'mhc_pre_tilelang_optimized',
+    'mhc_pre_tilelang_splitk',
+    'mhc_pre',  # recommended: auto-select best
     'mhc_post_tilelang_official',
+    'mhc_post',  # recommended
 ]
