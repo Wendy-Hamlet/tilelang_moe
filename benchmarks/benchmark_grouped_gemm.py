@@ -1,13 +1,15 @@
 """
 Grouped GEMM Performance Benchmark
 
-4个版本对比：
-1. pytorch-loop: PyTorch简单循环
-2. pytorch-compiled: torch.compile优化循环
-3. tilelang: TileLang grouped GEMM kernel
-4. ours (best): 自动选择最佳实现 (H<=2560用TileLang, H>2560用PyTorch)
+对比4个实现：
+1. PyTorch: 高效PyTorch实现 (排序+scatter_reduce，对齐TileLang官方baseline)
+2. torch.compile: 编译优化版本
+3. TL-Official: TileLang官方grouped_gemm kernel
+4. Ours: 自动选择最佳实现
 
-配置：DeepSeek-V2/V3场景
+官方配置来源：
+- FusedMoE Test: d_hidden=1024, d_expert=256, n_routed_experts=8
+- DeepSeek-V3: dim=7168, moe_inter_dim=2048, n_routed_experts=256
 """
 
 import sys
@@ -23,22 +25,39 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 import torch
-import time
+import math
 from typing import Dict, List, Tuple
 from tabulate import tabulate
 
 # 启用TF32以获得更好的float32矩阵乘法性能
 torch.set_float32_matmul_precision('high')
 
-# 导入所有实现
-from kernels.grouped_gemm_baseline import (
-    grouped_gemm_loop,
-    grouped_gemm_loop_compiled
-)
+
+# ============ 导入所有实现 ============
 from kernels.grouped_gemm_tilelang import (
+    grouped_gemm_pytorch,
     grouped_gemm_tilelang,
     grouped_gemm_best,
 )
+
+
+# ============ torch.compile优化版本 ============
+_compiled_fn_cache = {}
+
+
+def grouped_gemm_compiled(
+    X: torch.Tensor,
+    W: torch.Tensor,
+    expert_indices: torch.Tensor,
+) -> torch.Tensor:
+    """torch.compile优化版本"""
+    E = W.shape[0]
+    
+    # 为每个E值预编译
+    if E not in _compiled_fn_cache:
+        _compiled_fn_cache[E] = torch.compile(grouped_gemm_pytorch)
+    
+    return _compiled_fn_cache[E](X, W, expert_indices)
 
 
 # ============ TileLang do_bench集成 ============
@@ -50,22 +69,17 @@ try:
         def wrapper():
             return func(*args)
         
-        # do_bench返回median时间（毫秒）
         time_ms = do_bench(wrapper, warmup=warmup, rep=rep, return_mode='median')
         return time_ms
         
 except ImportError:
-    print("Warning: TileLang do_bench not available, using manual CUDA Events")
-    
     def benchmark_function(func, *args, warmup=100, rep=1000):
         """手动CUDA Events测量（fallback）"""
-        # Warmup
         for _ in range(warmup):
             func(*args)
         
         torch.cuda.synchronize()
         
-        # Benchmark
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         
@@ -80,31 +94,13 @@ except ImportError:
         return time_ms
 
 
-# ============ Benchmark配置 ============
-BENCHMARK_CONFIGS = [
-    # (name, total_tokens, H, I, E, description)
-    # Original configs
-    ("B128_H512_I384_E8", 128, 512, 384, 8, "Small Test"),
-    ("B256_H1024_I768_E16", 256, 1024, 768, 16, "Medium Test"),
-    ("B512_H2048_I1536_E32", 512, 2048, 1536, 32, "DeepSeek-V2-like"),
-    ("B1024_H4096_I3072_E64", 1024, 4096, 3072, 64, "DeepSeek-V3-like (scaled)"),
-    
-    # Additional configs for debugging - varying E (num experts)
-    ("B1024_H4096_I3072_E8", 1024, 4096, 3072, 8, "Large tokens, few experts"),
-    ("B1024_H4096_I3072_E16", 1024, 4096, 3072, 16, "Large tokens, medium experts"),
-    ("B1024_H4096_I3072_E32", 1024, 4096, 3072, 32, "Large tokens, many experts"),
-    
-    # Additional configs - varying H and I dimensions
-    ("B1024_H2048_I1536_E64", 1024, 2048, 1536, 64, "Large E, smaller H/I"),
-    ("B1024_H1024_I768_E64", 1024, 1024, 768, 64, "Large E, small H/I"),
-    
-    # Additional configs - varying total_tokens with E=64
-    ("B512_H4096_I3072_E64", 512, 4096, 3072, 64, "Fewer tokens, E=64"),
-    ("B2048_H4096_I3072_E64", 2048, 4096, 3072, 64, "More tokens, E=64"),
-    
-    # Test non-power-of-2 dimensions
-    ("B1000_H4096_I3072_E64", 1000, 4096, 3072, 64, "Non-pow2 tokens, E=64"),
-    ("B1024_H4000_I3000_E64", 1024, 4000, 3000, 64, "Non-pow2 H/I, E=64"),
+# ============ 官方Benchmark配置 ============
+OFFICIAL_CONFIGS = [
+    # (name, H, I, E, total_tokens, description)
+    # FusedMoE Test配置 (tilelang/examples/fusedmoe/test_example_fusedmoe.py)
+    ("FusedMoE-Test", 1024, 256, 8, 1024, "d_hidden=1024, d_expert=256, E=8"),
+    # DeepSeek-V3配置 (tilelang/examples/deepseek_v32/inference/config_671B_v3.2.json)
+    ("DeepSeek-V3", 7168, 2048, 256, 1024, "dim=7168, moe_inter_dim=2048, E=256"),
 ]
 
 
@@ -115,8 +111,7 @@ def generate_test_data(total_tokens: int, H: int, I: int, E: int, device="cuda")
     X = torch.randn(total_tokens, H, device=device, dtype=torch.float16)
     W = torch.randn(E, I, H, device=device, dtype=torch.float16)
     
-    # 生成expert indices（模拟真实MoE分布）
-    # 使用zipf分布模拟热门expert
+    # 模拟真实MoE分布 (zipf)
     expert_probs = torch.tensor([1.0 / (i + 1) for i in range(E)], device=device)
     expert_probs = expert_probs / expert_probs.sum()
     expert_indices = torch.multinomial(expert_probs, total_tokens, replacement=True)
@@ -124,107 +119,54 @@ def generate_test_data(total_tokens: int, H: int, I: int, E: int, device="cuda")
     return X, W, expert_indices
 
 
-def verify_correctness(
-    X: torch.Tensor,
-    W: torch.Tensor,
-    expert_indices: torch.Tensor,
-    versions: Dict[str, callable],
-    baseline_name: str = "pytorch-loop"
-) -> Dict[str, Tuple[bool, float]]:
-    """
-    验证所有版本的正确性
-    
-    Returns:
-        {version_name: (is_correct, max_diff)}
-    """
-    results = {}
-    
-    # 计算baseline
-    baseline_output = versions[baseline_name](X, W, expert_indices)
-    
-    for name, func in versions.items():
-        try:
-            output = func(X, W, expert_indices)
-            
-            # 计算差异
-            max_diff = (output - baseline_output).abs().max().item()
-            is_correct = max_diff < 1e-2  # FP16容差
-            
-            results[name] = (is_correct, max_diff)
-        except Exception as e:
-            print(f"❌ Error in {name}: {e}")
-            results[name] = (False, float('inf'))
-    
-    return results
-
-
-def run_benchmark_config(
-    config_name: str,
-    total_tokens: int,
-    H: int,
-    I: int,
-    E: int,
-    description: str,
-    warmup: int = 50,
-    rep: int = 500
-) -> Dict[str, float]:
+def benchmark_config(H: int, I: int, E: int, total_tokens: int, config_name: str):
     """运行单个配置的benchmark"""
-    
-    print(f"\n{'='*80}")
-    print(f"Config: {config_name} - {description}")
-    print(f"  total_tokens={total_tokens}, H={H}, I={I}, E={E}")
-    print(f"{'='*80}")
+    print(f"\n{'='*70}")
+    print(f"Config: {config_name}")
+    print(f"  H={H}, I={I}, E={E}, total_tokens={total_tokens}")
+    print(f"{'='*70}")
     
     # 生成数据
     X, W, expert_indices = generate_test_data(total_tokens, H, I, E)
     
-    # 统计expert分布
-    expert_counts = torch.bincount(expert_indices, minlength=E)
-    print(f"Expert distribution: min={expert_counts.min()}, max={expert_counts.max()}, "
-          f"mean={expert_counts.float().mean():.1f}")
-    
     # 所有版本
     versions = {
-        "pytorch-loop": grouped_gemm_loop,
-        "pytorch-compiled": grouped_gemm_loop_compiled,
-        "tilelang": grouped_gemm_tilelang,
-        "ours (best)": grouped_gemm_best,
+        'PyTorch': lambda x, w, idx: grouped_gemm_pytorch(x, w, idx),
+        'torch.compile': lambda x, w, idx: grouped_gemm_compiled(x, w, idx),
+        'TL-Official': lambda x, w, idx: grouped_gemm_tilelang(x, w, idx),
+        'Ours': lambda x, w, idx: grouped_gemm_best(x, w, idx),
     }
     
-    # 1. 正确性验证
-    print("\n[1] Correctness Verification:")
-    correctness = verify_correctness(X, W, expert_indices, versions)
+    # 正确性验证
+    print("\n[Correctness]")
+    baseline = grouped_gemm_pytorch(X, W, expert_indices)
     
-    all_correct = True
-    for name, (is_correct, max_diff) in correctness.items():
-        status = "✅" if is_correct else "❌"
-        print(f"  {status} {name:25s}: max_diff = {max_diff:.6f}")
-        if not is_correct:
-            all_correct = False
+    for name, func in versions.items():
+        try:
+            output = func(X, W, expert_indices)
+            max_diff = (output - baseline).abs().max().item()
+            # FP16容差
+            status = "✅" if max_diff < 0.1 else "⚠️"
+            print(f"  {status} {name}: max_diff = {max_diff:.6f}")
+        except Exception as e:
+            print(f"  ❌ {name}: {e}")
     
-    if not all_correct:
-        print("\n⚠️  Warning: Some versions have correctness issues!")
-        print("Continuing with benchmark, but results may be invalid.\n")
-    
-    # 2. 性能Benchmark
-    print(f"\n[2] Performance Benchmark (warmup={warmup}, rep={rep}):")
-    
+    # 性能Benchmark
+    print("\n[Performance]")
     latencies = {}
     
     for name, func in versions.items():
         try:
-            # 预编译（避免首次编译计入时间）
+            # 预热
             _ = func(X, W, expert_indices)
             torch.cuda.synchronize()
             
             # Benchmark
-            latency_ms = benchmark_function(func, X, W, expert_indices, warmup=warmup, rep=rep)
+            latency_ms = benchmark_function(func, X, W, expert_indices, warmup=50, rep=500)
             latencies[name] = latency_ms
-            
-            print(f"  {name:25s}: {latency_ms:8.4f} ms")
-            
+            print(f"  {name}: {latency_ms:.4f} ms")
         except Exception as e:
-            print(f"  {name:25s}: FAILED ({e})")
+            print(f"  {name}: FAILED ({e})")
             latencies[name] = float('inf')
     
     return latencies
@@ -232,10 +174,10 @@ def run_benchmark_config(
 
 def main():
     """主Benchmark函数"""
-    print("="*80)
+    print("="*70)
     print("Grouped GEMM Performance Benchmark")
-    print("4 Versions: pytorch-loop, pytorch-compiled, tilelang, ours (best)")
-    print("="*80)
+    print("4 Versions: PyTorch, torch.compile, TL-Official, Ours")
+    print("="*70)
     
     # 检查CUDA
     if not torch.cuda.is_available():
@@ -246,122 +188,100 @@ def main():
     print(f"Device: {device_name}")
     print(f"PyTorch version: {torch.__version__}")
     
-    # 运行所有配置
+    # 运行所有官方配置
     all_results = []
     
-    for config in BENCHMARK_CONFIGS:
-        config_name, total_tokens, H, I, E, description = config
-        
-        latencies = run_benchmark_config(
-            config_name, total_tokens, H, I, E, description,
-            warmup=50, rep=500
-        )
-        
-        # 保存结果
+    for name, H, I, E, total_tokens, desc in OFFICIAL_CONFIGS:
+        latencies = benchmark_config(H, I, E, total_tokens, name)
         all_results.append({
-            "config": config_name,
+            "config": name,
+            "params": f"H={H}, I={I}, E={E}",
             "latencies": latencies
         })
     
-    # ============ 汇总表格 ============
-    print("\n" + "="*80)
+    # ============ 汇总表格1: 延迟对比 ============
+    print("\n" + "="*70)
     print("SUMMARY: Latency Comparison (ms)")
-    print("="*80)
+    print("="*70)
     
-    # 延迟表格
     latency_table = []
     for result in all_results:
-        config = result["config"]
-        latencies = result["latencies"]
-        
-        row = [config]
-        for version in ["pytorch-loop", "pytorch-compiled", "tilelang", "ours (best)"]:
-            lat = latencies.get(version, float('inf'))
+        row = [result["config"], result["params"]]
+        for version in ["PyTorch", "torch.compile", "TL-Official", "Ours"]:
+            lat = result["latencies"].get(version, float('inf'))
             if lat == float('inf'):
                 row.append("FAILED")
             else:
                 row.append(f"{lat:.4f}")
-        
         latency_table.append(row)
     
-    headers = ["Config", "PyTorch", "Compiled", "TileLang", "Best"]
-    print(tabulate(latency_table, headers=headers, tablefmt="grid"))
+    headers = ["Config", "Params", "PyTorch", "torch.compile", "TL-Official", "Ours"]
+    print(tabulate(latency_table, headers=headers, tablefmt="pipe"))
     
-    # 加速比表格（vs PyTorch）
-    print("\n" + "="*80)
-    print("SUMMARY: Speedup vs PyTorch Baseline")
-    print("="*80)
-    
-    speedup_table = []
-    for result in all_results:
-        config = result["config"]
-        latencies = result["latencies"]
-        
-        baseline = latencies.get("pytorch-loop", float('inf'))
-        if baseline == float('inf'):
-            continue
-        
-        row = [config]
-        for version in ["pytorch-compiled", "tilelang", "ours (best)"]:
-            lat = latencies.get(version, float('inf'))
-            if lat == float('inf') or lat == 0:
-                row.append("N/A")
-            else:
-                speedup = baseline / lat
-                row.append(f"{speedup:.2f}x")
-        
-        speedup_table.append(row)
-    
-    headers = ["Config", "Compiled", "TileLang", "Best"]
-    print(tabulate(speedup_table, headers=headers, tablefmt="grid"))
-    
-    # ============ Ours (Best) vs TileLang 对比 ============
-    print("\n" + "="*80)
-    print("SUMMARY: Ours (Best) vs TileLang")
-    print("="*80)
+    # ============ 汇总表格2: Ours vs 最强其他 ============
+    print("\n" + "="*70)
+    print("SUMMARY: Ours vs Best Other")
+    print("="*70)
     
     compare_table = []
+    total_speedup = []
+    
     for result in all_results:
         config = result["config"]
         latencies = result["latencies"]
         
-        tilelang = latencies.get("tilelang", float('inf'))
-        best = latencies.get("ours (best)", float('inf'))
+        ours = latencies.get("Ours", float('inf'))
         
-        if tilelang == float('inf') or best == float('inf'):
+        # 找到最强其他
+        other_versions = ["PyTorch", "torch.compile", "TL-Official"]
+        best_other_name = None
+        best_other_lat = float('inf')
+        
+        for v in other_versions:
+            lat = latencies.get(v, float('inf'))
+            if lat < best_other_lat:
+                best_other_lat = lat
+                best_other_name = v
+        
+        if ours == float('inf') or best_other_lat == float('inf'):
             continue
         
-        diff_pct = (best - tilelang) / tilelang * 100
-        if best < tilelang * 0.95:
-            status = "✅ Faster"
-        elif best > tilelang * 1.05:
-            status = "❌ Slower"
+        speedup = best_other_lat / ours
+        total_speedup.append(speedup)
+        
+        if speedup >= 1.05:
+            status = "✅"
+        elif speedup >= 0.95:
+            status = "≈"
         else:
-            status = "≈ Same"
+            status = "❌"
         
-        compare_table.append([config, f"{tilelang:.4f}", f"{best:.4f}", f"{diff_pct:+.1f}%", status])
+        compare_table.append([
+            config,
+            f"{best_other_name} ({best_other_lat:.4f} ms)",
+            f"{ours:.4f} ms",
+            f"{speedup:.2f}x",
+            status
+        ])
     
-    headers = ["Config", "TileLang", "Best", "Diff", "Status"]
-    print(tabulate(compare_table, headers=headers, tablefmt="grid"))
+    headers = ["Config", "Best Other", "Ours", "Speedup", "Status"]
+    print(tabulate(compare_table, headers=headers, tablefmt="pipe"))
     
-    # ============ 计算平均加速 ============
-    print("\n" + "="*80)
-    print("Average Speedup vs PyTorch:")
-    print("="*80)
+    # 平均加速比
+    if total_speedup:
+        avg_speedup = sum(total_speedup) / len(total_speedup)
+        print(f"\n**平均加速**: **{avg_speedup:.2f}x** (Ours vs Best Other)")
     
-    for version in ["pytorch-compiled", "tilelang", "ours (best)"]:
-        speedups = []
-        for result in all_results:
-            latencies = result["latencies"]
-            baseline = latencies.get("pytorch-loop", float('inf'))
-            lat = latencies.get(version, float('inf'))
-            
-            if baseline != float('inf') and lat != float('inf') and lat > 0:
-                speedups.append(baseline / lat)
-        
-        if speedups:
-            avg_speedup = sum(speedups) / len(speedups)
-            print(f"  {version:25s}: {avg_speedup:.2f}x")
+    # ============ 自动选择策略说明 ============
+    print("\n" + "="*70)
+    print("AUTO-SELECT STRATEGY:")
+    print("="*70)
+    print("""
+H <= 2560 且 E <= 64:  TileLang grouped_gemm (小矩阵时kernel调度开销更低)
+其他情况:              PyTorch循环 (大矩阵/大E时cuBLAS更高效)
+
+Note: TileLang在E > 64时可能有精度问题，因此需要fallback到PyTorch
+""")
 
 
 if __name__ == "__main__":

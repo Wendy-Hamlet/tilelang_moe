@@ -44,21 +44,33 @@ N > 512:           Radix TopK + Softmax (大规模高效)
 
 ### Grouped GEMM
 
-**官方配置参数来源**: `tilelang/examples/`
+**官方配置来源**: `tilelang/examples/`
 
-| 配置来源 | H | I | E | 策略 | vs PyTorch | 状态 |
-|----------|---|---|---|------|------------|------|
-| example_fusedmoe.py (DeepSeek) | 7168 | 2048 | 8 | PyTorch | 1.00x | ✅ |
-| test_example_fusedmoe.py | 1024 | 256 | 8 | TileLang | **3.70x** | ✅ |
-| example_grouped_gemm.py | 8192 | 8192 | 2 | PyTorch | 1.00x | ✅ |
+#### 延迟对比 (ms)
+
+| 配置 | Params | PyTorch | torch.compile | TL-Official | Ours |
+|------|--------|---------|---------------|-------------|------|
+| FusedMoE-Test | H=1024, I=256, E=8 | 0.1808 | 0.1875 | **0.1404** | 0.1408 |
+| DeepSeek-V3 | H=7168, I=2048, E=256 | **5.9279** | 5.9423 | 38.9530 | 5.9279 |
+
+*PyTorch = 高效实现(排序+连续访问，对齐TileLang官方baseline)*
+
+#### Ours vs 最强其他方案
+
+| 配置 | 最强其他 | Ours | 加速比 | 状态 |
+|------|----------|------|--------|------|
+| FusedMoE-Test | TL-Official (0.1404 ms) | 0.1408 ms | 1.00x | ≈ |
+| DeepSeek-V3 | PyTorch (5.9279 ms) | 5.9279 ms | 1.00x | ≈ |
+
+**平均加速**: **1.00x** (vs 最强其他方案，自动选择最优实现)
 
 **自动选择策略**:
 ```
-H <= 2560:  TileLang grouped GEMM (1.06x - 3.7x 加速)
-H > 2560:   PyTorch循环 (cuBLAS对大矩阵更优)
+H <= 2560 且 E <= 64:  TileLang grouped_gemm (kernel调度开销更低)
+其他情况:              PyTorch循环 (cuBLAS对大矩阵更优)
 ```
 
-**注意**: 大H配置下的"正确性问题"实际是FP16累加精度差异，TileLang结果比PyTorch FP16更接近FP32参考值。
+**注意**: TileLang grouped_gemm在E > 64时可能有精度问题，因此fallback到PyTorch。
 
 ### mHC (Multi-Head Cache)
 

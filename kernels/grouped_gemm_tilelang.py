@@ -108,7 +108,7 @@ def _grouped_gemm_kernel(
 _kernel_cache: Dict[Tuple, any] = {}
 
 
-# ============ PyTorch Baseline ============
+# ============ PyTorch Baseline (高效版本) ============
 
 def grouped_gemm_pytorch(
     X: torch.Tensor,
@@ -116,7 +116,14 @@ def grouped_gemm_pytorch(
     expert_indices: torch.Tensor,
 ) -> torch.Tensor:
     """
-    PyTorch循环实现grouped GEMM (使用cuBLAS)
+    高效PyTorch grouped GEMM实现
+    
+    对齐TileLang官方example_grouped_gemm_fwd.py中的torch_gmm函数：
+    1. 按expert排序tokens
+    2. 循环对每个expert调用torch.mm
+    3. 恢复原始顺序
+    
+    这比简单循环+索引更高效，因为连续内存访问更快。
     
     Args:
         X: (total_tokens, H) - 输入tokens
@@ -131,15 +138,36 @@ def grouped_gemm_pytorch(
     device = X.device
     dtype = X.dtype
     
-    Y = torch.zeros(total_tokens, I, device=device, dtype=dtype)
+    # 按expert排序
+    sorted_indices = expert_indices.argsort()
+    X_sorted = X[sorted_indices]
     
-    for expert_id in range(E):
-        mask = expert_indices == expert_id
-        if not mask.any():
+    # 计算每个expert的batch sizes
+    expert_counts = torch.bincount(expert_indices, minlength=E)
+    batch_sizes = expert_counts.tolist()
+    
+    # 输出缓冲区
+    Y_sorted = torch.empty(total_tokens, I, device=device, dtype=dtype)
+    
+    # 对每个expert执行GEMM
+    start = 0
+    for expert_id, size in enumerate(batch_sizes):
+        if size == 0:
             continue
-        expert_tokens = X[mask]
-        expert_output = expert_tokens @ W[expert_id].T
-        Y[mask] = expert_output
+        end = start + size
+        
+        # 获取该expert的tokens
+        expert_tokens = X_sorted[start:end]  # (size, H)
+        
+        # GEMM: (size, H) @ (H, I) = (size, I)
+        expert_output = torch.mm(expert_tokens, W[expert_id].T)
+        
+        Y_sorted[start:end] = expert_output
+        start = end
+    
+    # 恢复原始顺序
+    Y = torch.empty(total_tokens, I, device=device, dtype=dtype)
+    Y[sorted_indices] = Y_sorted
     
     return Y
 
@@ -231,8 +259,10 @@ def grouped_gemm_best(
     智能选择最佳grouped GEMM实现
     
     决策逻辑:
-    - H <= 2560: TileLang grouped_gemm (1.06x-3.7x加速)
-    - H > 2560: PyTorch循环 (cuBLAS在大矩阵时更优)
+    - H <= 2560 且 E <= 64: TileLang grouped_gemm (小矩阵1.01x-1.26x加速)
+    - 其他情况: PyTorch循环 (cuBLAS在大矩阵/大E时更优)
+    
+    Note: TileLang grouped_gemm在E > 64时可能有精度问题，因此fallback到PyTorch
     
     Args:
         X: (total_tokens, H) - 输入tokens
@@ -243,9 +273,10 @@ def grouped_gemm_best(
         Y: (total_tokens, I) - 输出
     """
     H = X.shape[1]
+    E = W.shape[0]
     
-    # 阈值: H <= 2560时TileLang更快
-    if H <= 2560:
+    # TileLang适用于小H且小E的场景
+    if H <= 2560 and E <= 64:
         return grouped_gemm_tilelang(X, W, expert_indices)
     else:
         return grouped_gemm_pytorch(X, W, expert_indices)
