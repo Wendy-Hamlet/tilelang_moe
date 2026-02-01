@@ -1,30 +1,28 @@
 """
-TopK+Softmax最佳实现：自动选择策略
+TopK+Softmax Best Implementation: Auto-selection Strategy
 
-根据num_experts大小自动选择最佳实现：
-- 小num_experts (<=1024): 使用Sonic融合kernel
-- 大num_experts (>1024): 使用Radix TopK + PyTorch Softmax
+Automatically selects the best implementation based on num_experts:
+- num_experts <= 1024: Bitonic Sort fusion kernel (best parallelism, single kernel)
+- num_experts > 1024: Radix TopK + PyTorch Softmax (better for large N)
 
-原因：
-- Sonic使用选择排序O(k*N/T)，在小N时高效
-- Radix使用基数选择O(N*log(N))，在大N时更高效
+Bitonic Sort advantages:
+- Fully parallel O(N * log²N) sort
+- Single fused kernel (ONE read + ONE write to global memory)
+- Better occupancy with many parallel threads
 """
 
 import torch
 from typing import Tuple
 
-# 延迟导入以支持直接运行
-def _get_sonic_kernel():
-    from .topk_softmax_sonic import topk_softmax_sonic
-    return topk_softmax_sonic
+
+def _get_bitonic_kernel():
+    from .topk_softmax_bitonic import topk_softmax_bitonic
+    return topk_softmax_bitonic
+
 
 def _get_radix_topk():
     from .topk_radix import topk_radix_tilelang
     return topk_radix_tilelang
-
-
-# 缓存编译好的kernel
-_sonic_kernel_cache = {}
 
 
 def topk_softmax_best(
@@ -32,7 +30,7 @@ def topk_softmax_best(
     k: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    自动选择最佳TopK+Softmax实现
+    Auto-select best TopK+Softmax implementation
     
     Args:
         logits: (batch, num_experts) float32
@@ -42,24 +40,15 @@ def topk_softmax_best(
     """
     batch_size, num_experts = logits.shape
     
-    # 根据num_experts选择策略
-    # 阈值基于benchmark结果：
-    # - num_experts <= 1024: Sonic更快 (1.0x-2.1x vs PyTorch)
-    # - num_experts > 1024 且 <= 2048: Sonic仍略好于Radix，但两者都比PyTorch慢
-    # - num_experts > 2048: Radix更快
-    # 综合考虑，使用2048作为阈值（Sonic在<=2048时总是优于或等于Radix）
-    if num_experts <= 2048:
-        # 使用Sonic融合kernel
-        topk_softmax_sonic = _get_sonic_kernel()
-        cache_key = (batch_size, num_experts, k)
-        if cache_key not in _sonic_kernel_cache:
-            _sonic_kernel_cache[cache_key] = topk_softmax_sonic(batch_size, num_experts, k)
-        
-        kernel = _sonic_kernel_cache[cache_key]
-        scores, indices = kernel(logits)
-        return scores, indices
+    # Strategy selection based on benchmark results:
+    # - num_experts <= 1024: Bitonic Sort fusion (1.0x-2.0x speedup vs PyTorch)
+    # - num_experts > 1024: Radix TopK + Softmax (handles large N efficiently)
+    if num_experts <= 1024:
+        # Use Bitonic Sort fusion kernel
+        topk_softmax_bitonic = _get_bitonic_kernel()
+        return topk_softmax_bitonic(logits, k)
     else:
-        # 使用Radix TopK + PyTorch Softmax
+        # Use Radix TopK + PyTorch Softmax
         topk_radix_tilelang = _get_radix_topk()
         
         # 1. Radix TopK
@@ -74,7 +63,7 @@ def topk_softmax_best(
         return scores, topk_indices.to(torch.int32)
 
 
-# 导出为默认实现
+# Export as default implementation
 topk_softmax = topk_softmax_best
 
 
@@ -83,10 +72,10 @@ if __name__ == "__main__":
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent.parent))
     
-    # 重新定义导入函数以支持直接运行
-    def _get_sonic_kernel():
-        from kernels.topk_softmax_sonic import topk_softmax_sonic
-        return topk_softmax_sonic
+    # Redefine imports for direct execution
+    def _get_bitonic_kernel():
+        from kernels.topk_softmax_bitonic import topk_softmax_bitonic
+        return topk_softmax_bitonic
     
     def _get_radix_topk():
         from kernels.topk_radix import topk_radix_tilelang
@@ -94,10 +83,13 @@ if __name__ == "__main__":
     
     from tilelang.profiler import do_bench
     
-    print("TopK+Softmax最佳实现测试")
+    torch.set_float32_matmul_precision('high')
+    
+    print("TopK+Softmax Best Implementation Test")
     print("=" * 80)
     
     configs = [
+        (64, 64, 8),
         (64, 160, 6),
         (64, 256, 8),
         (128, 512, 16),
@@ -125,11 +117,11 @@ if __name__ == "__main__":
         pytorch_ms = do_bench(pytorch_fn, warmup=100, rep=1000, return_mode='median')
         best_ms = do_bench(best_fn, warmup=100, rep=1000, return_mode='median')
         
-        # 验证正确性
+        # Correctness check
         ref_scores, ref_indices = pytorch_fn()
         test_scores, test_indices = best_fn()
         
-        # 检查索引重叠
+        # Check index overlap
         overlap = 0
         for i in range(batch_size):
             ref_set = set(ref_indices[i].cpu().tolist())
@@ -137,7 +129,7 @@ if __name__ == "__main__":
             overlap += len(ref_set & test_set) / top_k
         overlap /= batch_size
         
-        strategy = "Sonic" if num_experts <= 2048 else "Radix"
+        strategy = "Bitonic" if num_experts <= 1024 else "Radix"
         speedup = pytorch_ms / best_ms
         status = "✓" if overlap > 0.95 else "✗"
         
