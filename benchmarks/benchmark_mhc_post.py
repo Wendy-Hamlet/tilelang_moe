@@ -8,9 +8,9 @@ import sys
 sys.path.insert(0, '.')
 
 from kernels.mhc_post_optimized import (
-    mhc_post_optimized_v2,
-    mhc_post_optimized_v3,
-    mhc_post_optimized_v4,
+    mhc_post_optimized_v5,
+    mhc_post_optimized_v6,
+    mhc_post_optimized_v7,
 )
 from kernels.mhc_optimized import mhc_post_official
 
@@ -69,9 +69,9 @@ def run_benchmark(num_tokens, hc_mult=4, hidden_size=5120):
     # Test each version
     versions = [
         ("Official", mhc_post_official),
-        ("v2 (h_blk=256, 2-stage)", mhc_post_optimized_v2),
-        ("v3 (h_blk=256, 3-stage)", mhc_post_optimized_v3),
-        ("v4 (h_blk=512, 3-stage)", mhc_post_optimized_v4),
+        ("v5 (2D Grid)", mhc_post_optimized_v5),
+        ("v6 (h=1024, split)", mhc_post_optimized_v6),
+        ("v7 (row write)", mhc_post_optimized_v7),
     ]
     
     for name, fn in versions:
@@ -131,7 +131,7 @@ def main():
     print("=" * 80)
     
     # Header
-    versions = ["Official", "v2 (h_blk=256, 2-stage)", "v3 (h_blk=256, 3-stage)", "v4 (h_blk=512, 3-stage)"]
+    versions = ["Official", "v5 (2D Grid)", "v6 (h=1024, split)", "v7 (row write)"]
     header = f"{'Tokens':<10}"
     for v in versions:
         header += f"{v[:15]:<18}"
