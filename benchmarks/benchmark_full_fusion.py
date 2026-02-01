@@ -23,8 +23,8 @@ def benchmark_mhc_pre_full_fusion():
         mhc_pre_optimized_v1,
         mhc_pre_official,
     )
-    from kernels.mhc_full_fusion import (
-        mhc_pre_full_fusion_v2,
+    from kernels.mhc_full_fusion_simple import (
+        mhc_pre_full_fusion_simple,
     )
     
     # Test configurations
@@ -124,7 +124,7 @@ def benchmark_mhc_pre_full_fusion():
         try:
             # Warmup
             for _ in range(warmup_iterations):
-                _ = mhc_pre_full_fusion_v2(
+                _ = mhc_pre_full_fusion_simple(
                     residual, fn, hc_scale, hc_base,
                     rms_eps, hc_pre_eps, hc_sinkhorn_eps,
                     hc_post_mult_value, sinkhorn_repeat
@@ -133,7 +133,7 @@ def benchmark_mhc_pre_full_fusion():
             
             start = time.perf_counter()
             for _ in range(benchmark_iterations):
-                _ = mhc_pre_full_fusion_v2(
+                _ = mhc_pre_full_fusion_simple(
                     residual, fn, hc_scale, hc_base,
                     rms_eps, hc_pre_eps, hc_sinkhorn_eps,
                     hc_post_mult_value, sinkhorn_repeat
@@ -185,7 +185,7 @@ def benchmark_mhc_pre_full_fusion():
 def verify_correctness():
     """Verify Full Fusion produces correct results"""
     from kernels.mhc_optimized import mhc_pre_official
-    from kernels.mhc_full_fusion import mhc_pre_full_fusion_v2
+    from kernels.mhc_full_fusion_simple import mhc_pre_full_fusion_simple
     
     print("=" * 80)
     print("Correctness Verification: Full Fusion vs Official")
@@ -212,7 +212,7 @@ def verify_correctness():
     )
     
     # Full Fusion
-    post_fuse, comb_fuse, layer_fuse = mhc_pre_full_fusion_v2(
+    post_fuse, comb_fuse, layer_fuse = mhc_pre_full_fusion_simple(
         residual, fn, hc_scale, hc_base,
         rms_eps=1e-6, hc_pre_eps=1e-6, hc_sinkhorn_eps=1e-6,
         hc_post_mult_value=1.0, sinkhorn_repeat=10
