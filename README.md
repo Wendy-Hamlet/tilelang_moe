@@ -21,17 +21,19 @@
 
 | 配置 | Params | PyTorch | torch.compile | TL-Official | Ours |
 |------|--------|---------|---------------|-------------|------|
-| DeepSeek-V2 | M=320, N=128, K=6 | 0.0143 | 0.0144 | 0.0266 | **0.0078** |
-| DeepSeek-V3 | M=64, N=32768, K=2048 | 0.1042 | 0.1757 | 0.0594 | **0.0591** |
+| DeepSeek-V2 | M=320, N=128, K=6 | 0.0144 | 0.0144 | 0.0266 | **0.0082** |
+| DeepSeek-V3 | M=64, N=32768, K=2048 | 0.1046 | 0.1758 | 0.0614 | **0.0594** |
+
+*TL-Official = TileLang Softmax + TileLang Radix TopK (全TileLang实现)*
 
 #### Ours vs 最强其他方案
 
 | 配置 | 最强其他 | Ours | 加速比 | 状态 |
 |------|----------|------|--------|------|
-| DeepSeek-V2 | PyTorch (0.0143 ms) | 0.0078 ms | **1.84x** | ✅ |
-| DeepSeek-V3 | TL-Official (0.0594 ms) | 0.0591 ms | 1.01x | ≈ |
+| DeepSeek-V2 | torch.compile (0.0144 ms) | 0.0082 ms | **1.75x** | ✅ |
+| DeepSeek-V3 | TL-Official (0.0614 ms) | 0.0594 ms | 1.03x | ≈ |
 
-**平均加速**: **1.42x** (vs 最强其他方案)
+**平均加速**: **1.39x** (vs 最强其他方案)
 
 **自动选择策略**:
 ```

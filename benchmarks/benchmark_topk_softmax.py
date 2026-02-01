@@ -109,7 +109,7 @@ def main():
     print("Versions:")
     print("  - PyTorch: softmax(all) → topk")
     print("  - torch.compile: compiled PyTorch")
-    print("  - TL-Official: TileLang TopK + PyTorch softmax (separate)")
+    print("  - TL-Official: TileLang Softmax + TileLang TopK (separate, all TileLang)")
     print("  - Ours: fused kernel + auto-select algorithm")
     print()
     

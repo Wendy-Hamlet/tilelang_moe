@@ -5,7 +5,7 @@ This file contains all TileLang implementations for TopK+Softmax:
 1. Radix TopK: Official TileLang radix selection algorithm
 2. Selection Sort: O(K*N) selection sort based fusion kernel
 3. Bitonic Sort: O(N*log²N) parallel bitonic sort fusion (Sonic-style)
-4. Separate: TileLang TopK + PyTorch Softmax (non-fused)
+4. Separate: TileLang TopK + TileLang Softmax (non-fused, all TileLang)
 5. Best: Auto-selection based on config
 
 Note: The real Sonic library uses Bitonic Sort for TopK.
@@ -20,7 +20,7 @@ import torch
 import tilelang
 import tilelang as tl
 import tilelang.language as T
-from typing import Tuple
+from typing import Tuple, Dict, Callable
 
 
 # ============================================================================
@@ -233,6 +233,76 @@ def topk_radix_tilelang(logits: torch.Tensor, topk: int = 6) -> torch.Tensor:
     kernel(logits, indices, starts, ends)
     
     return indices
+
+
+# ============================================================================
+# Part 1.5: TileLang Online Softmax (Official Implementation)
+# ============================================================================
+
+# Softmax kernel cache: (M, N) -> kernel
+_softmax_kernel_cache: Dict[Tuple[int, int], Callable] = {}
+
+
+@tl.jit(out_idx=[1])
+def _tl_softmax_kernel(M: int, N: int, dtype: T.dtype = T.float32):
+    """
+    TileLang Online Softmax implementation
+    Based on: tilelang/examples/online_softmax/online_softmax.py
+    """
+    BN = min(tl.next_power_of_2(N), 8192)
+    NN = tl.cdiv(N, BN)
+    accum_dtype = T.float32
+    scale = 1.44269504  # log2(e)
+
+    @T.prim_func
+    def main(
+        X: T.Tensor([M, N], dtype),
+        Y: T.Tensor([M, N], dtype),
+    ):
+        with T.Kernel(M, threads=128) as (i_m):
+            x = T.alloc_fragment([BN], dtype)
+            y = T.alloc_fragment([BN], dtype)
+            lse = T.alloc_fragment([1], accum_dtype)
+            max_x = T.alloc_fragment([1], dtype)
+            exp_x = T.alloc_fragment([BN], accum_dtype)
+            sum_exp_x = T.alloc_fragment([1], accum_dtype)
+            T.fill(lse, -T.infinity(accum_dtype))
+
+            for i_n in T.Pipelined(0, NN):
+                T.copy(X[i_m, i_n * BN : (i_n + 1) * BN], x)
+                T.reduce_max(x, max_x, dim=0, clear=True)
+                for j in T.Parallel(BN):
+                    exp_x[j] = T.exp2(x[j] * scale - max_x[0] * scale)
+                T.reduce_sum(exp_x, sum_exp_x, dim=0, clear=True)
+                lse[0] = max_x[0] * scale + T.log2(T.exp2(lse[0] - max_x[0] * scale) + sum_exp_x[0])
+
+            for i_n in T.Pipelined(0, NN):
+                T.copy(X[i_m, i_n * BN : (i_n + 1) * BN], x)
+                for j in T.Parallel(BN):
+                    y[j] = T.exp2(x[j] * scale - lse[0])
+                T.copy(y, Y[i_m, i_n * BN : (i_n + 1) * BN])
+
+    return main
+
+
+def softmax_tilelang(x: torch.Tensor) -> torch.Tensor:
+    """
+    TileLang Softmax wrapper
+    
+    Args:
+        x: [M, N] input tensor
+    Returns:
+        y: [M, N] softmax output
+    """
+    M, N = x.shape
+    cache_key = (M, N)
+    
+    if cache_key not in _softmax_kernel_cache:
+        dtype = T.float32 if x.dtype == torch.float32 else T.float16
+        _softmax_kernel_cache[cache_key] = _tl_softmax_kernel(M, N, dtype)
+    
+    kernel = _softmax_kernel_cache[cache_key]
+    return kernel(x)
 
 
 # ============================================================================
@@ -534,12 +604,16 @@ topk_softmax_sonic_kernel = topk_softmax_selection_kernel
 
 
 # ============================================================================
-# Part 5: Separate Implementation (Non-fused)
+# Part 5: Separate Implementation (Non-fused, All TileLang)
 # ============================================================================
 
 def topk_softmax_tilelang_separate(logits: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    TileLang non-fused version: Global softmax + Radix TopK
+    TileLang non-fused version: TileLang Softmax + TileLang Radix TopK
+    
+    Both operators use official TileLang implementations:
+    - Softmax: online_softmax from tilelang/examples/
+    - TopK: radix_topk from tilelang/examples/deepseek_v32/
     
     Args:
         logits: (batch, num_experts) float32
@@ -547,10 +621,19 @@ def topk_softmax_tilelang_separate(logits: torch.Tensor, k: int) -> Tuple[torch.
     Returns:
         (scores, indices): both shape (batch, k)
     """
-    import torch.nn.functional as F
-    scores = F.softmax(logits, dim=-1, dtype=torch.float32)
+    # Ensure float32
+    if logits.dtype != torch.float32:
+        logits = logits.to(torch.float32)
+    
+    # Step 1: TileLang Softmax (global)
+    scores = softmax_tilelang(logits)
+    
+    # Step 2: TileLang Radix TopK
     topk_indices = topk_radix_tilelang(logits, k)
+    
+    # Step 3: Gather top-k scores
     topk_scores = torch.gather(scores, dim=-1, index=topk_indices.to(torch.int64))
+    
     return topk_scores, topk_indices.to(torch.int32)
 
 
