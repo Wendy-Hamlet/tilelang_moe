@@ -9,6 +9,7 @@ from .topk_softmax_baseline import (
 )
 from .topk_softmax_sonic import topk_softmax_sonic
 from .topk_softmax_tilelang_separate import topk_softmax_tilelang_separate
+from .topk_softmax_best import topk_softmax_best, topk_softmax
 
 # Grouped GEMM kernels
 from .grouped_gemm_baseline import (
@@ -44,6 +45,8 @@ __all__ = [
     'topk_softmax_fused',
     'topk_softmax_sonic',
     'topk_softmax_tilelang_separate',
+    'topk_softmax_best',
+    'topk_softmax',  # recommended: auto-select best
     # Grouped GEMM
     'grouped_gemm_loop',
     'grouped_gemm_loop_compiled',

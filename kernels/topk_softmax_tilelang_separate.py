@@ -32,7 +32,7 @@ def topk_softmax_tilelang_separate(
     # 2) TileLang TopK
     topk_indices = topk_radix_tilelang(logits, k)
     
-    # 3) Gather top-k scores
-    topk_scores = torch.gather(scores, dim=-1, index=topk_indices)
+    # 3) Gather top-k scores (需要int64索引)
+    topk_scores = torch.gather(scores, dim=-1, index=topk_indices.to(torch.int64))
     
-    return topk_scores, topk_indices
+    return topk_scores, topk_indices.to(torch.int32)

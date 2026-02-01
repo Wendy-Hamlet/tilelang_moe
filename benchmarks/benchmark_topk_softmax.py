@@ -29,6 +29,7 @@ from kernels.topk_softmax_baseline import (
 )
 from kernels.topk_softmax_tilelang_separate import topk_softmax_tilelang_separate
 from kernels.topk_softmax_sonic import topk_softmax_sonic
+from kernels.topk_softmax_best import topk_softmax_best
 
 
 def benchmark_callable(
@@ -134,8 +135,8 @@ def benchmark_config(
         'torch.compile': lambda x: topk_softmax_separate_compiled(x, top_k),
         # 3) tilelang（无算法版本，两个算子分开，官方TopK）
         'tilelang-separate': lambda x: topk_softmax_tilelang_separate(x, top_k),
-        # 4) ours（融合+sonic算法，单kernel）
-        'ours': lambda x: sonic_kernel(x),
+        # 4) ours（融合+sonic算法+自动选择）
+        'ours': lambda x: topk_softmax_best(x, top_k),
     }
 
     results: Dict[str, Dict] = {}
