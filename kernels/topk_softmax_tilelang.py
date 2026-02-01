@@ -3,10 +3,13 @@ TopK+Softmax TileLang Implementations
 
 This file contains all TileLang implementations for TopK+Softmax:
 1. Radix TopK: Official TileLang radix selection algorithm
-2. Sonic: Selection sort based fusion kernel
-3. Bitonic: Bitonic sort based fusion kernel (best parallelism)
+2. Selection Sort: O(K*N) selection sort based fusion kernel
+3. Bitonic Sort: O(N*log²N) parallel bitonic sort fusion (Sonic-style)
 4. Separate: TileLang TopK + PyTorch Softmax (non-fused)
 5. Best: Auto-selection based on config
+
+Note: The real Sonic library uses Bitonic Sort for TopK.
+      Our "selection" kernel is a simpler O(K*N) approach.
 
 Recommended usage:
     from kernels.topk_softmax_tilelang import topk_softmax  # auto-select best
@@ -233,7 +236,7 @@ def topk_radix_tilelang(logits: torch.Tensor, topk: int = 6) -> torch.Tensor:
 
 
 # ============================================================================
-# Part 2: Sonic TopK+Softmax (Selection Sort Based)
+# Part 2: Selection Sort TopK+Softmax
 # ============================================================================
 
 @tilelang.jit(
@@ -242,7 +245,7 @@ def topk_radix_tilelang(logits: torch.Tensor, topk: int = 6) -> torch.Tensor:
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     }
 )
-def topk_softmax_sonic_kernel(
+def topk_softmax_selection_kernel(
     batch_size: int,
     num_experts: int,
     top_k: int,
@@ -250,10 +253,12 @@ def topk_softmax_sonic_kernel(
     dtype = T.float32,
 ):
     """
-    Sonic-style TopK+Softmax fusion kernel
+    Selection Sort based TopK+Softmax fusion kernel
     
     Algorithm: Selection sort O(K*N) + single-thread softmax
-    Best for: Medium N with small K (K iterations are cheap)
+    Best for: Small K with high padding ratio (fewer iterations needed)
+    
+    Note: This is NOT the actual Sonic algorithm. Real Sonic uses Bitonic Sort.
     """
     @T.prim_func
     def main(
@@ -375,7 +380,7 @@ def topk_softmax_sonic_kernel(
 
 
 # ============================================================================
-# Part 3: Bitonic TopK+Softmax (Parallel Sort Based)
+# Part 3: Bitonic Sort TopK+Softmax (Sonic-style, Parallel Sort)
 # ============================================================================
 
 _bitonic_pass_configs = {
@@ -387,10 +392,12 @@ _bitonic_pass_configs = {
 
 def _make_topk_softmax_bitonic_kernel(batch_size: int, num_experts: int, top_k: int):
     """
-    Create fused TopK+Softmax kernel with Bitonic Sort
+    Create fused TopK+Softmax kernel with Bitonic Sort (Sonic-style)
+    
+    This is the same algorithm used by Sonic library (from QuACK's bitonic_topk).
     
     Algorithm: O(N * log²N) parallel sort
-    Best for: N is power of 2 (no padding waste)
+    Best for: N is power of 2 (no padding waste), high parallelism
     """
     N_padded = 1 << int(math.ceil(math.log2(max(num_experts, 2))))
     num_iters = int(math.log2(N_padded))
@@ -494,15 +501,15 @@ def topk_softmax_bitonic(logits: torch.Tensor, k: int) -> Tuple[torch.Tensor, to
 
 
 # ============================================================================
-# Part 4: Sonic Wrapper (for compatibility)
+# Part 4: Selection Sort Wrapper
 # ============================================================================
 
-_sonic_kernel_cache = {}
+_selection_kernel_cache = {}
 
 
-def topk_softmax_sonic(logits: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+def topk_softmax_selection(logits: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Sonic-style TopK+Softmax
+    Selection Sort based TopK+Softmax
     
     Args:
         logits: (batch, num_experts) tensor
@@ -514,11 +521,16 @@ def topk_softmax_sonic(logits: torch.Tensor, k: int) -> Tuple[torch.Tensor, torc
     batch_size, num_experts = logits.shape
     
     cache_key = (batch_size, num_experts, k)
-    if cache_key not in _sonic_kernel_cache:
-        _sonic_kernel_cache[cache_key] = topk_softmax_sonic_kernel(batch_size, num_experts, k)
+    if cache_key not in _selection_kernel_cache:
+        _selection_kernel_cache[cache_key] = topk_softmax_selection_kernel(batch_size, num_experts, k)
     
-    kernel = _sonic_kernel_cache[cache_key]
+    kernel = _selection_kernel_cache[cache_key]
     return kernel(logits)
+
+
+# Alias for backward compatibility
+topk_softmax_sonic = topk_softmax_selection
+topk_softmax_sonic_kernel = topk_softmax_selection_kernel
 
 
 # ============================================================================
@@ -559,7 +571,11 @@ def _select_strategy(num_experts: int, k: int) -> str:
     """
     Smart strategy selection based on algorithm cost estimation
     
-    Returns: 'bitonic', 'sonic', or 'radix'
+    Returns: 'bitonic', 'selection', or 'radix'
+    
+    Note:
+    - 'bitonic' = Bitonic Sort O(N*log²N), same as real Sonic library
+    - 'selection' = Selection Sort O(K*N), simpler but fewer iterations for small K
     """
     if num_experts > 1024:
         return 'radix'
@@ -570,21 +586,21 @@ def _select_strategy(num_experts: int, k: int) -> str:
         return 'bitonic'
     
     if k <= 8 and padding_ratio > 0.4:
-        return 'sonic'
+        return 'selection'
     
     if 8 <= k <= 16 and 0.2 <= padding_ratio <= 0.5:
-        return 'bitonic' if num_experts >= 384 else 'sonic'
+        return 'bitonic' if num_experts >= 384 else 'selection'
     
     if padding_ratio > 0.5:
-        return 'sonic'
+        return 'selection'
     
     if _is_power_of_2(num_experts) or padding_ratio < 0.2:
         if num_experts >= 128 and k <= 6:
-            return 'sonic'
+            return 'selection'
         if num_experts >= 256 and k <= 8:
-            return 'sonic'
+            return 'selection'
         if num_experts >= 1024 and k >= 16:
-            return 'sonic'
+            return 'selection'
         return 'bitonic'
     
     return 'bitonic'
@@ -595,8 +611,8 @@ def topk_softmax_best(logits: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch
     Auto-select best TopK+Softmax implementation
     
     Selection is based on:
-    - N value and padding overhead for Bitonic
-    - K value for Sonic iteration count
+    - N value and padding overhead for Bitonic (Sonic-style)
+    - K value for Selection Sort iteration count
     - N > 1024 falls back to Radix
     
     Args:
@@ -610,8 +626,8 @@ def topk_softmax_best(logits: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch
     
     if strategy == 'bitonic':
         return topk_softmax_bitonic(logits, k)
-    elif strategy == 'sonic':
-        return topk_softmax_sonic(logits, k)
+    elif strategy == 'selection':
+        return topk_softmax_selection(logits, k)
     else:  # radix
         topk_indices = topk_radix_tilelang(logits, k)
         topk_values = torch.gather(logits, dim=-1, index=topk_indices.to(torch.int64))

@@ -9,9 +9,10 @@ from .topk_softmax_baseline import (
 from .topk_softmax_tilelang import (
     # Radix TopK (official algorithm)
     topk_radix_tilelang,
-    # Sonic fusion kernel (selection sort based)
-    topk_softmax_sonic,
-    # Bitonic fusion kernel (parallel sort based)
+    # Selection Sort fusion kernel
+    topk_softmax_selection,
+    topk_softmax_sonic,  # alias for backward compatibility
+    # Bitonic Sort fusion kernel (Sonic-style, parallel sort)
     topk_softmax_bitonic,
     # Non-fused TileLang version
     topk_softmax_tilelang_separate,
@@ -52,8 +53,9 @@ __all__ = [
     'topk_softmax_separate',
     'topk_softmax_separate_compiled',
     'topk_softmax_fused',
-    'topk_softmax_sonic',
-    'topk_softmax_bitonic',
+    'topk_softmax_selection',  # Selection Sort based
+    'topk_softmax_sonic',      # alias for topk_softmax_selection
+    'topk_softmax_bitonic',    # Bitonic Sort based (Sonic-style)
     'topk_softmax_tilelang_separate',
     'topk_softmax_best',
     'topk_softmax',  # recommended: auto-select best
