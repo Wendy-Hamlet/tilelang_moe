@@ -1,0 +1,3 @@
+2026-02-01 21:17:32,328 WARNING:Tunable parameters ['blk_m', 'threads'] already provided during auto-tuning. Skipping compilation and using direct JIT
+2026-02-01 21:17:34,001 WARNING:Tunable parameters ['blk_m', 'threads'] already provided during auto-tuning. Skipping compilation and using direct JIT
+2026-02-01 21:17:39,103 WARNING:Tunable parameters ['blk_m', 'threads'] already provided during auto-tuning. Skipping compilation and using direct JIT

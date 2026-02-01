@@ -15,15 +15,23 @@
 
 ### TopK+Softmax
 
-**官方配置参数来源**: `tilelang/examples/`
+**官方配置来源**: `tilelang/examples/`
 
-| 配置来源 | E (experts) | K (topk) | 策略 | vs PyTorch | 状态 |
-|----------|-------------|----------|------|------------|------|
-| example_topk.py | 128 | 6 | Bitonic | **2.24x** | ✅ |
-| example_fusedmoe.py | 8 | 4 | Bitonic | **3.00x** | ✅ |
-| example_dequant_groupedgemm.py | 32 | 4 | Bitonic | **2.18x** | ✅ |
+#### 延迟对比 (ms)
 
-**平均加速**: **2.47x** (官方配置)
+| 配置 | PyTorch | torch.compile | TL-Official | Ours |
+|------|---------|---------------|-------------|------|
+| DeepSeek-V2 (M=320, N=128, K=6) | 0.0143 | 0.0147 | 0.0268 | **0.0078** |
+| DeepSeek-V3 (M=8192, N=8, K=4) | 0.0225 | 0.0290 | 0.0922 | **0.0082** |
+
+#### Ours vs 最强其他方案
+
+| 配置 | 最强其他 | Ours | 加速比 | 状态 |
+|------|----------|------|--------|------|
+| DeepSeek-V2 | PyTorch (0.0143 ms) | 0.0078 ms | **1.84x** | ✅ |
+| DeepSeek-V3 | PyTorch (0.0225 ms) | 0.0082 ms | **2.75x** | ✅ |
+
+**平均加速**: **2.30x** (vs 最强其他方案)
 
 **自动选择策略**:
 ```
@@ -38,7 +46,7 @@ E > 512:           Radix TopK + Softmax (大规模高效)
 
 | 配置来源 | H | I | E | 策略 | vs PyTorch | 状态 |
 |----------|---|---|---|------|------------|------|
-| example_fusedmoe.py (DeepSeek) | 7168 | 2048 | 8 | PyTorch | 1.01x | ✅ |
+| example_fusedmoe.py (DeepSeek) | 7168 | 2048 | 8 | PyTorch | 1.00x | ✅ |
 | test_example_fusedmoe.py | 1024 | 256 | 8 | TileLang | **3.70x** | ✅ |
 | example_grouped_gemm.py | 8192 | 8192 | 2 | PyTorch | 1.00x | ✅ |
 
