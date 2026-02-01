@@ -21,16 +21,14 @@ warnings.filterwarnings('ignore', category=UserWarning, module='torch._inductor'
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
+import torch.nn.functional as F
 from typing import Callable, Dict
 from tabulate import tabulate
 from tilelang.profiler import do_bench
 
 torch.set_float32_matmul_precision('high')
 
-from kernels.topk_softmax_baseline import (
-    topk_softmax_separate,
-    topk_softmax_separate_compiled,
-)
+from kernels.topk_softmax_baseline import topk_softmax_separate
 from kernels.topk_softmax_tilelang import (
     topk_softmax_tilelang_separate,
     topk_softmax_best,
@@ -45,6 +43,23 @@ OFFICIAL_CONFIGS = [
 ]
 
 
+# ============ torch.compile 预编译函数缓存 ============
+# 为每个K值创建专用的编译函数，避免重复编译
+_compiled_cache: Dict[int, Callable] = {}
+
+def get_compiled_fn(k: int) -> Callable:
+    """获取或创建针对特定K值的编译函数"""
+    if k not in _compiled_cache:
+        # 创建固定K的函数
+        def fn(logits):
+            scores = F.softmax(logits, dim=-1, dtype=torch.float32)
+            return torch.topk(scores, k, dim=-1)
+        
+        # 编译并缓存
+        _compiled_cache[k] = torch.compile(fn)
+    return _compiled_cache[k]
+
+
 def benchmark_config(batch_size: int, num_experts: int, top_k: int, config_name: str):
     """测试单个配置，返回四个版本的延迟结果。"""
     
@@ -52,9 +67,12 @@ def benchmark_config(batch_size: int, num_experts: int, top_k: int, config_name:
     torch.cuda.manual_seed(42)
     logits = torch.randn(batch_size, num_experts, device='cuda', dtype=torch.float32)
 
+    # 预先获取编译函数
+    compiled_fn = get_compiled_fn(top_k)
+    
     versions = {
         'PyTorch': lambda x: topk_softmax_separate(x, top_k),
-        'torch.compile': lambda x: topk_softmax_separate_compiled(x, top_k),
+        'torch.compile': compiled_fn,
         'TL-Official': lambda x: topk_softmax_tilelang_separate(x, top_k),
         'Ours': lambda x: topk_softmax_best(x, top_k),
     }
@@ -62,8 +80,9 @@ def benchmark_config(batch_size: int, num_experts: int, top_k: int, config_name:
     results = {}
     for name, fn in versions.items():
         try:
-            # Warmup
-            for _ in range(10):
+            # Warmup (torch.compile需要更多warmup)
+            warmup_iters = 50 if name == 'torch.compile' else 10
+            for _ in range(warmup_iters):
                 _ = fn(logits)
             torch.cuda.synchronize()
             
