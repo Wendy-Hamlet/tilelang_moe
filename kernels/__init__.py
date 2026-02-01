@@ -27,9 +27,12 @@ from .grouped_gemm_baseline import (
     grouped_gemm_loop_compiled,
     grouped_gemm_padded,
 )
-from .grouped_gemm_tilelang_separate import grouped_gemm_tilelang_separate
-from .grouped_gemm_tilelang_official import grouped_gemm_tilelang_official
-from .grouped_gemm_sonic import grouped_gemm_sonic
+from .grouped_gemm_tilelang import (
+    grouped_gemm_tilelang,
+    grouped_gemm_pytorch,
+    grouped_gemm_best,
+    grouped_gemm,  # alias for grouped_gemm_best
+)
 
 # mHC (Multi-Head Cache) kernels
 from .mhc_baseline import (
@@ -63,9 +66,10 @@ __all__ = [
     'grouped_gemm_loop',
     'grouped_gemm_loop_compiled',
     'grouped_gemm_padded',
-    'grouped_gemm_tilelang_separate',
-    'grouped_gemm_tilelang_official',
-    'grouped_gemm_sonic',
+    'grouped_gemm_tilelang',
+    'grouped_gemm_pytorch',
+    'grouped_gemm_best',
+    'grouped_gemm',  # recommended: auto-select best
     # mHC
     'mhc_pre_pytorch',
     'mhc_pre_pytorch_compiled',

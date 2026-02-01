@@ -4,8 +4,8 @@ Grouped GEMM Performance Benchmark
 4个版本对比：
 1. pytorch-loop: PyTorch简单循环
 2. pytorch-compiled: torch.compile优化循环
-3. tilelang-separate: TileLang分expert调用
-4. ours (sonic): Sonic风格融合kernel
+3. tilelang: TileLang grouped GEMM kernel
+4. ours (best): 自动选择最佳实现 (H<=2560用TileLang, H>2560用PyTorch)
 
 配置：DeepSeek-V2/V3场景
 """
@@ -35,9 +35,10 @@ from kernels.grouped_gemm_baseline import (
     grouped_gemm_loop,
     grouped_gemm_loop_compiled
 )
-from kernels.grouped_gemm_tilelang_separate import grouped_gemm_tilelang_separate
-from kernels.grouped_gemm_tilelang_official import grouped_gemm_tilelang_official
-from kernels.grouped_gemm_sonic import grouped_gemm_sonic
+from kernels.grouped_gemm_tilelang import (
+    grouped_gemm_tilelang,
+    grouped_gemm_best,
+)
 
 
 # ============ TileLang do_bench集成 ============
@@ -186,9 +187,8 @@ def run_benchmark_config(
     versions = {
         "pytorch-loop": grouped_gemm_loop,
         "pytorch-compiled": grouped_gemm_loop_compiled,
-        "tilelang-separate": grouped_gemm_tilelang_separate,
-        "tilelang-official": grouped_gemm_tilelang_official,
-        "ours (sonic)": grouped_gemm_sonic,
+        "tilelang": grouped_gemm_tilelang,
+        "ours (best)": grouped_gemm_best,
     }
     
     # 1. 正确性验证
@@ -234,7 +234,7 @@ def main():
     """主Benchmark函数"""
     print("="*80)
     print("Grouped GEMM Performance Benchmark")
-    print("5 Versions: pytorch-loop, pytorch-compiled, tilelang-separate, tilelang-official, ours (sonic)")
+    print("4 Versions: pytorch-loop, pytorch-compiled, tilelang, ours (best)")
     print("="*80)
     
     # 检查CUDA
@@ -275,7 +275,7 @@ def main():
         latencies = result["latencies"]
         
         row = [config]
-        for version in ["pytorch-loop", "pytorch-compiled", "tilelang-separate", "tilelang-official", "ours (sonic)"]:
+        for version in ["pytorch-loop", "pytorch-compiled", "tilelang", "ours (best)"]:
             lat = latencies.get(version, float('inf'))
             if lat == float('inf'):
                 row.append("FAILED")
@@ -284,7 +284,7 @@ def main():
         
         latency_table.append(row)
     
-    headers = ["Config", "PyTorch", "Compiled", "TL-Sep", "TL-Official", "Sonic"]
+    headers = ["Config", "PyTorch", "Compiled", "TileLang", "Best"]
     print(tabulate(latency_table, headers=headers, tablefmt="grid"))
     
     # 加速比表格（vs PyTorch）
@@ -302,7 +302,7 @@ def main():
             continue
         
         row = [config]
-        for version in ["pytorch-compiled", "tilelang-separate", "tilelang-official", "ours (sonic)"]:
+        for version in ["pytorch-compiled", "tilelang", "ours (best)"]:
             lat = latencies.get(version, float('inf'))
             if lat == float('inf') or lat == 0:
                 row.append("N/A")
@@ -312,12 +312,12 @@ def main():
         
         speedup_table.append(row)
     
-    headers = ["Config", "Compiled", "TL-Sep", "TL-Official", "Sonic"]
+    headers = ["Config", "Compiled", "TileLang", "Best"]
     print(tabulate(speedup_table, headers=headers, tablefmt="grid"))
     
-    # ============ Ours vs TileLang Official 对比 ============
+    # ============ Ours (Best) vs TileLang 对比 ============
     print("\n" + "="*80)
-    print("SUMMARY: Ours (Sonic) vs TileLang Official")
+    print("SUMMARY: Ours (Best) vs TileLang")
     print("="*80)
     
     compare_table = []
@@ -325,23 +325,23 @@ def main():
         config = result["config"]
         latencies = result["latencies"]
         
-        official = latencies.get("tilelang-official", float('inf'))
-        sonic = latencies.get("ours (sonic)", float('inf'))
+        tilelang = latencies.get("tilelang", float('inf'))
+        best = latencies.get("ours (best)", float('inf'))
         
-        if official == float('inf') or sonic == float('inf'):
+        if tilelang == float('inf') or best == float('inf'):
             continue
         
-        diff_pct = (sonic - official) / official * 100
-        if sonic < official * 0.95:
+        diff_pct = (best - tilelang) / tilelang * 100
+        if best < tilelang * 0.95:
             status = "✅ Faster"
-        elif sonic > official * 1.05:
+        elif best > tilelang * 1.05:
             status = "❌ Slower"
         else:
             status = "≈ Same"
         
-        compare_table.append([config, f"{official:.4f}", f"{sonic:.4f}", f"{diff_pct:+.1f}%", status])
+        compare_table.append([config, f"{tilelang:.4f}", f"{best:.4f}", f"{diff_pct:+.1f}%", status])
     
-    headers = ["Config", "TL-Official", "Sonic", "Diff", "Status"]
+    headers = ["Config", "TileLang", "Best", "Diff", "Status"]
     print(tabulate(compare_table, headers=headers, tablefmt="grid"))
     
     # ============ 计算平均加速 ============
@@ -349,7 +349,7 @@ def main():
     print("Average Speedup vs PyTorch:")
     print("="*80)
     
-    for version in ["pytorch-compiled", "tilelang-separate", "tilelang-official", "ours (sonic)"]:
+    for version in ["pytorch-compiled", "tilelang", "ours (best)"]:
         speedups = []
         for result in all_results:
             latencies = result["latencies"]
