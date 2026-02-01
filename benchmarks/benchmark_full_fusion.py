@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 def benchmark_mhc_pre_full_fusion():
     """Benchmark mHC Pre implementations"""
     from kernels.mhc_optimized import (
-        mhc_pre_optimized_v1,
+        mhc_pre_optimized,
         mhc_pre_official,
     )
     from kernels.mhc_full_fusion_simple import (
@@ -97,7 +97,7 @@ def benchmark_mhc_pre_full_fusion():
         try:
             # Warmup
             for _ in range(warmup_iterations):
-                _ = mhc_pre_optimized_v1(
+                _ = mhc_pre_optimized(
                     residual, fn, hc_scale, hc_base,
                     rms_eps, hc_pre_eps, hc_sinkhorn_eps,
                     hc_post_mult_value, sinkhorn_repeat
@@ -106,7 +106,7 @@ def benchmark_mhc_pre_full_fusion():
             
             start = time.perf_counter()
             for _ in range(benchmark_iterations):
-                _ = mhc_pre_optimized_v1(
+                _ = mhc_pre_optimized(
                     residual, fn, hc_scale, hc_base,
                     rms_eps, hc_pre_eps, hc_sinkhorn_eps,
                     hc_post_mult_value, sinkhorn_repeat
@@ -114,9 +114,9 @@ def benchmark_mhc_pre_full_fusion():
             torch.cuda.synchronize()
             v1_time = (time.perf_counter() - start) / benchmark_iterations * 1000
             v1_speedup = official_time / v1_time
-            print(f"Optimized v1: {v1_time:.4f} ms ({v1_speedup:.2f}x vs official)")
+            print(f"Optimized:    {v1_time:.4f} ms ({v1_speedup:.2f}x vs official)")
         except Exception as e:
-            print(f"Optimized v1: FAILED - {e}")
+            print(f"Optimized:    FAILED - {e}")
             v1_time = float('inf')
             v1_speedup = 0
         
