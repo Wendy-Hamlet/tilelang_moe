@@ -7,7 +7,7 @@
 本项目对DeepSeek MoE模型中的关键算子进行优化，包括：
 1. **TopK+Softmax**: MoE路由层融合优化
 2. **Grouped GEMM**: 专家计算批量矩阵乘法
-3. **mHC (Multi-Head Cache)**: 多头缓存预处理/后处理
+3. **mHC (Manifold-Constrained Hyper-Connections)**: 流形约束超连接预处理/后处理
 
 每个算子都实现了智能选择策略，根据输入参数自动选择最优实现。
 
@@ -78,23 +78,47 @@ H <= 2560 且 E <= 64:  TileLang grouped_gemm (1.27x vs PyTorch)
 
 **注意**: 大E(>64)时TileLang可能有精度问题，自动fallback到PyTorch。
 
-### mHC (Multi-Head Cache)
+### mHC (Manifold-Constrained Hyper-Connections)
 
-**官方配置参数来源**: `tilelang/examples/deepseek_mhc/`
+**官方配置来源**: `tilelang/examples/deepseek_mhc/`
 
-| num_tokens | hidden_size | hc_mult | 策略 | vs 官方 | 状态 |
-|------------|-------------|---------|------|---------|------|
-| 512 | 1280 | 4 | Optimized | **1.20x** | ✅ |
-| 1024 | 2560 | 4 | Optimized | **1.14x** | ✅ |
-| 2048 | 4096 | 4 | Optimized | **1.12x** | ✅ |
-| 8192 | 4096 | 4 | Split-K | **2.45x** | ✅ |
+#### mHC Pre 延迟对比 (ms)
 
-**平均加速**: **1.46x** (官方配置)
+| Config | Params | PyTorch | torch.compile | TL-Official | Ours |
+|--------|--------|---------|---------------|-------------|------|
+| Config-1 | n=512, h=1280 | 0.2028 | 0.0717 | 0.0352 | **0.0221** |
+| Config-2 | n=1024, h=2560 | 0.2969 | 0.1334 | 0.0676 | **0.0405** |
+| Config-3 | n=2048, h=4096 | 0.8509 | 0.3075 | 0.1188 | **0.0983** |
+| Config-4 | n=8192, h=4096 | 3.1334 | 1.1203 | 0.4039 | **0.3936** |
+
+#### mHC Post 延迟对比 (ms)
+
+| Config | Params | PyTorch | torch.compile | TL-Official | Ours |
+|--------|--------|---------|---------------|-------------|------|
+| Config-1 | n=512, h=1280 | 0.0800 | 0.0537 | **0.0102** | 0.0102 |
+| Config-2 | n=1024, h=2560 | 0.2888 | 0.2134 | 0.0379 | **0.0369** |
+| Config-3 | n=2048, h=4096 | 1.1298 | 0.7557 | **0.1065** | 0.1065 |
+| Config-4 | n=8192, h=4096 | 4.6341 | 3.0111 | **0.4035** | 0.4035 |
+
+#### Ours vs 最强其他方案
+
+| Config | 最强其他 | Ours | 加速比 | 状态 |
+|--------|----------|------|--------|------|
+| Config-1 (Pre) | TL-Official (0.0352 ms) | 0.0221 ms | **1.59x** | ✅ |
+| Config-2 (Pre) | TL-Official (0.0676 ms) | 0.0405 ms | **1.67x** | ✅ |
+| Config-3 (Pre) | TL-Official (0.1188 ms) | 0.0983 ms | **1.21x** | ✅ |
+| Config-4 (Pre) | TL-Official (0.4039 ms) | 0.3936 ms | 1.03x | ≈ |
+
+**平均加速**: **1.19x** (Ours vs Best Other，含Pre+Post)
 
 **自动选择策略**:
 ```
-Split-K条件: hc_hidden_size % 1024 == 0 且 (num_tokens <= 2048 或 (num_tokens >= 8192 且 hc_hidden_size >= 10240))
-否则使用Optimized版本
+mHC Pre:
+  Split-K条件: hc_hidden_size % 1024 == 0 且 
+               (num_tokens <= 2048 或 (num_tokens >= 8192 且 hc_hidden_size >= 10240))
+  否则使用Optimized版本
+
+mHC Post: 使用TileLang官方实现（已高度优化，7-11x vs PyTorch）
 ```
 
 ## 快速开始
@@ -185,12 +209,16 @@ topk_scores = softmax(topk_logits)        # 只对k个softmax
 - **小H**: TileLang grouped kernel (减少kernel launch开销)
 - **大H**: PyTorch循环调用cuBLAS (大矩阵GEMM更优化)
 
-### mHC Split-K 优化
+### mHC (Manifold-Constrained Hyper-Connections) 优化
 
-对于"瘦高"矩阵 (大K, 小N):
-- 将K维度分割为多个部分并行计算
-- 使用原子操作累加结果
-- 在特定配置下实现 **2.45x** 加速
+**mHC Pre优化**:
+- Split-K分解：将K维度分割并行计算，使用原子操作累加
+- 去除pass_configs限制启用TMA/Warp Specialization
+- 小配置实现 **1.59-1.67x** 加速
+
+**mHC Post优化**:
+- TileLang官方实现已高度优化（7-11x vs PyTorch）
+- 流水线化内存访问减少延迟
 
 ## 测试环境
 
