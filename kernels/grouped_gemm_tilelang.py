@@ -37,16 +37,21 @@ import tilelang
 import tilelang.language as T
 
 
-# ============ TileLang Official Grouped GEMM Kernel ============
+# ============ TileLang Grouped GEMM Kernel (Optimized) ============
 
 @tilelang.jit(out_idx=[2])
 def _grouped_gemm_kernel(
     batch_sizes_list, K, N, 
-    block_M=64, block_N=128, block_K=64, 
-    num_stages=2, threads=128, dtype=T.float16
+    block_M=64, block_N=64, block_K=64, 
+    num_stages=3, threads=128, dtype=T.float16
 ):
     """
-    TileLang官方grouped GEMM kernel
+    优化的TileLang grouped GEMM kernel
+    
+    优化点:
+    - 双swizzled layout减少bank conflict
+    - num_stages=3增加流水线深度
+    - 调整block size适应小规模场景
     
     Args:
         batch_sizes_list: 每个expert的token数量 tuple
@@ -78,7 +83,11 @@ def _grouped_gemm_kernel(
             C_local = T.alloc_fragment([block_M, block_N], accum_dtype)
             cur_batch_idx = T.alloc_var(dtype=T.int32)
 
-            T.annotate_layout({A_shared: tilelang.layout.make_swizzled_layout(A_shared)})
+            # 双swizzled layout优化bank conflict
+            T.annotate_layout({
+                A_shared: tilelang.layout.make_swizzled_layout(A_shared),
+                B_shared: tilelang.layout.make_swizzled_layout(B_shared),
+            })
 
             m_start_padded = bx * block_M
 
@@ -203,9 +212,9 @@ def grouped_gemm_tilelang(
     expert_counts = torch.bincount(expert_indices, minlength=E)
     batch_sizes_list = expert_counts.tolist()
     
-    # 准备元数据
+    # 优化的block参数
     block_M = 64
-    block_N = 128
+    block_N = 64  # 减小block_N适应小I场景
     block_K = 64
     
     batch_offsets_list = [0]
