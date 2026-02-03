@@ -35,6 +35,22 @@
 
 **平均加速**: **1.39x** (vs 最强其他方案)
 
+#### H100 延迟对比 (ms)
+
+| 配置 | Params | PyTorch | torch.compile | TL-Official | Ours |
+|------|--------|---------|---------------|-------------|------|
+| DeepSeek-V2 | M=320, N=128, K=6 | 0.0213 | 0.0212 | 0.0348 | **0.0103** |
+| DeepSeek-V3 | M=64, N=32768, K=2048 | 0.1269 | 0.1368 | 0.0618 | **0.0598** |
+
+#### H100 Ours vs 最强其他方案
+
+| 配置 | 最强其他 | Ours | 加速比 | 状态 |
+|------|----------|------|--------|------|
+| DeepSeek-V2 | torch.compile (0.0212 ms) | 0.0103 ms | **2.06x** | ✅ |
+| DeepSeek-V3 | TL-Official (0.0618 ms) | 0.0598 ms | 1.03x | ≈ |
+
+**H100 平均加速**: **1.54x** (vs 最强其他方案)
+
 **自动选择策略**:
 ```
 N <= 64:           Bitonic Sort (高并行度)
@@ -64,6 +80,22 @@ N > 512:           Radix TopK + Softmax (大规模高效)
 | DeepSeek-V3 | PyTorch (5.9249 ms) | 5.9290 ms | 1.00x | ≈ |
 
 **平均加速**: **1.00x** (自动选择最优实现)
+
+#### H100 延迟对比 (ms)
+
+| 配置 | Params | PyTorch | torch.compile | TL-Official | Ours |
+|------|--------|---------|---------------|-------------|------|
+| FusedMoE-Test | H=1024, I=256, E=8 | 0.4729 | 0.5842 | 0.2675 | **0.2671** |
+| DeepSeek-V3 | H=7168, I=2048, E=256 | 7.7162 | 7.9759 | 31.3483 | **3.9945** |
+
+#### H100 Ours vs 最强其他方案
+
+| 配置 | 最强其他 | Ours | 加速比 | 状态 |
+|------|----------|------|--------|------|
+| FusedMoE-Test | TL-Official (0.2675 ms) | 0.2671 ms | 1.00x | ≈ |
+| DeepSeek-V3 | PyTorch (7.7162 ms) | 3.9945 ms | **1.93x** | ✅ |
+
+**H100 平均加速**: **1.47x** (vs 最强其他方案)
 
 **TileLang优化点**:
 - 双swizzled layout减少bank conflict
@@ -110,6 +142,39 @@ H <= 2560 且 E <= 64:  TileLang grouped_gemm (1.27x vs PyTorch)
 | Config-4 (Pre) | TL-Official (0.4039 ms) | 0.3936 ms | 1.03x | ≈ |
 
 **平均加速**: **1.19x** (Ours vs Best Other，含Pre+Post)
+
+#### H100 mHC Pre 延迟对比 (ms)
+
+| Config | Params | PyTorch | torch.compile | TL-Official | Ours |
+|--------|--------|---------|---------------|-------------|------|
+| Config-1 | n=512, h=1280 | 0.6453 | 0.2356 | 0.0360 | **0.0227** |
+| Config-2 | n=1024, h=2560 | 0.4128 | 0.1228 | 0.0613 | **0.0313** |
+| Config-3 | n=2048, h=4096 | 0.7679 | 0.2425 | 0.1113 | **0.0764** |
+| Config-4 | n=8192, h=4096 | 2.2217 | 0.7252 | 0.2423 | 0.2640 |
+
+#### H100 mHC Post 延迟对比 (ms)
+
+| Config | Params | PyTorch | torch.compile | TL-Official | Ours |
+|--------|--------|---------|---------------|-------------|------|
+| Config-1 | n=512, h=1280 | 0.0779 | 0.0507 | **0.0107** | 0.0107 |
+| Config-2 | n=1024, h=2560 | 0.2634 | 0.1934 | 0.0222 | **0.0221** |
+| Config-3 | n=2048, h=4096 | 0.8081 | 0.5787 | **0.0572** | 0.0575 |
+| Config-4 | n=8192, h=4096 | 3.1505 | 2.2867 | **0.2072** | 0.2071 |
+
+#### H100 Ours vs 最强其他方案
+
+| Config | 最强其他 | Ours | 加速比 | 状态 |
+|--------|----------|------|--------|------|
+| Config-1 (Pre) | TL-Official (0.0360 ms) | 0.0227 ms | **1.59x** | ✅ |
+| Config-2 (Pre) | TL-Official (0.0613 ms) | 0.0313 ms | **1.96x** | ✅ |
+| Config-3 (Pre) | TL-Official (0.1113 ms) | 0.0764 ms | **1.46x** | ✅ |
+| Config-4 (Pre) | TL-Official (0.2423 ms) | 0.2640 ms | 0.92x | ❌ |
+| Config-1 (Post) | TL-Official (0.0107 ms) | 0.0107 ms | 1.00x | ≈ |
+| Config-2 (Post) | TL-Official (0.0222 ms) | 0.0221 ms | 1.00x | ≈ |
+| Config-3 (Post) | TL-Official (0.0572 ms) | 0.0575 ms | 0.99x | ≈ |
+| Config-4 (Post) | TL-Official (0.2072 ms) | 0.2071 ms | 1.00x | ≈ |
+
+**H100 平均加速**: **1.24x** (Ours vs Best Other)
 
 **自动选择策略**:
 ```
