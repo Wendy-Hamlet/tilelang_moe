@@ -50,6 +50,17 @@ from .mhc_tilelang import (
     mhc_post,
 )
 
+# FusedMoE kernels
+from .fusedmoe_baseline import (
+    fusedmoe_pytorch,
+    fusedmoe_pytorch_compiled,
+    generate_fusedmoe_inputs,
+)
+from .fusedmoe_tilelang import (
+    fusedmoe_tilelang,
+    FusedMoETileLang,
+)
+
 __all__ = [
     # TopK + Softmax
     'topk_radix_tilelang',
@@ -81,4 +92,10 @@ __all__ = [
     'mhc_pre',  # recommended: auto-select best
     'mhc_post_tilelang_official',
     'mhc_post',  # recommended
+    # FusedMoE
+    'fusedmoe_pytorch',
+    'fusedmoe_pytorch_compiled',
+    'fusedmoe_tilelang',  # recommended: TileLang auto-optimized
+    'generate_fusedmoe_inputs',
+    'FusedMoETileLang',
 ]
