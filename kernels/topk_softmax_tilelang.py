@@ -720,3 +720,27 @@ def topk_softmax_best(logits: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch
 
 # Default export: auto-select best
 topk_softmax = topk_softmax_best
+
+
+
+def topk_softmax_conv_b_radix_unfused(
+    logits: torch.Tensor,
+    k: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    BL-5: Convention B + TileLang radix topk (unfused) + PyTorch softmax(K)
+
+    Used in Experiment 1 (Q1/Q2 chain) as the TileLang unfused baseline.
+    Radix topk is the only TileLang algorithm naturally separable from softmax:
+    it outputs indices only, so softmax must be applied in a separate step.
+
+    Contrast with bitonic/selection: those algorithms produce scores within a
+    single kernel not because of classical fusion but because the algorithm
+    itself never creates an intermediate index tensor in global memory.
+    """
+    if logits.dtype != torch.float32:
+        logits = logits.to(torch.float32)
+    indices = topk_radix_tilelang(logits, k)
+    topk_values = torch.gather(logits, dim=-1, index=indices.to(torch.int64))
+    scores = torch.softmax(topk_values, dim=-1)
+    return scores, indices.to(torch.int32)

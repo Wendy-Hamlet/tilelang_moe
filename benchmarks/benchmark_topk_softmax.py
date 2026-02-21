@@ -1,205 +1,219 @@
 """
-TopK + Softmax 性能对比基准
+TopK+Softmax Experiment Benchmark
+==================================
 
-官方配置:
-1. DeepSeek-V2 (example_topk.py): M=320, N=128, K=6
-2. DeepSeek-V3 (deepseek_v32/topk_selector.py): batch=64, seq_len=32768, K=2048
+Convention definitions:
+  A-norenorm : softmax(E experts) -> topk           [scores sum < 1]
+  A-renorm   : softmax(E experts) -> topk -> renorm [scores sum = 1]
+  B          : topk(logits)       -> softmax(K)     [scores sum = 1]
 
-对比四个版本：
-1) PyTorch: 全局softmax→topk
-2) torch.compile: PyTorch编译优化
-3) TL-Official: TileLang官方TopK + PyTorch softmax (separate)
-4) Ours: 融合kernel + 自动选择最优算法
+Equivalence (sec 3.2): A-renorm == B  (exact, algebraic; fp32 diff ~1e-8)
+                        A-norenorm != B (uniform scale 1/(1-delta))
+
+Experiment design
+-----------------
+Exp 1 -- Convention + programming model chain  (algorithm fixed to radix)
+  BL-1 : Conv A, PyTorch          -[Q1: convention swap]->
+  BL-4 : Conv B, PyTorch unfused  -[Q2: programming model]->
+  BL-5 : Conv B, TileLang radix unfused
+
+Exp 2 -- Algorithm comparison  (Conv B + TileLang, all configs)
+  radix (unfused, = BL-5) | bitonic | selection
+  Key: bitonic/selection produce scores inside a single kernel not because
+  of classical fusion but because the algorithm itself never creates an
+  intermediate index tensor in global memory.
+
+Q4 -- Total speedup: BL-1 vs Ours-best
+
+Performance configs cover representative (E, K) from real models.
+Correctness verification is in test_topk_softmax_conventions.py.
 """
 
 import sys
 import warnings
 from pathlib import Path
 
-warnings.filterwarnings('ignore', category=UserWarning, module='torch._inductor')
-
+warnings.filterwarnings("ignore", category=UserWarning, module="torch._inductor")
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
-import torch.nn.functional as F
-from typing import Callable, Dict
 from tabulate import tabulate
 from tilelang.profiler import do_bench
 
-torch.set_float32_matmul_precision('high')
-
-from kernels.topk_softmax_baseline import topk_softmax_separate
+from kernels.topk_softmax_baseline import (
+    topk_softmax_separate       as bl1_conv_a_pytorch,
+    topk_softmax_conv_b_unfused as bl4_conv_b_pytorch,
+)
 from kernels.topk_softmax_tilelang import (
-    topk_softmax_tilelang_separate,
-    topk_softmax_best,
+    topk_softmax_conv_b_radix_unfused as bl5_conv_b_radix,
+    topk_softmax_bitonic               as ours_bitonic,
+    topk_softmax_selection             as ours_selection,
+    topk_softmax_best                  as ours_best,
 )
 
+torch.set_float32_matmul_precision("high")
 
-# ============ 官方配置 ============
-OFFICIAL_CONFIGS = [
-    # (name, batch/M, num_experts/N, topk, source)
-    ("DeepSeek-V2", 320, 128, 6, "example_topk.py"),
-    ("DeepSeek-V3", 64, 32768, 2048, "deepseek_v32/topk_selector.py"),
+# ---------------------------------------------------------------------------
+# Configs: (display_name, E, K, representative_models)
+# We benchmark across all (E, K) from real models. Performance is determined
+# by E and K; the source model's convention only matters for correctness.
+# ---------------------------------------------------------------------------
+PERF_CONFIGS = [
+    ("Mixtral",     8,   2, "Mixtral-8x7B/8x22B, Grok-1"),
+    ("DBRX",        16,  4, "databricks/dbrx"),
+    ("OLMoE/Qwen2", 64,  8, "allenai/OLMoE, Qwen/Qwen2-57B-A14B"),
+    ("Qwen3",       128, 8, "Qwen/Qwen3-30B-A3B, Qwen3-235B-A22B"),
+    ("DeepSeek-V2", 160, 6, "deepseek-ai/DeepSeek-V2/V2.5"),
+    ("DeepSeek-V3", 256, 8, "deepseek-ai/DeepSeek-V3 routing (softmax proxy)"),
 ]
 
-
-# ============ torch.compile 预编译函数缓存 ============
-# 为每个K值创建专用的编译函数，避免重复编译
-_compiled_cache: Dict[int, Callable] = {}
-
-def get_compiled_fn(k: int) -> Callable:
-    """获取或创建针对特定K值的编译函数"""
-    if k not in _compiled_cache:
-        # 创建固定K的函数
-        def fn(logits):
-            scores = F.softmax(logits, dim=-1, dtype=torch.float32)
-            return torch.topk(scores, k, dim=-1)
-        
-        # 编译并缓存
-        _compiled_cache[k] = torch.compile(fn)
-    return _compiled_cache[k]
+BATCH_SIZE = 256
+WARMUP     = 50
+REP        = 500
 
 
-def benchmark_config(batch_size: int, num_experts: int, top_k: int, config_name: str):
-    """测试单个配置，返回四个版本的延迟结果。"""
-    
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
-    logits = torch.randn(batch_size, num_experts, device='cuda', dtype=torch.float32)
+def bench(fn, logits):
+    try:
+        for _ in range(10):
+            fn(logits)
+        torch.cuda.synchronize()
+        return do_bench(lambda: fn(logits), warmup=WARMUP, rep=REP, return_mode="median")
+    except Exception as e:
+        print(f"    [ERR] {e}")
+        return None
 
-    # 预先获取编译函数
-    compiled_fn = get_compiled_fn(top_k)
-    
-    versions = {
-        'PyTorch': lambda x: topk_softmax_separate(x, top_k),
-        'torch.compile': compiled_fn,
-        'TL-Official': lambda x: topk_softmax_tilelang_separate(x, top_k),
-        'Ours': lambda x: topk_softmax_best(x, top_k),
-    }
 
-    results = {}
-    for name, fn in versions.items():
-        try:
-            # Warmup (torch.compile需要更多warmup)
-            warmup_iters = 50 if name == 'torch.compile' else 10
-            for _ in range(warmup_iters):
-                _ = fn(logits)
-            torch.cuda.synchronize()
-            
-            # Benchmark
-            latency_ms = do_bench(lambda: fn(logits), warmup=100, rep=1000, return_mode='median')
-            results[name] = latency_ms
-            
-        except Exception as e:
-            print(f"  ✗ {name}: {e}")
-            results[name] = None
-    
-    return results
+def make_logits(batch, num_experts):
+    return torch.randn(batch, num_experts, device="cuda", dtype=torch.float32)
+
+
+def fmt_ms(t):
+    return f"{t:.4f}" if t is not None else "ERR"
+
+
+def fmt_speedup(ref, target):
+    if ref and target:
+        return f"{ref / target:.2f}x"
+    return "N/A"
+
+
+# ---------------------------------------------------------------------------
+# Experiment 1: Convention + programming model chain  (Q1, Q2)
+# ---------------------------------------------------------------------------
+def experiment_1(batch_size):
+    print()
+    print("=" * 95)
+    print("Experiment 1  |  Convention + Programming Model Chain  (algorithm = radix throughout)")
+    print("  BL-1 (Conv A, PyTorch)  --[Q1: convention]-->  BL-4 (Conv B, PyTorch unfused)")
+    print("  BL-4                    --[Q2: prog model]-->  BL-5 (Conv B, TileLang radix unfused)")
+    print(f"  batch_size = {batch_size}")
+    print("=" * 95)
+
+    rows = []
+    for name, E, K, _ in PERF_CONFIGS:
+        logits = make_logits(batch_size, E)
+        t1 = bench(lambda x: bl1_conv_a_pytorch(x, K), logits)
+        t4 = bench(lambda x: bl4_conv_b_pytorch(x, K), logits)
+        t5 = bench(lambda x: bl5_conv_b_radix(x, K),   logits)
+        rows.append([
+            name, f"E={E} K={K}",
+            fmt_ms(t1), fmt_ms(t4), fmt_ms(t5),
+            fmt_speedup(t1, t4),
+            fmt_speedup(t4, t5),
+        ])
+
+    print(tabulate(rows,
+        headers=["Model", "Config",
+                 "BL-1 A-PyTorch(ms)", "BL-4 B-PyTorch(ms)", "BL-5 B-TL-radix(ms)",
+                 "Q1 speedup", "Q2 speedup"],
+        tablefmt="grid"))
+
+
+# ---------------------------------------------------------------------------
+# Experiment 2: Algorithm comparison  (Conv B + TileLang)
+# ---------------------------------------------------------------------------
+def experiment_2(batch_size):
+    print()
+    print("=" * 95)
+    print("Experiment 2  |  Algorithm Comparison  (Conv B + TileLang)")
+    print("  radix [unfused = BL-5]  |  bitonic  |  selection")
+    print("  Note: bitonic/selection are single-kernel because the algorithm never")
+    print("        writes intermediate indices to global memory -- not classical fusion.")
+    print(f"  batch_size = {batch_size}")
+    print("=" * 95)
+
+    rows = []
+    for name, E, K, _ in PERF_CONFIGS:
+        logits     = make_logits(batch_size, E)
+        t_radix    = bench(lambda x: bl5_conv_b_radix(x, K),  logits)
+        t_bitonic  = bench(lambda x: ours_bitonic(x, K),      logits) if E <= 1024 else None
+        t_selection= bench(lambda x: ours_selection(x, K),    logits)
+
+        valid = [t for t in [t_bitonic, t_selection] if t is not None]
+        best_t = min(valid) if valid else None
+        winner = ""
+        if t_bitonic is not None and t_selection is not None:
+            winner = "bitonic" if t_bitonic <= t_selection else "selection"
+        elif t_bitonic is not None:
+            winner = "bitonic"
+        elif t_selection is not None:
+            winner = "selection"
+
+        rows.append([
+            name, f"E={E} K={K}",
+            fmt_ms(t_radix),
+            fmt_ms(t_bitonic) if E <= 1024 else "N/A(E>1024)",
+            fmt_ms(t_selection),
+            fmt_speedup(t_radix, best_t),
+            winner,
+        ])
+
+    print(tabulate(rows,
+        headers=["Model", "Config",
+                 "radix-unfused(ms)", "bitonic(ms)", "selection(ms)",
+                 "best/radix speedup", "winner"],
+        tablefmt="grid"))
+
+
+# ---------------------------------------------------------------------------
+# Q4: Total speedup  BL-1 vs Ours-best
+# ---------------------------------------------------------------------------
+def experiment_q4(batch_size):
+    print()
+    print("=" * 95)
+    print("Q4  |  Total Speedup  --  BL-1 (Conv A, PyTorch) vs Ours-best (Conv B, TileLang)")
+    print(f"  batch_size = {batch_size}")
+    print("=" * 95)
+
+    rows = []
+    for name, E, K, models in PERF_CONFIGS:
+        logits = make_logits(batch_size, E)
+        t_bl1  = bench(lambda x: bl1_conv_a_pytorch(x, K), logits)
+        t_ours = bench(lambda x: ours_best(x, K),           logits)
+        rows.append([
+            name, f"E={E} K={K}", models[:42],
+            fmt_ms(t_bl1), fmt_ms(t_ours),
+            fmt_speedup(t_bl1, t_ours),
+        ])
+
+    print(tabulate(rows,
+        headers=["Model", "Config", "Representative models",
+                 "BL-1(ms)", "Ours-best(ms)", "Total speedup"],
+        tablefmt="grid"))
 
 
 def main():
-    print("=" * 100)
-    print("TopK + Softmax Performance Benchmark")
-    print("=" * 100)
+    print("TopK+Softmax Experiment Benchmark")
+    print(f"GPU       : {torch.cuda.get_device_name(0)}")
+    print(f"PyTorch   : {torch.__version__}")
+    print(f"batch_size: {BATCH_SIZE}  (tokens)")
+
+    experiment_1(BATCH_SIZE)
+    experiment_2(BATCH_SIZE)
+    experiment_q4(BATCH_SIZE)
+
     print()
-    print("Official Configurations:")
-    for name, M, N, K, source in OFFICIAL_CONFIGS:
-        print(f"  - {name}: M={M}, N={N}, K={K} (from {source})")
-    print()
-    print("Versions:")
-    print("  - PyTorch: softmax(all) → topk")
-    print("  - torch.compile: compiled PyTorch")
-    print("  - TL-Official: TileLang Softmax + TileLang TopK (separate, all TileLang)")
-    print("  - Ours: fused kernel + auto-select algorithm")
-    print()
-    
-    all_results = []
-    
-    for name, M, N, K, source in OFFICIAL_CONFIGS:
-        print(f"Testing {name} (M={M}, N={N}, K={K})...")
-        results = benchmark_config(M, N, K, name)
-        results['config'] = name
-        results['params'] = f"M={M}, N={N}, K={K}"
-        all_results.append(results)
-        print(f"  Done: PyTorch={results.get('PyTorch', 'N/A'):.4f}ms, Ours={results.get('Ours', 'N/A'):.4f}ms")
-        print()
-    
-    # ============ 表格1: 延迟对比 (ms) ============
-    print("=" * 100)
-    print("Table 1: Latency Comparison (ms)")
-    print("=" * 100)
-    
-    latency_table = []
-    for r in all_results:
-        row = [
-            r['config'],
-            r['params'],
-            f"{r['PyTorch']:.4f}" if r.get('PyTorch') else "N/A",
-            f"{r['torch.compile']:.4f}" if r.get('torch.compile') else "N/A",
-            f"{r['TL-Official']:.4f}" if r.get('TL-Official') else "N/A",
-            f"{r['Ours']:.4f}" if r.get('Ours') else "N/A",
-        ]
-        latency_table.append(row)
-    
-    headers = ["Config", "Params", "PyTorch", "torch.compile", "TL-Official", "Ours"]
-    print(tabulate(latency_table, headers=headers, tablefmt="grid"))
-    
-    # ============ 表格2: Ours vs 最强其他方案 ============
-    print()
-    print("=" * 100)
-    print("Table 2: Ours vs Best Other")
-    print("=" * 100)
-    
-    compare_table = []
-    for r in all_results:
-        # 找出最强其他方案
-        others = {
-            'PyTorch': r.get('PyTorch'),
-            'torch.compile': r.get('torch.compile'),
-            'TL-Official': r.get('TL-Official'),
-        }
-        
-        valid_others = {k: v for k, v in others.items() if v is not None}
-        if not valid_others:
-            continue
-            
-        best_other_name = min(valid_others, key=valid_others.get)
-        best_other_latency = valid_others[best_other_name]
-        ours_latency = r.get('Ours')
-        
-        if ours_latency is None:
-            continue
-        
-        speedup = best_other_latency / ours_latency
-        status = "✅" if speedup > 1.05 else ("≈" if speedup > 0.95 else "❌")
-        
-        row = [
-            r['config'],
-            f"{best_other_name} ({best_other_latency:.4f} ms)",
-            f"{ours_latency:.4f} ms",
-            f"{speedup:.2f}x",
-            status,
-        ]
-        compare_table.append(row)
-    
-    headers = ["Config", "Best Other", "Ours", "Speedup", "Status"]
-    print(tabulate(compare_table, headers=headers, tablefmt="grid"))
-    
-    # ============ 平均加速比 ============
-    print()
-    speedups = []
-    for r in all_results:
-        others = [r.get('PyTorch'), r.get('torch.compile'), r.get('TL-Official')]
-        valid_others = [v for v in others if v is not None]
-        if valid_others and r.get('Ours'):
-            speedups.append(min(valid_others) / r['Ours'])
-    
-    if speedups:
-        avg_speedup = sum(speedups) / len(speedups)
-        print(f"Average Speedup (Ours vs Best Other): {avg_speedup:.2f}x")
-    
-    print()
-    print("=" * 100)
+    print("Correctness verification: python tests/test_topk_softmax_conventions.py")
 
 
 if __name__ == "__main__":

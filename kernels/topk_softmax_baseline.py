@@ -213,3 +213,29 @@ if __name__ == "__main__":
     
     print("\n测试3: 大规模配置")
     verify_equivalence(batch_size=128, num_experts=512, top_k=16)
+
+
+
+# ============================================================================
+# Supplement: named functions for experiment framework
+# ============================================================================
+
+def topk_softmax_conv_a_renorm(
+    logits: torch.Tensor,
+    k: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Convention A + renorm: softmax(E experts) -> topk -> renorm(sum=1)
+
+    Representative models: Mixtral-8x7B(HF), DBRX, Qwen3-30B-A3B, Grok-1
+    Equivalence: algebraically exact to Convention B (Z cancels, sec 3.2)
+    """
+    scores = F.softmax(logits, dim=-1, dtype=torch.float32)
+    topk_scores, topk_indices = torch.topk(scores, k, dim=-1)
+    topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)
+    return topk_scores, topk_indices
+
+
+# Explicit alias for BL-4 in experiments
+# (topk_softmax_fused already implements Conv B unfused semantics)
+topk_softmax_conv_b_unfused = topk_softmax_fused
