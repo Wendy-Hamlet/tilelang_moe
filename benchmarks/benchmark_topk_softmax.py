@@ -67,7 +67,7 @@ PERF_CONFIGS = [
     ("DeepSeek-V3", 256, 8, "deepseek-ai/DeepSeek-V3 routing (softmax proxy)"),
 ]
 
-BATCH_SIZE = 256
+NUM_TOKENS = 256
 WARMUP     = 50
 REP        = 500
 
@@ -83,8 +83,8 @@ def bench(fn, logits):
         return None
 
 
-def make_logits(batch, num_experts):
-    return torch.randn(batch, num_experts, device="cuda", dtype=torch.float32)
+def make_logits(num_tokens, num_experts):
+    return torch.randn(num_tokens, num_experts, device="cuda", dtype=torch.float32)
 
 
 def fmt_ms(t):
@@ -100,18 +100,18 @@ def fmt_speedup(ref, target):
 # ---------------------------------------------------------------------------
 # Experiment 1: Convention + programming model chain  (Q1, Q2)
 # ---------------------------------------------------------------------------
-def experiment_1(batch_size):
+def experiment_1(num_tokens):
     print()
     print("=" * 95)
     print("Experiment 1  |  Convention + Programming Model Chain  (algorithm = radix throughout)")
     print("  BL-1 (Conv A, PyTorch)  --[Q1: convention]-->  BL-4 (Conv B, PyTorch unfused)")
     print("  BL-4                    --[Q2: prog model]-->  BL-5 (Conv B, TileLang radix unfused)")
-    print(f"  batch_size = {batch_size}")
+    print(f"  num_tokens = {num_tokens}")
     print("=" * 95)
 
     rows = []
     for name, E, K, _ in PERF_CONFIGS:
-        logits = make_logits(batch_size, E)
+        logits = make_logits(num_tokens, E)
         t1 = bench(lambda x: bl1_conv_a_pytorch(x, K), logits)
         t4 = bench(lambda x: bl4_conv_b_pytorch(x, K), logits)
         t5 = bench(lambda x: bl5_conv_b_radix(x, K),   logits)
@@ -132,14 +132,14 @@ def experiment_1(batch_size):
 # ---------------------------------------------------------------------------
 # Experiment 2: Algorithm comparison  (Conv B + TileLang)
 # ---------------------------------------------------------------------------
-def experiment_2(batch_size):
+def experiment_2(num_tokens):
     print()
     print("=" * 95)
     print("Experiment 2  |  Algorithm Comparison  (Conv B + TileLang)")
     print("  radix [unfused = BL-5]  |  bitonic  |  selection")
     print("  Note: bitonic/selection are single-kernel because the algorithm never")
     print("        writes intermediate indices to global memory -- not classical fusion.")
-    print(f"  batch_size = {batch_size}")
+    print(f"  num_tokens = {num_tokens}")
     print("=" * 95)
 
     rows = []
@@ -178,16 +178,16 @@ def experiment_2(batch_size):
 # ---------------------------------------------------------------------------
 # Q4: Total speedup  BL-1 vs Ours-best
 # ---------------------------------------------------------------------------
-def experiment_q4(batch_size):
+def experiment_q4(num_tokens):
     print()
     print("=" * 95)
     print("Q4  |  Total Speedup  --  BL-1 (Conv A, PyTorch) vs Ours-best (Conv B, TileLang)")
-    print(f"  batch_size = {batch_size}")
+    print(f"  num_tokens = {num_tokens}")
     print("=" * 95)
 
     rows = []
     for name, E, K, models in PERF_CONFIGS:
-        logits = make_logits(batch_size, E)
+        logits = make_logits(num_tokens, E)
         t_bl1  = bench(lambda x: bl1_conv_a_pytorch(x, K), logits)
         t_ours = bench(lambda x: ours_best(x, K),           logits)
         rows.append([
@@ -206,11 +206,11 @@ def main():
     print("TopK+Softmax Experiment Benchmark")
     print(f"GPU       : {torch.cuda.get_device_name(0)}")
     print(f"PyTorch   : {torch.__version__}")
-    print(f"batch_size: {BATCH_SIZE}  (tokens)")
+    print(f"num_tokens: {NUM_TOKENS}")
 
-    experiment_1(BATCH_SIZE)
-    experiment_2(BATCH_SIZE)
-    experiment_q4(BATCH_SIZE)
+    experiment_1(NUM_TOKENS)
+    experiment_2(NUM_TOKENS)
+    experiment_q4(NUM_TOKENS)
 
     print()
     print("Correctness verification: python tests/test_topk_softmax_conventions.py")

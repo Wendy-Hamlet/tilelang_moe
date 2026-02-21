@@ -20,12 +20,12 @@ def topk_softmax_separate(
     标准MoE路由流程：先全局softmax，再topk
     
     Args:
-        logits: (batch_size, num_experts) - 未归一化的logits
+        logits: (num_tokens, num_experts) - 未归一化的logits
         k: top-k数量
     
     Returns:
-        scores: (batch_size, k) - 归一化的概率分数
-        indices: (batch_size, k) - top-k的索引
+        scores: (num_tokens, k) - 归一化的概率分数
+        indices: (num_tokens, k) - top-k的索引
     """
     # 全局softmax
     scores = F.softmax(logits, dim=-1, dtype=torch.float32)
@@ -50,12 +50,12 @@ def topk_softmax_fused(
     因为topk选出最大的k个，剩余(E-k)个exp值接近0，两者几乎等价。
     
     Args:
-        logits: (batch_size, num_experts) - 未归一化的logits
+        logits: (num_tokens, num_experts) - 未归一化的logits
         k: top-k数量
     
     Returns:
-        scores: (batch_size, k) - 归一化的概率分数
-        indices: (batch_size, k) - top-k的索引
+        scores: (num_tokens, k) - 归一化的概率分数
+        indices: (num_tokens, k) - top-k的索引
     """
     # 先找top-k的logits（未归一化）
     topk_logits, topk_indices = torch.topk(logits, k, dim=-1)
@@ -120,14 +120,14 @@ class TopKSoftmaxRouter(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            hidden_states: (batch_size, hidden_size)
+            hidden_states: (num_tokens, hidden_size)
         
         Returns:
-            router_scores: (batch_size, top_k) - 归一化的路由概率
-            selected_experts: (batch_size, top_k) - 选中的expert索引
+            router_scores: (num_tokens, top_k) - 归一化的路由概率
+            selected_experts: (num_tokens, top_k) - 选中的expert索引
         """
         # 计算logits
-        logits = self.router(hidden_states)  # (batch_size, num_experts)
+        logits = self.router(hidden_states)  # (num_tokens, num_experts)
         
         # TopK + Softmax
         router_scores, selected_experts = self.topk_softmax_fn(logits, self.top_k)
@@ -135,13 +135,13 @@ class TopKSoftmaxRouter(torch.nn.Module):
         return router_scores, selected_experts
 
 
-def verify_equivalence(batch_size: int = 64, num_experts: int = 256, top_k: int = 8):
+def verify_equivalence(num_tokens: int = 64, num_experts: int = 256, top_k: int = 8):
     """验证分离版本和融合版本的数学等价性"""
     print("验证TopK+Softmax融合的数学等价性")
     print("=" * 80)
     
     torch.manual_seed(42)
-    logits = torch.randn(batch_size, num_experts, device='cuda')
+    logits = torch.randn(num_tokens, num_experts, device='cuda')
     
     # 分离版本（需要重新归一化以对齐融合版本）
     scores_sep_raw, indices_sep = topk_softmax_separate(logits, top_k)
@@ -206,13 +206,13 @@ def verify_equivalence(batch_size: int = 64, num_experts: int = 256, top_k: int 
 if __name__ == "__main__":
     # 验证数学等价性
     print("\n测试1: DeepSeek-V2配置")
-    verify_equivalence(batch_size=64, num_experts=160, top_k=6)
+    verify_equivalence(num_tokens=64, num_experts=160, top_k=6)
     
     print("\n测试2: DeepSeek-V3配置")
-    verify_equivalence(batch_size=64, num_experts=256, top_k=8)
+    verify_equivalence(num_tokens=64, num_experts=256, top_k=8)
     
     print("\n测试3: 大规模配置")
-    verify_equivalence(batch_size=128, num_experts=512, top_k=16)
+    verify_equivalence(num_tokens=128, num_experts=512, top_k=16)
 
 
 

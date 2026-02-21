@@ -35,7 +35,7 @@ from kernels.topk_softmax_baseline import (
 )
 
 torch.manual_seed(42)
-BATCH = 512
+NUM_TOKENS = 512
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +79,7 @@ def summary_table():
     rows_score = []   # score differences
 
     for name, E, K, conv, renorm, model in CONFIGS:
-        logits = torch.randn(BATCH, E, device="cuda", dtype=torch.float32)
+        logits = torch.randn(NUM_TOKENS, E, device="cuda", dtype=torch.float32)
         (s_ano, idx_ano), (s_are, idx_are), (s_b, idx_b) = run_conventions(logits, K)
 
         # --- index equivalence (all three should agree) ---
@@ -154,7 +154,7 @@ def per_config_detail():
     for name, E, K, conv, renorm, model in CONFIGS:
         if conv == "B":
             continue
-        logits = torch.randn(BATCH, E, device="cuda", dtype=torch.float32)
+        logits = torch.randn(NUM_TOKENS, E, device="cuda", dtype=torch.float32)
         (s_ano, idx_ano), _, (s_b, idx_b) = run_conventions(logits, K)
 
         with torch.no_grad():
@@ -182,7 +182,7 @@ def per_config_detail():
 def main():
     print("TopK+Softmax Convention Correctness Verification")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"Batch size: {BATCH}")
+    print(f"Num tokens: {NUM_TOKENS}")
     summary_table()
     per_config_detail()
     print()

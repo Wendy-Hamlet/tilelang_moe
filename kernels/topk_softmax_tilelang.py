@@ -53,20 +53,20 @@ def _convert_to_uint32(x):
 
 @tilelang.jit(pass_configs=_radix_pass_configs)
 def _tl_topk_radix_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
-    batch = T.dynamic("batch")
-    seq_len = T.dynamic("seq_len")
+    num_tokens = T.dynamic("num_tokens")
+    num_experts = T.dynamic("num_experts")
     RADIX = 1 << 8
     BLOCK_SIZE = 1024
     SMEM_INPUT_SIZE = 4096
 
     @T.prim_func
     def tl_topk_radix_kernel(
-        input: T.Tensor[(batch, seq_len), in_dtype],
-        index: T.Tensor[(batch, topk), out_dtype],
-        starts: T.Tensor[(batch), out_dtype],
-        ends: T.Tensor[(batch), out_dtype],
+        input: T.Tensor[(num_tokens, num_experts), in_dtype],
+        index: T.Tensor[(num_tokens, topk), out_dtype],
+        starts: T.Tensor[(num_tokens), out_dtype],
+        ends: T.Tensor[(num_tokens), out_dtype],
     ):
-        with T.Kernel(batch, threads=BLOCK_SIZE) as (bx):
+        with T.Kernel(num_tokens, threads=BLOCK_SIZE) as (bx):
             tx = T.get_thread_binding()
 
             s_threshold_bin_id = T.alloc_shared([1], T.int32)
@@ -94,9 +94,9 @@ def _tl_topk_radix_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
             T.fill(s_num_input[0], 0)
             T.sync_threads()
 
-            for s in T.serial(T.ceildiv(seq_len, BLOCK_SIZE)):
+            for s in T.serial(T.ceildiv(num_experts, BLOCK_SIZE)):
                 input_idx = s * BLOCK_SIZE + tx
-                if input_idx < l_end_idx and input_idx >= l_start_idx and input_idx < seq_len:
+                if input_idx < l_end_idx and input_idx >= l_start_idx and input_idx < num_experts:
                     inval_int16 = _convert_to_uint16(input[bx, input_idx])
                     T.atomic_add(s_histogram[inval_int16], 1)
             T.sync_threads()
@@ -120,10 +120,10 @@ def _tl_topk_radix_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
             l_new_topk = l_new_topk - s_histogram[l_threshold_bin_id + 1]
             T.sync_threads()
 
-            for s in T.serial(T.ceildiv(seq_len, BLOCK_SIZE)):
+            for s in T.serial(T.ceildiv(num_experts, BLOCK_SIZE)):
                 T.sync_threads()
                 input_idx = s * BLOCK_SIZE + tx
-                if input_idx < l_end_idx and input_idx >= l_start_idx and input_idx < seq_len:
+                if input_idx < l_end_idx and input_idx >= l_start_idx and input_idx < num_experts:
                     bin_id = _convert_to_uint16(input[bx, input_idx])
                     l_bin_id32 = T.Cast(T.int32, bin_id)
                     
@@ -207,17 +207,17 @@ def topk_radix_tilelang(logits: torch.Tensor, topk: int = 6) -> torch.Tensor:
     TileLang Radix TopK implementation
     
     Args:
-        logits: [batch, num_experts] tensor
+        logits: [num_tokens, num_experts] tensor
         topk: number of experts to select
     
     Returns:
-        indices: [batch, topk] indices of top-k experts
+        indices: [num_tokens, topk] indices of top-k experts
     """
     if logits.dtype != torch.float32:
         logits = logits.to(torch.float32)
     
-    batch, num_experts = logits.shape
-    batch = int(batch)
+    num_tokens, num_experts = logits.shape
+    num_tokens = int(num_tokens)
     num_experts = int(num_experts)
     
     if isinstance(topk, torch.Tensor):
@@ -225,9 +225,9 @@ def topk_radix_tilelang(logits: torch.Tensor, topk: int = 6) -> torch.Tensor:
     else:
         topk = int(topk)
     
-    indices = torch.zeros((batch, topk), dtype=torch.int32, device=logits.device)
-    starts = torch.zeros((batch,), dtype=torch.int32, device=logits.device)
-    ends = torch.full((batch,), num_experts, dtype=torch.int32, device=logits.device)
+    indices = torch.zeros((num_tokens, topk), dtype=torch.int32, device=logits.device)
+    starts = torch.zeros((num_tokens,), dtype=torch.int32, device=logits.device)
+    ends = torch.full((num_tokens,), num_experts, dtype=torch.int32, device=logits.device)
     
     kernel = _tl_topk_radix_impl(topk)
     kernel(logits, indices, starts, ends)
@@ -316,7 +316,7 @@ def softmax_tilelang(x: torch.Tensor) -> torch.Tensor:
     }
 )
 def topk_softmax_selection_kernel(
-    batch_size: int,
+    num_tokens: int,
     num_experts: int,
     top_k: int,
     block_size: int = 256,
@@ -332,11 +332,11 @@ def topk_softmax_selection_kernel(
     """
     @T.prim_func
     def main(
-        logits: T.Tensor((batch_size, num_experts), dtype),
-        scores: T.Tensor((batch_size, top_k), T.float32),
-        indices: T.Tensor((batch_size, top_k), T.int32),
+        logits: T.Tensor((num_tokens, num_experts), dtype),
+        scores: T.Tensor((num_tokens, top_k), T.float32),
+        indices: T.Tensor((num_tokens, top_k), T.int32),
     ):
-        with T.Kernel(batch_size, threads=block_size) as bx:
+        with T.Kernel(num_tokens, threads=block_size) as bx:
             s_topk_vals = T.alloc_shared((top_k,), T.float32)
             s_topk_idx = T.alloc_shared((top_k,), T.int32)
             s_thread_vals = T.alloc_shared((block_size,), T.float32)
@@ -460,7 +460,7 @@ _bitonic_pass_configs = {
 }
 
 
-def _make_topk_softmax_bitonic_kernel(batch_size: int, num_experts: int, top_k: int):
+def _make_topk_softmax_bitonic_kernel(num_tokens: int, num_experts: int, top_k: int):
     """
     Create fused TopK+Softmax kernel with Bitonic Sort (Sonic-style)
     
@@ -497,11 +497,11 @@ def _make_topk_softmax_bitonic_kernel(batch_size: int, num_experts: int, top_k: 
         
         @T.prim_func
         def main(
-            logits: T.Tensor((batch_size, num_experts), T.float32),
-            scores: T.Tensor((batch_size, top_k), T.float32),
-            indices: T.Tensor((batch_size, top_k), T.int32),
+            logits: T.Tensor((num_tokens, num_experts), T.float32),
+            scores: T.Tensor((num_tokens, top_k), T.float32),
+            indices: T.Tensor((num_tokens, top_k), T.int32),
         ):
-            with T.Kernel(batch_size, threads=N_padded) as bx:
+            with T.Kernel(num_tokens, threads=N_padded) as bx:
                 s_vals = T.alloc_shared((N_padded,), T.float32)
                 s_idx = T.alloc_shared((N_padded,), T.int32)
                 
@@ -546,25 +546,25 @@ def topk_softmax_bitonic(logits: torch.Tensor, k: int) -> Tuple[torch.Tensor, to
     Fused TopK+Softmax using Bitonic Sort
     
     Args:
-        logits: (batch, num_experts) tensor
+        logits: (num_tokens, num_experts) tensor
         k: number of top elements
     
     Returns:
-        (scores, indices): both shape (batch, k)
+(scores, indices): both shape (num_tokens, k)
     """
-    batch_size, num_experts = logits.shape
+    num_tokens, num_experts = logits.shape
     
     if num_experts > 1024:
         raise ValueError(f"Bitonic sort kernel supports num_experts <= 1024, got {num_experts}")
     
-    cache_key = (batch_size, num_experts, k)
+    cache_key = (num_tokens, num_experts, k)
     if cache_key not in _bitonic_kernel_cache:
-        _bitonic_kernel_cache[cache_key] = _make_topk_softmax_bitonic_kernel(batch_size, num_experts, k)
+        _bitonic_kernel_cache[cache_key] = _make_topk_softmax_bitonic_kernel(num_tokens, num_experts, k)
     
     kernel = _bitonic_kernel_cache[cache_key]
     
-    scores = torch.empty(batch_size, k, device=logits.device, dtype=torch.float32)
-    indices = torch.empty(batch_size, k, device=logits.device, dtype=torch.int32)
+    scores = torch.empty(num_tokens, k, device=logits.device, dtype=torch.float32)
+    indices = torch.empty(num_tokens, k, device=logits.device, dtype=torch.int32)
     
     kernel(logits, scores, indices)
     return scores, indices
@@ -582,17 +582,17 @@ def topk_softmax_selection(logits: torch.Tensor, k: int) -> Tuple[torch.Tensor, 
     Selection Sort based TopK+Softmax
     
     Args:
-        logits: (batch, num_experts) tensor
+        logits: (num_tokens, num_experts) tensor
         k: number of top elements
     
     Returns:
-        (scores, indices): both shape (batch, k)
+(scores, indices): both shape (num_tokens, k)
     """
-    batch_size, num_experts = logits.shape
+    num_tokens, num_experts = logits.shape
     
-    cache_key = (batch_size, num_experts, k)
+    cache_key = (num_tokens, num_experts, k)
     if cache_key not in _selection_kernel_cache:
-        _selection_kernel_cache[cache_key] = topk_softmax_selection_kernel(batch_size, num_experts, k)
+        _selection_kernel_cache[cache_key] = topk_softmax_selection_kernel(num_tokens, num_experts, k)
     
     kernel = _selection_kernel_cache[cache_key]
     return kernel(logits)
@@ -616,10 +616,10 @@ def topk_softmax_tilelang_separate(logits: torch.Tensor, k: int) -> Tuple[torch.
     - TopK: radix_topk from tilelang/examples/deepseek_v32/
     
     Args:
-        logits: (batch, num_experts) float32
+        logits: (num_tokens, num_experts) float32
         k: top-k count
     Returns:
-        (scores, indices): both shape (batch, k)
+(scores, indices): both shape (num_tokens, k)
     """
     # Ensure float32
     if logits.dtype != torch.float32:
@@ -699,12 +699,12 @@ def topk_softmax_best(logits: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch
     - N > 1024 falls back to Radix
     
     Args:
-        logits: (batch, num_experts) float32
+        logits: (num_tokens, num_experts) float32
         k: top-k count
     Returns:
-        (scores, indices): both shape (batch, k)
+(scores, indices): both shape (num_tokens, k)
     """
-    batch_size, num_experts = logits.shape
+    num_tokens, num_experts = logits.shape
     strategy = _select_strategy(num_experts, k)
     
     if strategy == 'bitonic':
