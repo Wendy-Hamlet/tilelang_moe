@@ -1,6 +1,8 @@
 """
-TopK+Softmax Experiment Benchmark
-==================================
+TopK+Softmax Experiment Benchmark  (TileLang environment)
+==========================================================
+
+Run in: conda activate tilelang
 
 Convention definitions:
   A-norenorm : softmax(E experts) -> topk           [scores sum < 1]
@@ -23,13 +25,7 @@ Exp 2 -- Algorithm comparison  (Conv B + TileLang, all configs)
   of classical fusion but because the algorithm itself never creates an
   intermediate index tensor in global memory.
 
-Exp 3 -- Head-to-head: Sonic CuTe-DSL vs Ours-best (TileLang)
-  Both are Conv B, single-kernel fused TopK+Softmax.
-  Sonic: CuTe-DSL bitonic + bit-packing index encoding (Hopper-optimized)
-  Ours:  TileLang auto-select (bitonic/selection/radix)
-  Constraint: Sonic requires E <= 4096, K <= 16, E % 8 == 0
-
-Q4 -- Total speedup matrix: BL-1 vs Sonic vs Ours-best across (num_tokens x model)
+Q4 -- Total speedup matrix: BL-1 vs Ours-best across (num_tokens x model)
 
 Token sweep
 -----------
@@ -68,30 +64,6 @@ from kernels.topk_softmax_tilelang import (
     topk_softmax_selection             as ours_selection,
     topk_softmax_best                  as ours_best,
 )
-
-# ---------------------------------------------------------------------------
-# Sonic CuTe-DSL baseline (optional -- requires cutlass + quack + cuda-python)
-# ---------------------------------------------------------------------------
-SONIC_AVAILABLE = False
-try:
-    from sonicmoe.functional.forward import _softmax_topk_fwd as _sonic_fwd
-    SONIC_AVAILABLE = True
-except ImportError:
-    pass
-
-
-def sonic_topk_softmax(logits, k):
-    """Wrapper around Sonic's CuTe-DSL TopK+Softmax kernel.
-
-    Sonic uses Conv B (topk-first) with bitonic sort + bit-packing index
-    encoding, fused softmax.  Constraints: E <= 4096, K <= 16, E % 8 == 0.
-    """
-    T, E = logits.shape
-    scores  = torch.empty(T, k, dtype=torch.float32, device=logits.device)
-    indices = torch.empty(T, k, dtype=torch.int32,    device=logits.device)
-    _sonic_fwd(logits, scores, indices, E, k)
-    return scores, indices
-
 
 torch.set_float32_matmul_precision("high")
 
@@ -223,49 +195,7 @@ def experiment_2(token_sweep):
 
 
 # ---------------------------------------------------------------------------
-# Experiment 3: Head-to-head  --  Sonic CuTe-DSL vs Ours-best (TileLang)
-# Both are Conv B, single-kernel fused TopK+Softmax.
-# ---------------------------------------------------------------------------
-def experiment_3(token_sweep):
-    if not SONIC_AVAILABLE:
-        print()
-        print("=" * 95)
-        print("Experiment 3  |  SKIPPED -- sonicmoe not installed")
-        print("  Install: pip install -e third_party/sonic-moe")
-        print("=" * 95)
-        return
-
-    print()
-    print("=" * 95)
-    print("Experiment 3  |  Head-to-Head: Sonic CuTe-DSL vs Ours-best (TileLang)")
-    print("  Both: Conv B, single-kernel fused TopK+Softmax")
-    print("  Sonic : CuTe-DSL bitonic + bit-packing (Hopper-optimized)")
-    print("  Ours  : TileLang auto-select (bitonic / selection / radix)")
-    print("=" * 95)
-
-    for num_tokens in token_sweep:
-        print(f"\n  -- num_tokens = {num_tokens} --")
-        rows = []
-        for name, E, K, _ in PERF_CONFIGS:
-            logits    = make_logits(num_tokens, E)
-            t_sonic   = bench(lambda x: sonic_topk_softmax(x, K), logits)
-            t_ours    = bench(lambda x: ours_best(x, K),          logits)
-
-            rows.append([
-                name, f"E={E} K={K}",
-                fmt_ms(t_sonic), fmt_ms(t_ours),
-                fmt_speedup(t_sonic, t_ours),
-            ])
-
-        print(tabulate(rows,
-            headers=["Model", "Config",
-                     "Sonic CuTe-DSL(ms)", "Ours-best TL(ms)",
-                     "Sonic/Ours speedup"],
-            tablefmt="grid"))
-
-
-# ---------------------------------------------------------------------------
-# Q4: Total speedup matrix  --  BL-1 vs Sonic vs Ours-best
+# Q4: Total speedup matrix  --  BL-1 vs Ours-best
 # Rows: num_tokens (decode -> prefill sweep)
 # Cols: model config
 # Shows how total speedup scales with token count.
@@ -273,11 +203,7 @@ def experiment_3(token_sweep):
 def experiment_q4(token_sweep):
     print()
     print("=" * 95)
-    if SONIC_AVAILABLE:
-        print("Q4  |  Total Speedup Matrix  --  BL-1 (Conv A, PyTorch) vs Sonic vs Ours-best")
-    else:
-        print("Q4  |  Total Speedup Matrix  --  BL-1 (Conv A, PyTorch) vs Ours-best (Conv B, TileLang)")
-        print("  (Sonic not installed -- install sonicmoe to include it)")
+    print("Q4  |  Total Speedup Matrix  --  BL-1 (Conv A, PyTorch) vs Ours-best (Conv B, TileLang)")
     print("  Rows: num_tokens (decode -> prefill)  |  Cols: model config")
     print("=" * 95)
 
@@ -287,59 +213,35 @@ def experiment_q4(token_sweep):
     for num_tokens in token_sweep:
         speedup_row = [str(num_tokens)]
         for name, E, K, _ in PERF_CONFIGS:
-            logits  = make_logits(num_tokens, E)
-            t_bl1   = bench(lambda x: bl1_conv_a_pytorch(x, K), logits)
-            t_sonic = bench(lambda x: sonic_topk_softmax(x, K), logits) if SONIC_AVAILABLE else None
-            t_ours  = bench(lambda x: ours_best(x, K),          logits)
-
-            if SONIC_AVAILABLE:
-                speedup_row.append(
-                    f"{fmt_speedup(t_bl1, t_sonic)} / {fmt_speedup(t_bl1, t_ours)}"
-                )
-                detail_rows.append([
-                    num_tokens, name, f"E={E} K={K}",
-                    fmt_ms(t_bl1), fmt_ms(t_sonic), fmt_ms(t_ours),
-                    fmt_speedup(t_bl1, t_sonic), fmt_speedup(t_bl1, t_ours),
-                ])
-            else:
-                speedup_row.append(fmt_speedup(t_bl1, t_ours))
-                detail_rows.append([
-                    num_tokens, name, f"E={E} K={K}",
-                    fmt_ms(t_bl1), fmt_ms(t_ours),
-                    fmt_speedup(t_bl1, t_ours),
-                ])
+            logits = make_logits(num_tokens, E)
+            t_bl1  = bench(lambda x: bl1_conv_a_pytorch(x, K), logits)
+            t_ours = bench(lambda x: ours_best(x, K),           logits)
+            speedup_row.append(fmt_speedup(t_bl1, t_ours))
+            detail_rows.append([
+                num_tokens, name, f"E={E} K={K}",
+                fmt_ms(t_bl1), fmt_ms(t_ours),
+                fmt_speedup(t_bl1, t_ours),
+            ])
         speedup_rows.append(speedup_row)
 
     # Compact speedup matrix
     print()
-    if SONIC_AVAILABLE:
-        print("  Speedup matrix (BL-1/Sonic / BL-1/Ours):")
-        col_headers = ["num_tokens"] + [f"{name}\nE={E},K={K}" for name, E, K, _ in PERF_CONFIGS]
-    else:
-        print("  Speedup matrix (BL-1 / Ours-best):")
-        col_headers = ["num_tokens"] + [f"{name}\nE={E},K={K}" for name, E, K, _ in PERF_CONFIGS]
+    print("  Speedup matrix (BL-1 / Ours-best):")
+    col_headers = ["num_tokens"] + [f"{name}\nE={E},K={K}" for name, E, K, _ in PERF_CONFIGS]
     print(tabulate(speedup_rows, headers=col_headers, tablefmt="grid"))
 
     # Full latency detail
     print()
     print("  Full latency detail:")
-    if SONIC_AVAILABLE:
-        print(tabulate(detail_rows,
-            headers=["num_tokens", "Model", "Config",
-                     "BL-1(ms)", "Sonic(ms)", "Ours(ms)",
-                     "BL-1/Sonic", "BL-1/Ours"],
-            tablefmt="grid"))
-    else:
-        print(tabulate(detail_rows,
-            headers=["num_tokens", "Model", "Config", "BL-1(ms)", "Ours-best(ms)", "Speedup"],
-            tablefmt="grid"))
+    print(tabulate(detail_rows,
+        headers=["num_tokens", "Model", "Config", "BL-1(ms)", "Ours-best(ms)", "Speedup"],
+        tablefmt="grid"))
 
 
 def main():
     print("TopK+Softmax Experiment Benchmark")
     print(f"GPU        : {torch.cuda.get_device_name(0)}")
     print(f"PyTorch    : {torch.__version__}")
-    print(f"Sonic      : {'available' if SONIC_AVAILABLE else 'NOT installed (pip install -e third_party/sonic-moe)'}")
     print(f"token_sweep: {TOKEN_SWEEP}")
     print(f"  256   = small decode batch (latency-bound)")
     print(f"  1024  = medium decode batch")
@@ -348,7 +250,6 @@ def main():
 
     experiment_1(TOKEN_SWEEP)
     experiment_2(TOKEN_SWEEP)
-    experiment_3(TOKEN_SWEEP)
     experiment_q4(TOKEN_SWEEP)
 
     print()
