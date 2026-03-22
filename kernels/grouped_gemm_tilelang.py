@@ -113,7 +113,7 @@ def _grouped_gemm_kernel(
     return kernel
 
 
-# ============ V2: Store Path Optimization + Block Tuning ============
+# ============ V2: Store Path + Pre-computed Expert IDs + Adaptive Block ============
 
 @tilelang.jit(out_idx=[2])
 def _grouped_gemm_v2_kernel(
@@ -123,15 +123,16 @@ def _grouped_gemm_v2_kernel(
 ):
     """
     V2 grouped GEMM kernel — 核心优化:
-    1. 输出用 padded buffer, 消除逐元素边界检查
-    2. 两步 store: C_local → C_shared → C_padded (可 lower 到 TMA store)
-    3. T.use_swizzle(10) threadblock rasterization
-    4. 更大的 block size (128x128x64)
+    1. 预计算 tile_expert_ids 替代 O(E) expert lookup loop → O(1)
+    2. 输出用 padded buffer, 消除逐元素边界检查
+    3. 两步 store: C_local → C_shared → C_padded (可 lower 到 TMA store)
+    4. T.use_swizzle(10) threadblock rasterization
 
     Tensor shapes:
-        A:       (batch_sum, K)            - 按 expert 排序的 tokens (紧凑)
-        B:       (batch_count, K, N)       - expert 权重
-        C_padded:(batch_padded_sum, N)     - padded 输出
+        A:              (batch_sum, K)            - 按 expert 排序的 tokens (紧凑)
+        B:              (batch_count, K, N)       - expert 权重
+        C_padded:       (batch_padded_sum, N)     - padded 输出
+        tile_expert_ids:(total_m_blocks,)         - 每个 m-block 属于哪个 expert
     """
     batch_sum = sum(batch_sizes_list)
     batch_count = len(batch_sizes_list)
@@ -148,16 +149,15 @@ def _grouped_gemm_v2_kernel(
         A: T.Tensor([batch_sum, K], dtype),
         B: T.Tensor([batch_count, K, N], dtype),
         C_padded: T.Tensor([batch_padded_sum, N], dtype),
-        batch_sizes: T.Tensor([batch_count], T.int32),
         batch_offsets: T.Tensor([batch_count], T.int32),
         batch_padded_offsets: T.Tensor([batch_count], T.int32),
+        tile_expert_ids: T.Tensor([total_m_blocks], T.int32),
     ):
         with T.Kernel(total_m_blocks, T.ceildiv(N, block_N), threads=threads) as (bx, by):
             A_shared = T.alloc_shared([block_M, block_K], dtype)
             B_shared = T.alloc_shared([block_K, block_N], dtype)
             C_local = T.alloc_fragment([block_M, block_N], accum_dtype)
             C_shared = T.alloc_shared([block_M, block_N], dtype)
-            cur_batch_idx = T.alloc_var(dtype=T.int32)
 
             T.annotate_layout({
                 A_shared: tilelang.layout.make_swizzled_layout(A_shared),
@@ -167,10 +167,8 @@ def _grouped_gemm_v2_kernel(
 
             m_start_padded = bx * block_M
 
-            # Expert lookup
-            for i in range(batch_count):
-                in_cur_batch_idx = m_start_padded >= batch_padded_offsets[i]
-                cur_batch_idx = T.if_then_else(in_cur_batch_idx, i, cur_batch_idx)
+            # O(1) expert lookup via pre-computed table
+            cur_batch_idx = tile_expert_ids[bx]
 
             # A uses real offset (compact), C uses padded offset
             m_start = (m_start_padded
@@ -190,15 +188,29 @@ def _grouped_gemm_v2_kernel(
     return kernel
 
 
-def _get_v2_block_config(H, I, E):
-    """Select block parameters based on problem size."""
-    if H >= 4096:
-        return 128, 128, 64, 3, 128
-    elif H >= 1024:
-        block_N = 64 if I <= 256 else 128
-        return 128, block_N, 64, 3, 128
+def _get_v2_block_config(H, I, E, total_tokens):
+    """Select block parameters based on problem size and tokens per expert."""
+    avg_tokens_per_expert = max(1, total_tokens // E)
+
+    # block_M should not vastly exceed tokens per expert
+    if avg_tokens_per_expert <= 32:
+        block_M = 64
+    elif avg_tokens_per_expert <= 128:
+        block_M = 64
     else:
-        return 64, 64, 64, 2, 128
+        block_M = 128
+
+    if I <= 256:
+        block_N = 64
+    elif I <= 2048:
+        block_N = 128
+    else:
+        block_N = 128
+
+    block_K = 64
+    num_stages = 3
+    threads = 128
+    return block_M, block_N, block_K, num_stages, threads
 
 
 # ============ Kernel Cache ============
@@ -374,7 +386,8 @@ def grouped_gemm_tilelang_v2(
     batch_sizes_list = expert_counts.tolist()
 
     # Adaptive block config
-    block_M, block_N, block_K, num_stages, threads = _get_v2_block_config(H, I, E)
+    block_M, block_N, block_K, num_stages, threads = _get_v2_block_config(
+        H, I, E, total_tokens)
 
     # Compute offsets
     batch_offsets_list = [0]
@@ -386,9 +399,15 @@ def grouped_gemm_tilelang_v2(
             + math.ceil(batch_sizes_list[i] / block_M) * block_M
         )
 
-    batch_sizes_t = torch.tensor(batch_sizes_list, device=device, dtype=torch.int32)
+    # Pre-compute tile_expert_ids: which expert each m-block belongs to
+    tile_expert_ids_list = []
+    for expert_id, size in enumerate(batch_sizes_list):
+        n_blocks_for_expert = math.ceil(size / block_M) if size > 0 else 0
+        tile_expert_ids_list.extend([expert_id] * n_blocks_for_expert)
+
     batch_offsets_t = torch.tensor(batch_offsets_list, device=device, dtype=torch.int32)
     batch_padded_offsets_t = torch.tensor(batch_padded_offsets_list, device=device, dtype=torch.int32)
+    tile_expert_ids_t = torch.tensor(tile_expert_ids_list, device=device, dtype=torch.int32)
 
     # W: (E, I, H) → kernel expects (E, H, I)
     W_transposed = W.transpose(1, 2).contiguous()
@@ -409,7 +428,7 @@ def grouped_gemm_tilelang_v2(
 
     # Run kernel — out_idx=[2] auto-allocates C_padded with shape (batch_padded_sum, N)
     C_padded = kernel(X_sorted, W_transposed,
-                      batch_sizes_t, batch_offsets_t, batch_padded_offsets_t)
+                      batch_offsets_t, batch_padded_offsets_t, tile_expert_ids_t)
 
     # Extract valid rows from padded output
     Y_sorted = torch.empty(total_tokens, I, device=device, dtype=dtype)
