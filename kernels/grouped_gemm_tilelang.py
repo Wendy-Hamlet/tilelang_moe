@@ -113,8 +113,97 @@ def _grouped_gemm_kernel(
     return kernel
 
 
+# ============ V2: Store Path Optimization + Block Tuning ============
+
+@tilelang.jit(out_idx=[2])
+def _grouped_gemm_v2_kernel(
+    batch_sizes_list, K, N,
+    block_M=128, block_N=128, block_K=64,
+    num_stages=3, threads=128, dtype=T.float16
+):
+    """
+    V2 grouped GEMM kernel — 核心优化:
+    1. 输出用 padded buffer, 消除逐元素边界检查
+    2. 两步 store: C_local → C_shared → C_padded (可 lower 到 TMA store)
+    3. T.use_swizzle(10) threadblock rasterization
+    4. 更大的 block size (128x128x64)
+
+    Tensor shapes:
+        A:       (batch_sum, K)            - 按 expert 排序的 tokens (紧凑)
+        B:       (batch_count, K, N)       - expert 权重
+        C_padded:(batch_padded_sum, N)     - padded 输出
+    """
+    batch_sum = sum(batch_sizes_list)
+    batch_count = len(batch_sizes_list)
+    batch_padded_sum = sum(
+        ((s + block_M - 1) // block_M) * block_M for s in batch_sizes_list
+    )
+    accum_dtype = T.float32
+    total_m_blocks = sum(
+        (size + block_M - 1) // block_M for size in batch_sizes_list
+    )
+
+    @T.prim_func
+    def kernel(
+        A: T.Tensor([batch_sum, K], dtype),
+        B: T.Tensor([batch_count, K, N], dtype),
+        C_padded: T.Tensor([batch_padded_sum, N], dtype),
+        batch_sizes: T.Tensor([batch_count], T.int32),
+        batch_offsets: T.Tensor([batch_count], T.int32),
+        batch_padded_offsets: T.Tensor([batch_count], T.int32),
+    ):
+        with T.Kernel(total_m_blocks, T.ceildiv(N, block_N), threads=threads) as (bx, by):
+            A_shared = T.alloc_shared([block_M, block_K], dtype)
+            B_shared = T.alloc_shared([block_K, block_N], dtype)
+            C_local = T.alloc_fragment([block_M, block_N], accum_dtype)
+            C_shared = T.alloc_shared([block_M, block_N], dtype)
+            cur_batch_idx = T.alloc_var(dtype=T.int32)
+
+            T.annotate_layout({
+                A_shared: tilelang.layout.make_swizzled_layout(A_shared),
+                B_shared: tilelang.layout.make_swizzled_layout(B_shared),
+            })
+            T.use_swizzle(10)
+
+            m_start_padded = bx * block_M
+
+            # Expert lookup
+            for i in range(batch_count):
+                in_cur_batch_idx = m_start_padded >= batch_padded_offsets[i]
+                cur_batch_idx = T.if_then_else(in_cur_batch_idx, i, cur_batch_idx)
+
+            # A uses real offset (compact), C uses padded offset
+            m_start = (m_start_padded
+                       - batch_padded_offsets[cur_batch_idx]
+                       + batch_offsets[cur_batch_idx])
+
+            T.clear(C_local)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
+                T.copy(A[m_start, k * block_K], A_shared)
+                T.copy(B[cur_batch_idx, k * block_K, by * block_N], B_shared)
+                T.gemm(A_shared, B_shared, C_local)
+
+            # Two-step store: fragment → shared → global (TMA store path)
+            T.copy(C_local, C_shared)
+            T.copy(C_shared, C_padded[m_start_padded, by * block_N])
+
+    return kernel
+
+
+def _get_v2_block_config(H, I, E):
+    """Select block parameters based on problem size."""
+    if H >= 4096:
+        return 128, 128, 64, 3, 128
+    elif H >= 1024:
+        block_N = 64 if I <= 256 else 128
+        return 128, block_N, 64, 3, 128
+    else:
+        return 64, 64, 64, 2, 128
+
+
 # ============ Kernel Cache ============
 _kernel_cache: Dict[Tuple, any] = {}
+_kernel_cache_v2: Dict[Tuple, any] = {}
 
 
 # ============ PyTorch Baseline (高效版本) ============
@@ -257,6 +346,88 @@ def grouped_gemm_tilelang(
     return Y
 
 
+# ============ V2 TileLang Wrapper ============
+
+def grouped_gemm_tilelang_v2(
+    X: torch.Tensor,
+    W: torch.Tensor,
+    expert_indices: torch.Tensor,
+) -> torch.Tensor:
+    """
+    V2 TileLang grouped GEMM — padded output + two-step store + adaptive block.
+
+    核心改进:
+    - 输出用 padded buffer → 消除逐元素边界检查 → 启用 TMA store
+    - 自适应 block 大小 (大 H 用 128x128, 小 H 用 64x64)
+    - T.use_swizzle(10) threadblock rasterization
+    """
+    total_tokens, H = X.shape
+    E, I, _ = W.shape
+    device = X.device
+    dtype = X.dtype
+
+    # Sort tokens by expert
+    sorted_indices = expert_indices.argsort()
+    X_sorted = X[sorted_indices]
+
+    expert_counts = torch.bincount(expert_indices, minlength=E)
+    batch_sizes_list = expert_counts.tolist()
+
+    # Adaptive block config
+    block_M, block_N, block_K, num_stages, threads = _get_v2_block_config(H, I, E)
+
+    # Compute offsets
+    batch_offsets_list = [0]
+    batch_padded_offsets_list = [0]
+    for i in range(E - 1):
+        batch_offsets_list.append(batch_offsets_list[-1] + batch_sizes_list[i])
+        batch_padded_offsets_list.append(
+            batch_padded_offsets_list[-1]
+            + math.ceil(batch_sizes_list[i] / block_M) * block_M
+        )
+
+    batch_sizes_t = torch.tensor(batch_sizes_list, device=device, dtype=torch.int32)
+    batch_offsets_t = torch.tensor(batch_offsets_list, device=device, dtype=torch.int32)
+    batch_padded_offsets_t = torch.tensor(batch_padded_offsets_list, device=device, dtype=torch.int32)
+
+    # W: (E, I, H) → kernel expects (E, H, I)
+    W_transposed = W.transpose(1, 2).contiguous()
+
+    # Compile or retrieve kernel
+    cache_key = (tuple(batch_sizes_list), H, I, block_M, block_N)
+    if cache_key not in _kernel_cache_v2:
+        kernel = _grouped_gemm_v2_kernel(
+            tuple(batch_sizes_list),
+            K=H, N=I,
+            block_M=block_M, block_N=block_N, block_K=block_K,
+            num_stages=num_stages, threads=threads,
+            dtype=T.float16
+        )
+        _kernel_cache_v2[cache_key] = kernel
+
+    kernel = _kernel_cache_v2[cache_key]
+
+    # Run kernel — out_idx=[2] auto-allocates C_padded with shape (batch_padded_sum, N)
+    C_padded = kernel(X_sorted, W_transposed,
+                      batch_sizes_t, batch_offsets_t, batch_padded_offsets_t)
+
+    # Extract valid rows from padded output
+    Y_sorted = torch.empty(total_tokens, I, device=device, dtype=dtype)
+    real_offset = 0
+    padded_offset = 0
+    for size in batch_sizes_list:
+        if size > 0:
+            Y_sorted[real_offset:real_offset + size] = C_padded[padded_offset:padded_offset + size]
+        real_offset += size
+        padded_offset += math.ceil(size / block_M) * block_M
+
+    # Restore original order
+    Y = torch.empty(total_tokens, I, device=device, dtype=dtype)
+    Y[sorted_indices] = Y_sorted
+
+    return Y
+
+
 # ============ Auto-Select Best Implementation ============
 
 def grouped_gemm_best(
@@ -283,12 +454,9 @@ def grouped_gemm_best(
     """
     H = X.shape[1]
     E = W.shape[0]
-    
-    # TileLang适用于小H且小E的场景
-    if H <= 2560 and E <= 64:
-        return grouped_gemm_tilelang(X, W, expert_indices)
-    else:
-        return grouped_gemm_pytorch(X, W, expert_indices)
+
+    # V2 is preferred for all configs (padded output + TMA store)
+    return grouped_gemm_tilelang_v2(X, W, expert_indices)
 
 
 # ============ Aliases ============
