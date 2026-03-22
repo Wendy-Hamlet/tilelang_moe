@@ -812,11 +812,7 @@ def _make_topk_softmax_bitonic_v3_kernel(num_tokens: int, num_experts: int, top_
                     frag[e] = (bits & (~idx_mask)) | encoded_idx
 
                 # ---- Step 2: Local top-K selection into frag[0..K_padded-1] ----
-                # Selection sort: K_padded passes, each finds the max among
-                # unselected elements.  O(K_padded * elems_per_thread) instead
-                # of O(elems_per_thread * log²(elems_per_thread)) for full sort.
-                for ki in T.serial(K_padded):
-                    # Find max in frag[ki..elems_per_thread-1]
+                for ki in T.unroll(K_padded):
                     for e in T.serial(elems_per_thread):
                         if e > ki:
                             fi = T.reinterpret(T.float32, frag[ki])
@@ -826,13 +822,10 @@ def _make_topk_softmax_bitonic_v3_kernel(num_tokens: int, num_experts: int, top_
                                 frag[ki] = frag[e]
                                 frag[e] = tmp
 
-                # frag[0..K_padded-1] are top-K_padded but not sorted.
-                # Sort them descending for the merge step.
+                # Sort top-K_padded descending for merge step
                 bitonic_sort_kp(frag)
 
                 # ---- Step 3: Cross-thread merge via shfl_xor ----
-                # After local sort, frag[0..K_padded-1] are top-K_padded candidates.
-                # Merge across threads_per_row threads to find global top-K_padded.
                 if num_merge_stages > 0:
                     partner = T.alloc_local((K_padded,), T.uint32)
 
@@ -840,26 +833,20 @@ def _make_topk_softmax_bitonic_v3_kernel(num_tokens: int, num_experts: int, top_
                         stride = T.int32(threads_per_row) >> (ms + 1)
                         am_low = (lane_in_row & stride) == 0
 
-                        # Exchange K_padded values with partner
-                        for k in T.serial(K_padded):
+                        for k in T.unroll(K_padded):
                             val_i32 = T.reinterpret(T.int32, frag[k])
                             p_i32 = T.shfl_xor(val_i32, stride)
                             partner[k] = T.reinterpret(T.uint32, p_i32)
 
-                        # Bitonic merge: compare frag[k] with partner[K_padded-1-k]
-                        # frag is sorted desc, partner is sorted desc
-                        # reversed partner forms bitonic sequence with frag
-                        for k in T.serial(K_padded):
+                        for k in T.unroll(K_padded):
                             my_f = T.reinterpret(T.float32, frag[k])
                             p_f = T.reinterpret(T.float32, partner[K_padded - 1 - k])
-                            # am_low keeps the larger elements
                             should_take_partner = T.if_then_else(
                                 am_low, p_f > my_f, my_f > p_f
                             )
                             if should_take_partner:
                                 frag[k] = partner[K_padded - 1 - k]
 
-                        # Re-sort top-K_padded after merge
                         bitonic_sort_kp(frag)
 
                 # ---- Step 4: Decode + softmax + write ----
@@ -867,7 +854,7 @@ def _make_topk_softmax_bitonic_v3_kernel(num_tokens: int, num_experts: int, top_
                     s_topk_vals = T.alloc_shared((top_k,), T.float32)
                     s_topk_idx = T.alloc_shared((top_k,), T.int32)
 
-                    for ki in T.serial(top_k):
+                    for ki in T.unroll(top_k):
                         packed = frag[ki]
                         cleaned = packed & (~idx_mask)
                         fval = T.reinterpret(T.float32, cleaned)
@@ -882,17 +869,17 @@ def _make_topk_softmax_bitonic_v3_kernel(num_tokens: int, num_experts: int, top_
 
                     max_val = T.alloc_var(T.float32)
                     max_val = s_topk_vals[0]
-                    for ki in T.serial(top_k):
+                    for ki in T.unroll(top_k):
                         if s_topk_vals[ki] > max_val:
                             max_val = s_topk_vals[ki]
 
                     exp_sum = T.alloc_var(T.float32)
                     exp_sum = T.float32(0.0)
-                    for ki in T.serial(top_k):
+                    for ki in T.unroll(top_k):
                         s_topk_vals[ki] = T.exp(s_topk_vals[ki] - max_val)
                         exp_sum = exp_sum + s_topk_vals[ki]
 
-                    for ki in T.serial(top_k):
+                    for ki in T.unroll(top_k):
                         scores[token_idx, ki] = s_topk_vals[ki] / exp_sum
                         indices[token_idx, ki] = s_topk_idx[ki]
 
