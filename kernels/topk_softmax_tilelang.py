@@ -852,30 +852,40 @@ def _get_padding_ratio(n: int) -> float:
 def _select_strategy(num_experts: int, k: int) -> str:
     """
     Smart strategy selection based on algorithm cost estimation
-    
-    Returns: 'bitonic', 'selection', or 'radix'
-    
+
+    Returns: 'bitonic_v2', 'bitonic', 'selection', or 'radix'
+
     Note:
-    - 'bitonic' = Bitonic Sort O(N*log²N), same as real Sonic library
-    - 'selection' = Selection Sort O(K*N), simpler but fewer iterations for small K
+    - 'bitonic_v2' = Multi-token bitonic (best for small E where multi-token
+      amortization dominates; latency nearly flat across T)
+    - 'bitonic' = Bitonic Sort O(N*log²N), 1 token/block (best for medium E)
+    - 'selection' = Selection Sort O(K*N) (best for large E)
     """
     if num_experts > 1024:
         return 'radix'
-    
+
+    # v2 is best for small E: multi-token amortization makes latency nearly flat
+    # with T.  For large E, serial per-thread work in v2 is too expensive.
+    N_padded = 1 << int(math.ceil(math.log2(max(num_experts, 2))))
+    _, threads_per_row, _, elems_per_thread = _bitonic_v2_thread_config(num_experts, k)
+    if elems_per_thread <= 16:
+        # Small E: v2's multi-token batching dominates
+        return 'bitonic_v2'
+
     padding_ratio = _get_padding_ratio(num_experts)
-    
+
     if num_experts <= 64:
         return 'bitonic'
-    
+
     if k <= 8 and padding_ratio > 0.4:
         return 'selection'
-    
+
     if 8 <= k <= 16 and 0.2 <= padding_ratio <= 0.5:
         return 'bitonic' if num_experts >= 384 else 'selection'
-    
+
     if padding_ratio > 0.5:
         return 'selection'
-    
+
     if _is_power_of_2(num_experts) or padding_ratio < 0.2:
         if num_experts >= 128 and k <= 6:
             return 'selection'
@@ -906,7 +916,9 @@ def topk_softmax_best(logits: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch
     num_tokens, num_experts = logits.shape
     strategy = _select_strategy(num_experts, k)
     
-    if strategy == 'bitonic':
+    if strategy == 'bitonic_v2':
+        return topk_softmax_bitonic_v2(logits, k)
+    elif strategy == 'bitonic':
         return topk_softmax_bitonic(logits, k)
     elif strategy == 'selection':
         return topk_softmax_selection(logits, k)
