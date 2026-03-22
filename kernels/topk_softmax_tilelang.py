@@ -811,8 +811,24 @@ def _make_topk_softmax_bitonic_v3_kernel(num_tokens: int, num_experts: int, top_
                     )
                     frag[e] = (bits & (~idx_mask)) | encoded_idx
 
-                # ---- Step 2: Local bitonic sort (descending) in registers ----
-                bitonic_sort_ept(frag)
+                # ---- Step 2: Local top-K selection into frag[0..K_padded-1] ----
+                # Selection sort: K_padded passes, each finds the max among
+                # unselected elements.  O(K_padded * elems_per_thread) instead
+                # of O(elems_per_thread * log²(elems_per_thread)) for full sort.
+                for ki in T.serial(K_padded):
+                    # Find max in frag[ki..elems_per_thread-1]
+                    for e in T.serial(elems_per_thread):
+                        if e > ki:
+                            fi = T.reinterpret(T.float32, frag[ki])
+                            fe = T.reinterpret(T.float32, frag[e])
+                            if fe > fi:
+                                tmp = frag[ki]
+                                frag[ki] = frag[e]
+                                frag[e] = tmp
+
+                # frag[0..K_padded-1] are top-K_padded but not sorted.
+                # Sort them descending for the merge step.
+                bitonic_sort_kp(frag)
 
                 # ---- Step 3: Cross-thread merge via shfl_xor ----
                 # After local sort, frag[0..K_padded-1] are top-K_padded candidates.
