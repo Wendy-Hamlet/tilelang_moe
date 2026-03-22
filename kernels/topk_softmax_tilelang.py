@@ -743,14 +743,32 @@ def _make_topk_softmax_bitonic_v3_kernel(num_tokens: int, num_experts: int, top_
     def kernel_factory():
 
         @T.macro
-        def bitonic_sort_frag_descending(frag: T.Buffer, n: T.constexpr):
-            """In-register bitonic sort (descending) of n elements."""
-            log_n: T.constexpr = T.meta_var(int(math.log2(n)))
-            for i1 in T.serial(log_n):
+        def bitonic_sort_ept(frag: T.Buffer):
+            """In-register bitonic sort (descending) of elems_per_thread elements."""
+            for i1 in T.serial(log_ept):
                 for i2 in T.serial(i1 + 1):
                     step = T.int32(1) << (i1 - i2)
                     dir_mask = T.int32(1) << (i1 + 1)
-                    for i in T.serial(n):
+                    for i in T.serial(elems_per_thread):
+                        j = i ^ step
+                        if i < j:
+                            ascending = (i & dir_mask) != 0
+                            fi = T.reinterpret(T.float32, frag[i])
+                            fj = T.reinterpret(T.float32, frag[j])
+                            do_swap = T.if_then_else(ascending, fi > fj, fi < fj)
+                            if do_swap:
+                                tmp = frag[i]
+                                frag[i] = frag[j]
+                                frag[j] = tmp
+
+        @T.macro
+        def bitonic_sort_kp(frag: T.Buffer):
+            """In-register bitonic sort (descending) of K_padded elements."""
+            for i1 in T.serial(log_kp):
+                for i2 in T.serial(i1 + 1):
+                    step = T.int32(1) << (i1 - i2)
+                    dir_mask = T.int32(1) << (i1 + 1)
+                    for i in T.serial(K_padded):
                         j = i ^ step
                         if i < j:
                             ascending = (i & dir_mask) != 0
@@ -794,7 +812,7 @@ def _make_topk_softmax_bitonic_v3_kernel(num_tokens: int, num_experts: int, top_
                     frag[e] = (bits & (~idx_mask)) | encoded_idx
 
                 # ---- Step 2: Local bitonic sort (descending) in registers ----
-                bitonic_sort_frag_descending(frag, elems_per_thread)
+                bitonic_sort_ept(frag)
 
                 # ---- Step 3: Cross-thread merge via shfl_xor ----
                 # After local sort, frag[0..K_padded-1] are top-K_padded candidates.
@@ -826,7 +844,7 @@ def _make_topk_softmax_bitonic_v3_kernel(num_tokens: int, num_experts: int, top_
                                 frag[k] = partner[K_padded - 1 - k]
 
                         # Re-sort top-K_padded after merge
-                        bitonic_sort_frag_descending(frag, K_padded)
+                        bitonic_sort_kp(frag)
 
                 # ---- Step 4: Decode + softmax + write ----
                 if lane_in_row == 0 and token_idx < num_tokens:
