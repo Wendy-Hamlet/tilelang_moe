@@ -795,7 +795,7 @@ def _make_topk_softmax_bitonic_v3_kernel(num_tokens: int, num_experts: int, top_
 
                 # ---- Step 1: Load + bit-pack into register fragment ----
                 frag = T.alloc_local((elems_per_thread,), T.uint32)
-                for e in T.serial(elems_per_thread):
+                for e in T.vectorized(elems_per_thread):
                     col = lane_in_row * elems_per_thread + e
                     fval = T.if_then_else(
                         T.boolean(token_idx < num_tokens) & T.boolean(col < num_experts),
