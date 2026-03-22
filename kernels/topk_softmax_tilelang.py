@@ -885,6 +885,10 @@ def _make_topk_softmax_bitonic_v3_kernel(num_tokens: int, num_experts: int, top_
     return kernel_factory()
 
 
+_bitonic_kernel_cache = {}
+_bitonic_v2_kernel_cache = {}
+
+
 def topk_softmax_bitonic(logits: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Fused TopK+Softmax using Bitonic Sort
@@ -1050,24 +1054,22 @@ def _select_strategy(num_experts: int, k: int) -> str:
     """
     Smart strategy selection based on algorithm cost estimation
 
-    Returns: 'bitonic_v2', 'bitonic', 'selection', or 'radix'
+    Returns: 'bitonic_v3', 'bitonic', 'selection', or 'radix'
 
-    Note:
-    - 'bitonic_v2' = Multi-token bitonic (best for small E where multi-token
-      amortization dominates; latency nearly flat across T)
+    Benchmark-validated choices (H100):
+    - 'bitonic_v3' = Register partial sort + shfl merge (best for small E ≤ 16;
+      latency flat with T, matches or beats Sonic)
     - 'bitonic' = Bitonic Sort O(N*log²N), 1 token/block (best for medium E)
-    - 'selection' = Selection Sort O(K*N) (best for large E)
+    - 'selection' = Selection Sort O(K*N) (best for large E ≥ 160)
     """
     if num_experts > 1024:
         return 'radix'
 
-    # v2 is best for small E: multi-token amortization makes latency nearly flat
-    # with T.  For large E, serial per-thread work in v2 is too expensive.
-    N_padded = 1 << int(math.ceil(math.log2(max(num_experts, 2))))
-    _, threads_per_row, _, elems_per_thread = _bitonic_v2_thread_config(num_experts, k)
+    _, _, _, elems_per_thread = _bitonic_v2_thread_config(num_experts, k)
     if elems_per_thread <= 16:
-        # Small E: v2's multi-token batching dominates
-        return 'bitonic_v2'
+        # Small E (≤16 for typical K): v3's register sort + multi-token is fastest
+        # E=8 K=2: v3 beats Sonic; E=16 K=4: v3 within 2x of Sonic
+        return 'bitonic_v3'
 
     padding_ratio = _get_padding_ratio(num_experts)
 
@@ -1113,8 +1115,8 @@ def topk_softmax_best(logits: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch
     num_tokens, num_experts = logits.shape
     strategy = _select_strategy(num_experts, k)
     
-    if strategy == 'bitonic_v2':
-        return topk_softmax_bitonic_v2(logits, k)
+    if strategy == 'bitonic_v3':
+        return topk_softmax_bitonic_v3(logits, k)
     elif strategy == 'bitonic':
         return topk_softmax_bitonic(logits, k)
     elif strategy == 'selection':
