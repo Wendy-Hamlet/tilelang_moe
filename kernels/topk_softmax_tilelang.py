@@ -709,8 +709,162 @@ def _make_topk_softmax_bitonic_v2_kernel(num_tokens: int, num_experts: int, top_
     return kernel_factory()
 
 
-_bitonic_kernel_cache = {}
-_bitonic_v2_kernel_cache = {}
+# ============================================================================
+# Part 3c: Bitonic Sort v3 -- Register-based Partial Sort + Warp Shuffle Merge
+#
+# Key improvements over v2:
+#   - Local sort in registers (alloc_fragment) instead of shared memory
+#   - Partial sort: only extract top-K, not full N sort
+#   - Cross-thread merge via T.shfl_xor (no shared memory for sort)
+#   - Algorithm: O(E_pt * log²E_pt) local + O(K * log²K * log(tpr)) merge
+#     vs v1's O(N * log²N) full sort
+# ============================================================================
+
+def _make_topk_softmax_bitonic_v3_kernel(num_tokens: int, num_experts: int, top_k: int):
+    """
+    Bitonic v3: register-based partial sort with warp-shuffle merge.
+
+    Each thread loads elems_per_thread elements into a register fragment,
+    sorts locally via bitonic sort, keeps top K_padded candidates, then
+    merges across threads_per_row threads using shfl_xor.  Bit-packing
+    encodes column indices into float32 low bits.
+    """
+    N_padded, threads_per_row, cols_per_block, elems_per_thread = \
+        _bitonic_v2_thread_config(num_experts, top_k)
+    log_ept = int(math.log2(elems_per_thread))
+    K_padded = 1 << int(math.ceil(math.log2(max(top_k, 2))))
+    log_kp = int(math.log2(K_padded))
+    num_merge_stages = int(math.log2(threads_per_row)) if threads_per_row > 1 else 0
+    log_N = int(math.log2(N_padded))
+    idx_mask_val = (1 << log_N) - 1
+    num_blocks = (num_tokens + cols_per_block - 1) // cols_per_block
+
+    @tl.jit(pass_configs=_bitonic_pass_configs)
+    def kernel_factory():
+
+        @T.macro
+        def bitonic_sort_frag_descending(frag: T.Buffer, n: T.constexpr):
+            """In-register bitonic sort (descending) of n elements."""
+            log_n: T.constexpr = T.meta_var(int(math.log2(n)))
+            for i1 in T.serial(log_n):
+                for i2 in T.serial(i1 + 1):
+                    step = T.int32(1) << (i1 - i2)
+                    dir_mask = T.int32(1) << (i1 + 1)
+                    for i in T.serial(n):
+                        j = i ^ step
+                        if i < j:
+                            ascending = (i & dir_mask) != 0
+                            fi = T.reinterpret(T.float32, frag[i])
+                            fj = T.reinterpret(T.float32, frag[j])
+                            do_swap = T.if_then_else(ascending, fi > fj, fi < fj)
+                            if do_swap:
+                                tmp = frag[i]
+                                frag[i] = frag[j]
+                                frag[j] = tmp
+
+        @T.prim_func
+        def main(
+            logits: T.Tensor((num_tokens, num_experts), T.float32),
+            scores: T.Tensor((num_tokens, top_k), T.float32),
+            indices: T.Tensor((num_tokens, top_k), T.int32),
+        ):
+            with T.Kernel(num_blocks, threads=_BITONIC_V2_BLOCK_THREADS) as bx:
+                tx = T.get_thread_binding()
+                row_in_block = tx // threads_per_row
+                lane_in_row = tx % threads_per_row
+                token_idx = bx * cols_per_block + row_in_block
+                idx_mask = T.uint32(idx_mask_val)
+
+                # ---- Step 1: Load + bit-pack into register fragment ----
+                frag = T.alloc_fragment((elems_per_thread,), T.uint32)
+                for e in T.serial(elems_per_thread):
+                    col = lane_in_row * elems_per_thread + e
+                    fval = T.if_then_else(
+                        T.boolean(token_idx < num_tokens) & T.boolean(col < num_experts),
+                        logits[token_idx, T.min(col, num_experts - 1)],
+                        T.float32(-1e38),
+                    )
+                    bits = T.reinterpret(T.uint32, fval)
+                    col_u32 = T.Cast(T.uint32, col)
+                    encoded_idx = T.if_then_else(
+                        fval >= T.float32(0.0),
+                        (~col_u32) & idx_mask,
+                        col_u32 & idx_mask,
+                    )
+                    frag[e] = (bits & (~idx_mask)) | encoded_idx
+
+                # ---- Step 2: Local bitonic sort (descending) in registers ----
+                bitonic_sort_frag_descending(frag, elems_per_thread)
+
+                # ---- Step 3: Cross-thread merge via shfl_xor ----
+                # After local sort, frag[0..K_padded-1] are top-K_padded candidates.
+                # Merge across threads_per_row threads to find global top-K_padded.
+                if num_merge_stages > 0:
+                    partner = T.alloc_fragment((K_padded,), T.uint32)
+
+                    for ms in T.serial(num_merge_stages):
+                        stride = T.int32(threads_per_row) >> (ms + 1)
+                        am_low = (lane_in_row & stride) == 0
+
+                        # Exchange K_padded values with partner
+                        for k in T.serial(K_padded):
+                            val_i32 = T.reinterpret(T.int32, frag[k])
+                            p_i32 = T.shfl_xor(val_i32, stride)
+                            partner[k] = T.reinterpret(T.uint32, p_i32)
+
+                        # Bitonic merge: compare frag[k] with partner[K_padded-1-k]
+                        # frag is sorted desc, partner is sorted desc
+                        # reversed partner forms bitonic sequence with frag
+                        for k in T.serial(K_padded):
+                            my_f = T.reinterpret(T.float32, frag[k])
+                            p_f = T.reinterpret(T.float32, partner[K_padded - 1 - k])
+                            # am_low keeps the larger elements
+                            should_take_partner = T.if_then_else(
+                                am_low, p_f > my_f, my_f > p_f
+                            )
+                            if should_take_partner:
+                                frag[k] = partner[K_padded - 1 - k]
+
+                        # Re-sort top-K_padded after merge
+                        bitonic_sort_frag_descending(frag, K_padded)
+
+                # ---- Step 4: Decode + softmax + write ----
+                if lane_in_row == 0 and token_idx < num_tokens:
+                    s_topk_vals = T.alloc_shared((top_k,), T.float32)
+                    s_topk_idx = T.alloc_shared((top_k,), T.int32)
+
+                    for ki in T.serial(top_k):
+                        packed = frag[ki]
+                        cleaned = packed & (~idx_mask)
+                        fval = T.reinterpret(T.float32, cleaned)
+                        encoded_idx_val = packed & idx_mask
+                        col_idx = T.if_then_else(
+                            fval >= T.float32(0.0),
+                            (~encoded_idx_val) & idx_mask,
+                            encoded_idx_val & idx_mask,
+                        )
+                        s_topk_vals[ki] = fval
+                        s_topk_idx[ki] = T.Cast(T.int32, col_idx)
+
+                    max_val = T.alloc_var(T.float32)
+                    max_val = s_topk_vals[0]
+                    for ki in T.serial(top_k):
+                        if s_topk_vals[ki] > max_val:
+                            max_val = s_topk_vals[ki]
+
+                    exp_sum = T.alloc_var(T.float32)
+                    exp_sum = T.float32(0.0)
+                    for ki in T.serial(top_k):
+                        s_topk_vals[ki] = T.exp(s_topk_vals[ki] - max_val)
+                        exp_sum = exp_sum + s_topk_vals[ki]
+
+                    for ki in T.serial(top_k):
+                        scores[token_idx, ki] = s_topk_vals[ki] / exp_sum
+                        indices[token_idx, ki] = s_topk_idx[ki]
+
+        return main
+
+    return kernel_factory()
 
 
 def topk_softmax_bitonic(logits: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -769,9 +923,34 @@ def topk_softmax_bitonic_v2(logits: torch.Tensor, k: int) -> Tuple[torch.Tensor,
     return scores, indices
 
 
-# ============================================================================
-# Part 4: Selection Sort Wrapper
-# ============================================================================
+_bitonic_v3_kernel_cache = {}
+
+
+def topk_softmax_bitonic_v3(logits: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fused TopK+Softmax using Bitonic Sort v3 (register partial sort + shfl merge).
+
+    Each thread sorts its chunk in registers, keeps top-K candidates, then
+    merges across threads via warp shuffles.  No shared memory for the sort.
+    """
+    num_tokens, num_experts = logits.shape
+
+    if num_experts > 1024:
+        raise ValueError(f"Bitonic v3 kernel supports num_experts <= 1024, got {num_experts}")
+
+    cache_key = (num_tokens, num_experts, k)
+    if cache_key not in _bitonic_v3_kernel_cache:
+        _bitonic_v3_kernel_cache[cache_key] = _make_topk_softmax_bitonic_v3_kernel(
+            num_tokens, num_experts, k
+        )
+
+    kernel = _bitonic_v3_kernel_cache[cache_key]
+
+    scores = torch.empty(num_tokens, k, device=logits.device, dtype=torch.float32)
+    indices = torch.empty(num_tokens, k, device=logits.device, dtype=torch.int32)
+
+    kernel(logits, scores, indices)
+    return scores, indices
 
 _selection_kernel_cache = {}
 

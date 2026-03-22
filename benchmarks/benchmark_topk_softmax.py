@@ -62,6 +62,7 @@ from kernels.topk_softmax_tilelang import (
     topk_softmax_conv_b_radix_unfused as bl5_conv_b_radix,
     topk_softmax_bitonic               as ours_bitonic,
     topk_softmax_bitonic_v2            as ours_bitonic_v2,
+    topk_softmax_bitonic_v3            as ours_bitonic_v3,
     topk_softmax_selection             as ours_selection,
     topk_softmax_best                  as ours_best,
 )
@@ -154,7 +155,7 @@ def experiment_2(token_sweep):
     print()
     print("=" * 95)
     print("Experiment 2  |  Algorithm Comparison  (Conv B + TileLang)")
-    print("  radix [unfused = BL-5]  |  bitonic  |  bitonic_v2 (multi-token)  |  selection")
+    print("  radix [unfused = BL-5]  |  bitonic  |  bitonic_v2  |  bitonic_v3 (reg sort)  |  selection")
     print("  Note: bitonic/selection are single-kernel because the algorithm never")
     print("        writes intermediate indices to global memory -- not classical fusion.")
     print("=" * 95)
@@ -167,9 +168,10 @@ def experiment_2(token_sweep):
             t_radix      = bench(lambda x: bl5_conv_b_radix(x, K),  logits)
             t_bitonic    = bench(lambda x: ours_bitonic(x, K),      logits) if E <= 1024 else None
             t_bitonic_v2 = bench(lambda x: ours_bitonic_v2(x, K),  logits) if E <= 1024 else None
+            t_bitonic_v3 = bench(lambda x: ours_bitonic_v3(x, K),  logits) if E <= 1024 else None
             t_selection  = bench(lambda x: ours_selection(x, K),    logits)
 
-            valid  = [t for t in [t_bitonic, t_bitonic_v2, t_selection] if t is not None]
+            valid  = [t for t in [t_bitonic, t_bitonic_v2, t_bitonic_v3, t_selection] if t is not None]
             best_t = min(valid) if valid else None
 
             rows.append([
@@ -177,13 +179,14 @@ def experiment_2(token_sweep):
                 fmt_ms(t_radix),
                 fmt_ms(t_bitonic) if E <= 1024 else "N/A",
                 fmt_ms(t_bitonic_v2) if E <= 1024 else "N/A",
+                fmt_ms(t_bitonic_v3) if E <= 1024 else "N/A",
                 fmt_ms(t_selection),
                 fmt_speedup(t_radix, best_t),
             ])
 
         print(tabulate(rows,
             headers=["Model", "Config",
-                     "radix(ms)", "bitonic(ms)", "bitonic_v2(ms)", "selection(ms)",
+                     "radix(ms)", "bitonic(ms)", "v2(ms)", "v3(ms)", "selection(ms)",
                      "best/radix"],
             tablefmt="grid"))
 
