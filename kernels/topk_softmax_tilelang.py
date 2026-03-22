@@ -794,7 +794,7 @@ def _make_topk_softmax_bitonic_v3_kernel(num_tokens: int, num_experts: int, top_
                 idx_mask = T.uint32(idx_mask_val)
 
                 # ---- Step 1: Load + bit-pack into register fragment ----
-                frag = T.alloc_fragment((elems_per_thread,), T.uint32)
+                frag = T.alloc_local((elems_per_thread,), T.uint32)
                 for e in T.serial(elems_per_thread):
                     col = lane_in_row * elems_per_thread + e
                     fval = T.if_then_else(
@@ -818,7 +818,7 @@ def _make_topk_softmax_bitonic_v3_kernel(num_tokens: int, num_experts: int, top_
                 # After local sort, frag[0..K_padded-1] are top-K_padded candidates.
                 # Merge across threads_per_row threads to find global top-K_padded.
                 if num_merge_stages > 0:
-                    partner = T.alloc_fragment((K_padded,), T.uint32)
+                    partner = T.alloc_local((K_padded,), T.uint32)
 
                     for ms in T.serial(num_merge_stages):
                         stride = T.int32(threads_per_row) >> (ms + 1)
