@@ -611,13 +611,15 @@ def _make_topk_softmax_bitonic_v2_kernel(num_tokens: int, num_experts: int, top_
                     col = lane_in_row * elems_per_thread + e
                     smem_pos = row_off + col
 
-                    if token_idx < num_tokens and col < num_experts:
-                        fval = logits[token_idx, col]
-                    else:
-                        fval = T.float32(-1e38)
+                    # Use if_then_else to avoid scoping issues
+                    fval = T.if_then_else(
+                        T.boolean(token_idx < num_tokens) & T.boolean(col < num_experts),
+                        logits[token_idx, T.min(col, num_experts - 1)],
+                        T.float32(-1e38),
+                    )
 
                     bits = T.reinterpret(T.uint32, fval)
-                    col_u32 = T.uint32(col)
+                    col_u32 = T.Cast(T.uint32, col)
                     # Positive values: invert index bits for stable tie-break
                     encoded_idx = T.if_then_else(
                         fval >= T.float32(0.0),
@@ -665,22 +667,8 @@ def _make_topk_softmax_bitonic_v2_kernel(num_tokens: int, num_experts: int, top_
                 if lane_in_row == 0 and token_idx < num_tokens:
                     # Decode top-K values and indices
                     # After descending sort, top-K are at positions 0..K-1
-                    max_val = T.float32(-1e38)
-                    for ki in T.serial(top_k):
-                        packed = s_data[row_off + ki]
-                        cleaned = packed & (~idx_mask)
-                        fval = T.reinterpret(T.float32, cleaned)
-                        if fval > max_val:
-                            max_val = fval
-
-                    # Softmax: exp(val - max) / sum(exp)
-                    exp_sum = T.float32(0.0)
-                    for ki in T.serial(top_k):
-                        packed = s_data[row_off + ki]
-                        cleaned = packed & (~idx_mask)
-                        fval = T.reinterpret(T.float32, cleaned)
-                        exp_val = T.exp(fval - max_val)
-                        exp_sum = exp_sum + exp_val
+                    s_topk_vals = T.alloc_shared((top_k,), T.float32)
+                    s_topk_idx = T.alloc_shared((top_k,), T.int32)
 
                     for ki in T.serial(top_k):
                         packed = s_data[row_off + ki]
@@ -694,10 +682,27 @@ def _make_topk_softmax_bitonic_v2_kernel(num_tokens: int, num_experts: int, top_
                             (~encoded_idx_val) & idx_mask,
                             encoded_idx_val & idx_mask,
                         )
+                        s_topk_vals[ki] = fval
+                        s_topk_idx[ki] = T.Cast(T.int32, col_idx)
 
-                        # Write softmax score and index
-                        scores[token_idx, ki] = T.exp(fval - max_val) / exp_sum
-                        indices[token_idx, ki] = T.Cast(T.int32, col_idx)
+                    # Softmax: find max
+                    max_val = T.alloc_var(T.float32)
+                    max_val = s_topk_vals[0]
+                    for ki in T.serial(top_k):
+                        if s_topk_vals[ki] > max_val:
+                            max_val = s_topk_vals[ki]
+
+                    # exp and sum
+                    exp_sum = T.alloc_var(T.float32)
+                    exp_sum = T.float32(0.0)
+                    for ki in T.serial(top_k):
+                        s_topk_vals[ki] = T.exp(s_topk_vals[ki] - max_val)
+                        exp_sum = exp_sum + s_topk_vals[ki]
+
+                    # normalize and write
+                    for ki in T.serial(top_k):
+                        scores[token_idx, ki] = s_topk_vals[ki] / exp_sum
+                        indices[token_idx, ki] = s_topk_idx[ki]
 
         return main
 
