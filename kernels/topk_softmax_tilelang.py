@@ -538,34 +538,228 @@ def _make_topk_softmax_bitonic_kernel(num_tokens: int, num_experts: int, top_k: 
     return kernel_factory()
 
 
+# ============================================================================
+# Part 3b: Bitonic Sort v2 -- Multi-Token + Bit-Packing (Sonic-aligned)
+#
+# Key improvements over v1:
+#   - Multiple tokens per block (cols_per_block) instead of 1
+#   - Bit-packing: column index encoded into float32 low bits → no separate
+#     index array, halves shared memory and swap cost
+#   - 128 threads per block (fixed), each handling elems_per_thread elements
+#   - Same bitonic sorting network, but much better SM utilization
+# ============================================================================
+
+_BITONIC_V2_BLOCK_THREADS = 128
+
+
+def _bitonic_v2_thread_config(num_experts: int, top_k: int):
+    """Compute thread layout parameters matching Sonic's strategy."""
+    N_padded = 1 << int(math.ceil(math.log2(max(num_experts, 2))))
+    threads_per_row = max(min(N_padded // top_k, 32, N_padded // 64), 1)
+    cols_per_block = _BITONIC_V2_BLOCK_THREADS // threads_per_row
+    elems_per_thread = N_padded // threads_per_row
+    return N_padded, threads_per_row, cols_per_block, elems_per_thread
+
+
+def _make_topk_softmax_bitonic_v2_kernel(num_tokens: int, num_experts: int, top_k: int):
+    """
+    Bitonic Sort v2: multi-token per block + bit-packing.
+
+    Thread layout (all compile-time constants):
+      BLOCK_THREADS  = 128
+      threads_per_row = max(min(N_padded//K, 32, N_padded//64), 1)
+      cols_per_block  = 128 // threads_per_row   (tokens per block)
+      elems_per_thread = N_padded // threads_per_row
+
+    Bit-packing: column index encoded into low log2(N_padded) bits of the
+    float32 value (reinterpreted as uint32).  Positive values invert the
+    index bits for stable tie-breaking.  After sort, low bits are cleared
+    to recover the value, and index is decoded.
+    """
+    N_padded, threads_per_row, cols_per_block, elems_per_thread = \
+        _bitonic_v2_thread_config(num_experts, top_k)
+    num_iters = int(math.log2(N_padded))
+    log_N = int(math.log2(N_padded))
+    idx_mask_val = (1 << log_N) - 1
+    num_blocks = (num_tokens + cols_per_block - 1) // cols_per_block
+    total_smem = cols_per_block * N_padded  # uint32 elements
+
+    @tl.jit(pass_configs=_bitonic_pass_configs)
+    def kernel_factory():
+
+        @T.prim_func
+        def main(
+            logits: T.Tensor((num_tokens, num_experts), T.float32),
+            scores: T.Tensor((num_tokens, top_k), T.float32),
+            indices: T.Tensor((num_tokens, top_k), T.int32),
+        ):
+            with T.Kernel(num_blocks, threads=_BITONIC_V2_BLOCK_THREADS) as bx:
+                # Shared memory: bit-packed values (value + encoded index)
+                s_data = T.alloc_shared((total_smem,), T.uint32)
+
+                tx = T.get_thread_binding()
+                row_in_block = tx // threads_per_row
+                lane_in_row = tx % threads_per_row
+                token_idx = bx * cols_per_block + row_in_block
+                row_off = row_in_block * N_padded
+                idx_mask = T.uint32(idx_mask_val)
+
+                # ----------------------------------------------------------
+                # Step 1: Load + bit-pack encode
+                # ----------------------------------------------------------
+                for e in T.serial(elems_per_thread):
+                    col = lane_in_row * elems_per_thread + e
+                    smem_pos = row_off + col
+
+                    if token_idx < num_tokens and col < num_experts:
+                        fval = logits[token_idx, col]
+                    else:
+                        fval = T.float32(-1e38)
+
+                    bits = T.reinterpret(T.uint32, fval)
+                    col_u32 = T.uint32(col)
+                    # Positive values: invert index bits for stable tie-break
+                    encoded_idx = T.if_then_else(
+                        fval >= T.float32(0.0),
+                        (~col_u32) & idx_mask,
+                        col_u32 & idx_mask,
+                    )
+                    s_data[smem_pos] = (bits & (~idx_mask)) | encoded_idx
+
+                T.sync_threads()
+
+                # ----------------------------------------------------------
+                # Step 2: Bitonic sort (descending) per row in shared memory
+                #   Each thread handles elems_per_thread elements via serial
+                #   loop.  The i<j convention ensures no write conflicts.
+                # ----------------------------------------------------------
+                for i1 in T.serial(num_iters):
+                    for i2 in T.serial(i1 + 1):
+                        step_bit = T.int32(1) << (i1 - i2)
+                        dir_bit = T.int32(1) << (i1 + 1)
+
+                        for e in T.serial(elems_per_thread):
+                            p = lane_in_row * elems_per_thread + e
+                            q = p ^ step_bit
+                            if p < q and q < N_padded:
+                                ascending = (p & dir_bit) != 0
+                                sp = s_data[row_off + p]
+                                sq = s_data[row_off + q]
+                                # Reinterpret as float for comparison
+                                fp = T.reinterpret(T.float32, sp)
+                                fq = T.reinterpret(T.float32, sq)
+                                do_swap = T.if_then_else(
+                                    ascending,
+                                    fp > fq,
+                                    fp < fq,
+                                )
+                                if do_swap:
+                                    s_data[row_off + p] = sq
+                                    s_data[row_off + q] = sp
+
+                        T.sync_threads()
+
+                # ----------------------------------------------------------
+                # Step 3: Decode top-K + softmax (first thread of each row)
+                # ----------------------------------------------------------
+                if lane_in_row == 0 and token_idx < num_tokens:
+                    # Decode top-K values and indices
+                    # After descending sort, top-K are at positions 0..K-1
+                    max_val = T.float32(-1e38)
+                    for ki in T.serial(top_k):
+                        packed = s_data[row_off + ki]
+                        cleaned = packed & (~idx_mask)
+                        fval = T.reinterpret(T.float32, cleaned)
+                        if fval > max_val:
+                            max_val = fval
+
+                    # Softmax: exp(val - max) / sum(exp)
+                    exp_sum = T.float32(0.0)
+                    for ki in T.serial(top_k):
+                        packed = s_data[row_off + ki]
+                        cleaned = packed & (~idx_mask)
+                        fval = T.reinterpret(T.float32, cleaned)
+                        exp_val = T.exp(fval - max_val)
+                        exp_sum = exp_sum + exp_val
+
+                    for ki in T.serial(top_k):
+                        packed = s_data[row_off + ki]
+                        cleaned = packed & (~idx_mask)
+                        fval = T.reinterpret(T.float32, cleaned)
+
+                        # Decode index
+                        encoded_idx_val = packed & idx_mask
+                        col_idx = T.if_then_else(
+                            fval >= T.float32(0.0),
+                            (~encoded_idx_val) & idx_mask,
+                            encoded_idx_val & idx_mask,
+                        )
+
+                        # Write softmax score and index
+                        scores[token_idx, ki] = T.exp(fval - max_val) / exp_sum
+                        indices[token_idx, ki] = T.Cast(T.int32, col_idx)
+
+        return main
+
+    return kernel_factory()
+
+
 _bitonic_kernel_cache = {}
+_bitonic_v2_kernel_cache = {}
 
 
 def topk_softmax_bitonic(logits: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Fused TopK+Softmax using Bitonic Sort
-    
+
     Args:
         logits: (num_tokens, num_experts) tensor
         k: number of top elements
-    
+
     Returns:
 (scores, indices): both shape (num_tokens, k)
     """
     num_tokens, num_experts = logits.shape
-    
+
     if num_experts > 1024:
         raise ValueError(f"Bitonic sort kernel supports num_experts <= 1024, got {num_experts}")
-    
+
     cache_key = (num_tokens, num_experts, k)
     if cache_key not in _bitonic_kernel_cache:
         _bitonic_kernel_cache[cache_key] = _make_topk_softmax_bitonic_kernel(num_tokens, num_experts, k)
-    
+
     kernel = _bitonic_kernel_cache[cache_key]
-    
+
     scores = torch.empty(num_tokens, k, device=logits.device, dtype=torch.float32)
     indices = torch.empty(num_tokens, k, device=logits.device, dtype=torch.int32)
-    
+
+    kernel(logits, scores, indices)
+    return scores, indices
+
+
+def topk_softmax_bitonic_v2(logits: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fused TopK+Softmax using Bitonic Sort v2 (multi-token + bit-packing).
+
+    Same interface as topk_softmax_bitonic but processes multiple tokens per
+    block (like Sonic) for much better SM utilization at large T.
+    """
+    num_tokens, num_experts = logits.shape
+
+    if num_experts > 1024:
+        raise ValueError(f"Bitonic v2 kernel supports num_experts <= 1024, got {num_experts}")
+
+    cache_key = (num_tokens, num_experts, k)
+    if cache_key not in _bitonic_v2_kernel_cache:
+        _bitonic_v2_kernel_cache[cache_key] = _make_topk_softmax_bitonic_v2_kernel(
+            num_tokens, num_experts, k
+        )
+
+    kernel = _bitonic_v2_kernel_cache[cache_key]
+
+    scores = torch.empty(num_tokens, k, device=logits.device, dtype=torch.float32)
+    indices = torch.empty(num_tokens, k, device=logits.device, dtype=torch.int32)
+
     kernel(logits, scores, indices)
     return scores, indices
 

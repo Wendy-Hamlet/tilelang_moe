@@ -61,6 +61,7 @@ from kernels.topk_softmax_baseline import (
 from kernels.topk_softmax_tilelang import (
     topk_softmax_conv_b_radix_unfused as bl5_conv_b_radix,
     topk_softmax_bitonic               as ours_bitonic,
+    topk_softmax_bitonic_v2            as ours_bitonic_v2,
     topk_softmax_selection             as ours_selection,
     topk_softmax_best                  as ours_best,
 )
@@ -153,7 +154,7 @@ def experiment_2(token_sweep):
     print()
     print("=" * 95)
     print("Experiment 2  |  Algorithm Comparison  (Conv B + TileLang)")
-    print("  radix [unfused = BL-5]  |  bitonic  |  selection")
+    print("  radix [unfused = BL-5]  |  bitonic  |  bitonic_v2 (multi-token)  |  selection")
     print("  Note: bitonic/selection are single-kernel because the algorithm never")
     print("        writes intermediate indices to global memory -- not classical fusion.")
     print("=" * 95)
@@ -162,35 +163,28 @@ def experiment_2(token_sweep):
         print(f"\n  -- num_tokens = {num_tokens} --")
         rows = []
         for name, E, K, _ in PERF_CONFIGS:
-            logits      = make_logits(num_tokens, E)
-            t_radix     = bench(lambda x: bl5_conv_b_radix(x, K),  logits)
-            t_bitonic   = bench(lambda x: ours_bitonic(x, K),      logits) if E <= 1024 else None
-            t_selection = bench(lambda x: ours_selection(x, K),    logits)
+            logits       = make_logits(num_tokens, E)
+            t_radix      = bench(lambda x: bl5_conv_b_radix(x, K),  logits)
+            t_bitonic    = bench(lambda x: ours_bitonic(x, K),      logits) if E <= 1024 else None
+            t_bitonic_v2 = bench(lambda x: ours_bitonic_v2(x, K),  logits) if E <= 1024 else None
+            t_selection  = bench(lambda x: ours_selection(x, K),    logits)
 
-            valid  = [t for t in [t_bitonic, t_selection] if t is not None]
+            valid  = [t for t in [t_bitonic, t_bitonic_v2, t_selection] if t is not None]
             best_t = min(valid) if valid else None
-            if t_bitonic is not None and t_selection is not None:
-                winner = "bitonic" if t_bitonic <= t_selection else "selection"
-            elif t_bitonic is not None:
-                winner = "bitonic"
-            elif t_selection is not None:
-                winner = "selection"
-            else:
-                winner = "N/A"
 
             rows.append([
                 name, f"E={E} K={K}",
                 fmt_ms(t_radix),
                 fmt_ms(t_bitonic) if E <= 1024 else "N/A",
+                fmt_ms(t_bitonic_v2) if E <= 1024 else "N/A",
                 fmt_ms(t_selection),
                 fmt_speedup(t_radix, best_t),
-                winner,
             ])
 
         print(tabulate(rows,
             headers=["Model", "Config",
-                     "radix-unfused(ms)", "bitonic(ms)", "selection(ms)",
-                     "best/radix speedup", "winner"],
+                     "radix(ms)", "bitonic(ms)", "bitonic_v2(ms)", "selection(ms)",
+                     "best/radix"],
             tablefmt="grid"))
 
 
@@ -203,7 +197,7 @@ def experiment_2(token_sweep):
 def experiment_q4(token_sweep):
     print()
     print("=" * 95)
-    print("Q4  |  Total Speedup Matrix  --  BL-1 (Conv A, PyTorch) vs Ours-best (Conv B, TileLang)")
+    print("Q4  |  Total Speedup Matrix  --  BL-1 vs Ours-best vs Bitonic-v2")
     print("  Rows: num_tokens (decode -> prefill)  |  Cols: model config")
     print("=" * 95)
 
@@ -216,17 +210,22 @@ def experiment_q4(token_sweep):
             logits = make_logits(num_tokens, E)
             t_bl1  = bench(lambda x: bl1_conv_a_pytorch(x, K), logits)
             t_ours = bench(lambda x: ours_best(x, K),           logits)
-            speedup_row.append(fmt_speedup(t_bl1, t_ours))
+            t_v2   = bench(lambda x: ours_bitonic_v2(x, K),    logits) if E <= 1024 else None
+            speedup_row.append(
+                f"{fmt_speedup(t_bl1, t_ours)} / {fmt_speedup(t_bl1, t_v2)}"
+            )
             detail_rows.append([
                 num_tokens, name, f"E={E} K={K}",
                 fmt_ms(t_bl1), fmt_ms(t_ours),
+                fmt_ms(t_v2) if t_v2 else "N/A",
                 fmt_speedup(t_bl1, t_ours),
+                fmt_speedup(t_bl1, t_v2),
             ])
         speedup_rows.append(speedup_row)
 
     # Compact speedup matrix
     print()
-    print("  Speedup matrix (BL-1 / Ours-best):")
+    print("  Speedup matrix (BL-1/Ours-best / BL-1/Bitonic-v2):")
     col_headers = ["num_tokens"] + [f"{name}\nE={E},K={K}" for name, E, K, _ in PERF_CONFIGS]
     print(tabulate(speedup_rows, headers=col_headers, tablefmt="grid"))
 
@@ -234,7 +233,8 @@ def experiment_q4(token_sweep):
     print()
     print("  Full latency detail:")
     print(tabulate(detail_rows,
-        headers=["num_tokens", "Model", "Config", "BL-1(ms)", "Ours-best(ms)", "Speedup"],
+        headers=["num_tokens", "Model", "Config", "BL-1(ms)", "Ours-best(ms)", "v2(ms)",
+                 "BL1/best", "BL1/v2"],
         tablefmt="grid"))
 
 
