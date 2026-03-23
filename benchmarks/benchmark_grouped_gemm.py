@@ -80,19 +80,23 @@ def grouped_gemm_torch_grouped_mm(
     device = X.device
 
     sorted_indices = expert_indices.argsort()
-    X_sorted = X[sorted_indices].to(torch.bfloat16)
+    X_sorted = X[sorted_indices]
+    if X_sorted.dtype != torch.bfloat16:
+        X_sorted = X_sorted.to(torch.bfloat16)
 
     expert_counts = torch.bincount(expert_indices, minlength=E)
     offs = torch.cumsum(expert_counts, dim=0).to(torch.int32)
 
     # W: (E, I, H) -> need (E, H, I) for A @ B = (tokens, H) @ (H, I)
-    W_transposed = W.transpose(1, 2).contiguous().to(torch.bfloat16)
+    W_transposed = W.transpose(1, 2).contiguous()
+    if W_transposed.dtype != torch.bfloat16:
+        W_transposed = W_transposed.to(torch.bfloat16)
 
     # torch._grouped_mm(A, B, offs) -> C
     Y_sorted_bf16 = torch._grouped_mm(X_sorted, W_transposed, offs)
 
     Y = torch.empty(total_tokens, I, device=device, dtype=X.dtype)
-    Y[sorted_indices] = Y_sorted_bf16.to(X.dtype)
+    Y[sorted_indices] = Y_sorted_bf16.to(X.dtype) if X.dtype != torch.bfloat16 else Y_sorted_bf16
     return Y
 
 
@@ -135,12 +139,13 @@ TOKEN_SWEEP = [256, 1024, 4096, 16384]
 
 
 def generate_test_data(total_tokens: int, H: int, I: int, E: int,
-                       device="cuda", seed=42, distribution="zipf"):
+                       device="cuda", seed=42, distribution="zipf",
+                       dtype=torch.float16):
     """Generate test data with specified expert distribution."""
     torch.manual_seed(seed)
 
-    X = torch.randn(total_tokens, H, device=device, dtype=torch.float16)
-    W = torch.randn(E, I, H, device=device, dtype=torch.float16)
+    X = torch.randn(total_tokens, H, device=device, dtype=dtype)
+    W = torch.randn(E, I, H, device=device, dtype=dtype)
 
     if distribution == "uniform":
         # Each expert gets exactly total_tokens // E tokens
@@ -173,10 +178,12 @@ def get_versions() -> Dict[str, callable]:
 
 def benchmark_single(H: int, I: int, E: int, total_tokens: int,
                      config_name: str, versions: Dict,
-                     warmup=50, rep=500, verbose=True, distribution="zipf"):
+                     warmup=50, rep=500, verbose=True, distribution="zipf",
+                     dtype=torch.bfloat16):
     """Run benchmark for a single (model, token_count) config."""
     X, W, expert_indices = generate_test_data(total_tokens, H, I, E,
-                                              distribution=distribution)
+                                              distribution=distribution,
+                                              dtype=dtype)
 
     # Correctness
     baseline = grouped_gemm_pytorch(X, W, expert_indices)
@@ -217,7 +224,12 @@ def main():
     parser.add_argument("--dist", type=str, default="zipf",
                         choices=["zipf", "uniform"],
                         help="Expert token distribution (default: zipf)")
+    parser.add_argument("--dtype", type=str, default="bf16",
+                        choices=["fp16", "bf16"],
+                        help="Data type (default: bf16, required by torch._grouped_mm)")
     args = parser.parse_args()
+
+    dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
 
     # Filter models
     if args.models:
@@ -248,6 +260,7 @@ def main():
     print(f"Versions: {', '.join(version_names)}")
     print(f"Token sweep: {token_sweep}")
     print(f"Distribution: {args.dist}")
+    print(f"Dtype: {args.dtype}")
     print()
 
     # ============ Run all benchmarks ============
@@ -264,7 +277,7 @@ def main():
             latencies, correctness = benchmark_single(
                 H, I, E, T, model_name, versions,
                 warmup=args.warmup, rep=args.rep,
-                distribution=args.dist)
+                distribution=args.dist, dtype=dtype)
 
             # Print inline
             parts = []
