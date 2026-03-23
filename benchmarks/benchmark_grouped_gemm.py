@@ -93,19 +93,23 @@ TOKEN_SWEEP = [256, 1024, 4096, 16384]
 
 
 def generate_test_data(total_tokens: int, H: int, I: int, E: int,
-                       device="cuda", seed=42):
-    """Generate test data with Zipf expert distribution."""
+                       device="cuda", seed=42, distribution="zipf"):
+    """Generate test data with specified expert distribution."""
     torch.manual_seed(seed)
 
     X = torch.randn(total_tokens, H, device=device, dtype=torch.float16)
     W = torch.randn(E, I, H, device=device, dtype=torch.float16)
 
-    # Zipf distribution for realistic expert load imbalance
-    expert_probs = torch.tensor([1.0 / (i + 1) for i in range(E)],
-                                device=device)
-    expert_probs = expert_probs / expert_probs.sum()
-    expert_indices = torch.multinomial(expert_probs, total_tokens,
-                                      replacement=True)
+    if distribution == "uniform":
+        # Each expert gets exactly total_tokens // E tokens
+        expert_indices = torch.arange(total_tokens, device=device) % E
+    else:
+        # Zipf distribution for realistic expert load imbalance
+        expert_probs = torch.tensor([1.0 / (i + 1) for i in range(E)],
+                                    device=device)
+        expert_probs = expert_probs / expert_probs.sum()
+        expert_indices = torch.multinomial(expert_probs, total_tokens,
+                                          replacement=True)
 
     return X, W, expert_indices
 
@@ -125,9 +129,10 @@ def get_versions() -> Dict[str, callable]:
 
 def benchmark_single(H: int, I: int, E: int, total_tokens: int,
                      config_name: str, versions: Dict,
-                     warmup=50, rep=500, verbose=True):
+                     warmup=50, rep=500, verbose=True, distribution="zipf"):
     """Run benchmark for a single (model, token_count) config."""
-    X, W, expert_indices = generate_test_data(total_tokens, H, I, E)
+    X, W, expert_indices = generate_test_data(total_tokens, H, I, E,
+                                              distribution=distribution)
 
     # Correctness
     baseline = grouped_gemm_pytorch(X, W, expert_indices)
@@ -165,6 +170,9 @@ def main():
                         help="Comma-separated token counts (default: 256,1024,4096,16384)")
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--rep", type=int, default=500)
+    parser.add_argument("--dist", type=str, default="zipf",
+                        choices=["zipf", "uniform"],
+                        help="Expert token distribution (default: zipf)")
     args = parser.parse_args()
 
     # Filter models
@@ -195,6 +203,7 @@ def main():
     print(f"PyTorch: {torch.__version__}")
     print(f"Versions: {', '.join(version_names)}")
     print(f"Token sweep: {token_sweep}")
+    print(f"Distribution: {args.dist}")
     print()
 
     # ============ Run all benchmarks ============
@@ -210,7 +219,8 @@ def main():
             print(f"\n  T={T}:")
             latencies, correctness = benchmark_single(
                 H, I, E, T, model_name, versions,
-                warmup=args.warmup, rep=args.rep)
+                warmup=args.warmup, rep=args.rep,
+                distribution=args.dist)
 
             # Print inline
             parts = []
