@@ -1,22 +1,25 @@
 """
-Grouped GEMM Performance Benchmark — Real MoE Model Configurations
+Grouped GEMM Benchmark v2 — Real MoE Prefill Scenarios
 
-使用 HuggingFace 上真实 MoE 模型的参数进行 benchmark。
-Up projection: (tokens_per_expert, H) @ (H, I) → (tokens_per_expert, I)
+Key changes from v1:
+- Variable: input_tokens (not T), routed_tokens = input_tokens * top_k
+- Prefill only: input_tokens = [1024, 2048, 4096, 8192, 16384]
+- For E>32 models, simulate single-GPU with E_local = 8, 16, 32 (expert parallel)
+- tokens_per_expert = input_tokens * top_k / E (same regardless of parallelism)
+- routed_tokens_local = E_local * tokens_per_expert
 
-模型参数来源:
-- OLMoE-1B-7B:   H=2048, I=1024,  E=64,  K=8
-- Mixtral-8x7B:  H=4096, I=14336, E=8,   K=2
-- Qwen3-235B:    H=4096, I=3072,  E=128, K=8  (SwiGLU: I_gemm=2*1536)
-- DeepSeek-V2:   H=5120, I=1536,  E=160, K=6
-- DBRX:          H=6144, I=10752, E=16,  K=4
-- DeepSeek-V3:   H=7168, I=2048,  E=256, K=8
+Implementations compared:
+- PyTorch: for-loop torch.mm (cuBLAS per expert)
+- torch._grouped_mm: CUTLASS grouped GEMM (single kernel)
+- TL-v1: TileLang official grouped GEMM
+- TL-v2: TileLang optimized (padded output + TMA store + O(1) expert lookup)
 """
 
 import sys
 import os
 import argparse
 import warnings
+import math
 from pathlib import Path
 
 warnings.filterwarnings('ignore', category=UserWarning, module='torch._inductor')
@@ -25,335 +28,239 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 import torch
-import math
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 from tabulate import tabulate
 
 torch.set_float32_matmul_precision('high')
-
 
 # ============ Import implementations ============
 from kernels.grouped_gemm_tilelang import (
     grouped_gemm_pytorch,
     grouped_gemm_tilelang,
-    grouped_gemm_best,
 )
-
-# Try importing v2 (will be added later)
 try:
     from kernels.grouped_gemm_tilelang import grouped_gemm_tilelang_v2
     HAS_V2 = True
 except ImportError:
     HAS_V2 = False
 
-# Try importing v3 (will be added later)
-try:
-    from kernels.grouped_gemm_tilelang import grouped_gemm_tilelang_v3
-    HAS_V3 = True
-except ImportError:
-    HAS_V3 = False
-
-# Check torch._grouped_mm availability (PyTorch 2.6+, CUTLASS grouped GEMM)
 HAS_TORCH_GROUPED_MM = hasattr(torch, "_grouped_mm")
 
 
-# ============ torch._grouped_mm wrapper (CUTLASS grouped GEMM) ============
-
-def grouped_gemm_torch_grouped_mm(
-    X: torch.Tensor,
-    W: torch.Tensor,
-    expert_indices: torch.Tensor,
-) -> torch.Tensor:
-    """
-    torch._grouped_mm baseline (PyTorch 2.6+, CUTLASS Hopper grouped GEMM).
-    Requires BFloat16. Single kernel launch for all experts.
-
-    Args:
-        X: (total_tokens, H) fp16 input
-        W: (E, I, H) fp16 weights
-        expert_indices: (total_tokens,) expert IDs
-    Returns:
-        Y: (total_tokens, I) fp16 output
-    """
-    total_tokens, H = X.shape
-    E, I, _ = W.shape
-    device = X.device
-
-    sorted_indices = expert_indices.argsort()
-    X_sorted = X[sorted_indices]
-    if X_sorted.dtype != torch.bfloat16:
-        X_sorted = X_sorted.to(torch.bfloat16)
-
-    expert_counts = torch.bincount(expert_indices, minlength=E)
-    offs = torch.cumsum(expert_counts, dim=0).to(torch.int32)
-
-    # W: (E, I, H) -> need (E, H, I) for A @ B = (tokens, H) @ (H, I)
-    W_transposed = W.transpose(1, 2).contiguous()
-    if W_transposed.dtype != torch.bfloat16:
-        W_transposed = W_transposed.to(torch.bfloat16)
-
-    # torch._grouped_mm(A, B, offs) -> C
-    Y_sorted_bf16 = torch._grouped_mm(X_sorted, W_transposed, offs)
-
-    Y = torch.empty(total_tokens, I, device=device, dtype=X.dtype)
-    Y[sorted_indices] = Y_sorted_bf16.to(X.dtype) if X.dtype != torch.bfloat16 else Y_sorted_bf16
-    return Y
-
-
 # ============ Benchmark infra ============
-try:
-    from tilelang.profiler import do_bench
-
-    def benchmark_function(func, *args, warmup=100, rep=1000):
-        def wrapper():
-            return func(*args)
-        return do_bench(wrapper, warmup=warmup, rep=rep, return_mode='median')
-except ImportError:
-    def benchmark_function(func, *args, warmup=100, rep=1000):
-        for _ in range(warmup):
-            func(*args)
-        torch.cuda.synchronize()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(rep):
-            func(*args)
-        end.record()
-        torch.cuda.synchronize()
-        return start.elapsed_time(end) / rep
+def bench_fn(fn, warmup=50, rep=500):
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    s = torch.cuda.Event(enable_timing=True)
+    e = torch.cuda.Event(enable_timing=True)
+    s.record()
+    for _ in range(rep):
+        fn()
+    e.record()
+    torch.cuda.synchronize()
+    return s.elapsed_time(e) / rep
 
 
 # ============ Real MoE model configs ============
-# (name, H, I, E, top_k, description)
+# (name, H, I, E_total, top_k)
 MODEL_CONFIGS = [
-    ("OLMoE-1B",      2048,  1024,  64, 8, "allenai/OLMoE-1B-7B"),
-    ("Mixtral-8x7B",  4096, 14336,   8, 2, "mistralai/Mixtral-8x7B"),
-    ("Qwen3-235B",    4096,  3072, 128, 8, "Qwen/Qwen3-235B (SwiGLU)"),
-    ("DeepSeek-V2",   5120,  1536, 160, 6, "deepseek-ai/DeepSeek-V2"),
-    ("DBRX",          6144, 10752,  16, 4, "databricks/dbrx-instruct"),
-    ("DeepSeek-V3",   7168,  2048, 256, 8, "deepseek-ai/DeepSeek-V3"),
+    ("OLMoE-1B",      2048,  1024,  64, 8),
+    ("Mixtral-8x7B",  4096, 14336,   8, 2),
+    ("Qwen3-235B",    4096,  3072, 128, 8),
+    ("DeepSeek-V2",   5120,  1536, 160, 6),
+    ("DBRX",          6144, 10752,  16, 4),
+    ("DeepSeek-V3",   7168,  2048, 256, 8),
 ]
 
-# total_tokens = input_tokens * top_k (routed tokens)
-TOKEN_SWEEP = [256, 1024, 4096, 16384]
+INPUT_TOKENS_SWEEP = [1024, 2048, 4096, 8192, 16384]
+
+# For models with E>32, simulate single-GPU expert parallel
+E_LOCAL_OPTIONS = [8, 16, 32]
 
 
-def generate_test_data(total_tokens: int, H: int, I: int, E: int,
-                       device="cuda", seed=42, distribution="zipf",
-                       dtype=torch.float16):
-    """Generate test data with specified expert distribution."""
-    torch.manual_seed(seed)
-
-    X = torch.randn(total_tokens, H, device=device, dtype=dtype)
-    W = torch.randn(E, I, H, device=device, dtype=dtype)
-
-    if distribution == "uniform":
-        # Each expert gets exactly total_tokens // E tokens
-        expert_indices = torch.arange(total_tokens, device=device) % E
-    else:
-        # Zipf distribution for realistic expert load imbalance
-        expert_probs = torch.tensor([1.0 / (i + 1) for i in range(E)],
-                                    device=device)
-        expert_probs = expert_probs / expert_probs.sum()
-        expert_indices = torch.multinomial(expert_probs, total_tokens,
-                                          replacement=True)
-
-    return X, W, expert_indices
+def get_e_local_list(E_total):
+    """Get E_local values to test for a model."""
+    if E_total <= 32:
+        return [E_total]  # fits on one GPU
+    return [e for e in E_LOCAL_OPTIONS if e <= E_total]
 
 
-def get_versions() -> Dict[str, callable]:
-    """Build version dict based on available implementations."""
-    versions = {
-        'PyTorch': grouped_gemm_pytorch,
-    }
+def run_single_config(name, H, I, E_local, top_k, E_total, input_tokens,
+                      warmup=20, rep=200):
+    """Run benchmark for one (model, E_local, input_tokens) config.
+
+    Returns dict of {version_name: latency_ms}.
+    """
+    device = "cuda"
+    tokens_per_expert = (input_tokens * top_k) // E_total
+    if tokens_per_expert == 0:
+        tokens_per_expert = 1
+    routed_tokens_local = E_local * tokens_per_expert
+
+    # Uniform distribution on local experts
+    expert_indices = torch.arange(routed_tokens_local, device=device) % E_local
+
+    # BF16 data (for fair grouped_mm comparison)
+    X_bf16 = torch.randn(routed_tokens_local, H, device=device, dtype=torch.bfloat16)
+    W_bf16_HI = torch.randn(E_local, H, I, device=device, dtype=torch.bfloat16)
+    W_bf16_IH = W_bf16_HI.transpose(1, 2).contiguous()
+
+    # FP16 data (for TileLang)
+    X_fp16 = X_bf16.to(torch.float16)
+    W_fp16_IH = W_bf16_IH.to(torch.float16)  # (E, I, H) for TileLang wrapper
+
+    sorted_indices = expert_indices.argsort()
+    X_sorted_bf16 = X_bf16[sorted_indices]
+    X_sorted_fp16 = X_fp16[sorted_indices]
+
+    counts = torch.bincount(expert_indices, minlength=E_local)
+    offs = torch.cumsum(counts, dim=0).to(torch.int32)
+    batch_sizes = counts.tolist()
+
+    Y_bf16 = torch.empty(routed_tokens_local, I, device=device, dtype=torch.bfloat16)
+
+    results = {}
+
+    # --- PyTorch for-loop (bf16, cuBLAS) ---
+    def loop_fn():
+        start = 0
+        for eid in range(E_local):
+            sz = batch_sizes[eid]
+            if sz == 0:
+                continue
+            torch.mm(X_sorted_bf16[start:start+sz], W_bf16_IH[eid].T,
+                     out=Y_bf16[start:start+sz])
+            start += sz
+
+    results['PyTorch'] = bench_fn(loop_fn, warmup=warmup, rep=rep)
+
+    # --- torch._grouped_mm (CUTLASS) ---
     if HAS_TORCH_GROUPED_MM:
-        versions['torch.grouped_mm'] = grouped_gemm_torch_grouped_mm
-    versions['TL-v1'] = grouped_gemm_tilelang
+        try:
+            torch._grouped_mm(X_sorted_bf16, W_bf16_HI, offs)  # verify
+            results['grouped_mm'] = bench_fn(
+                lambda: torch._grouped_mm(X_sorted_bf16, W_bf16_HI, offs),
+                warmup=warmup, rep=rep)
+        except Exception as e:
+            results['grouped_mm'] = float('inf')
+
+    # --- TileLang v1 (fp16) ---
+    try:
+        grouped_gemm_tilelang(X_fp16, W_fp16_IH, expert_indices)
+        results['TL-v1'] = bench_fn(
+            lambda: grouped_gemm_tilelang(X_fp16, W_fp16_IH, expert_indices),
+            warmup=warmup, rep=rep)
+    except Exception:
+        results['TL-v1'] = float('inf')
+
+    # --- TileLang v2 (fp16) ---
     if HAS_V2:
-        versions['TL-v2'] = grouped_gemm_tilelang_v2
-    if HAS_V3:
-        versions['TL-v3'] = grouped_gemm_tilelang_v3
-    return versions
-
-
-def benchmark_single(H: int, I: int, E: int, total_tokens: int,
-                     config_name: str, versions: Dict,
-                     warmup=50, rep=500, verbose=True, distribution="zipf",
-                     dtype=torch.bfloat16):
-    """Run benchmark for a single (model, token_count) config."""
-    X, W, expert_indices = generate_test_data(total_tokens, H, I, E,
-                                              distribution=distribution,
-                                              dtype=dtype)
-
-    # Correctness
-    baseline = grouped_gemm_pytorch(X, W, expert_indices)
-    correctness = {}
-    for name, func in versions.items():
         try:
-            out = func(X, W, expert_indices)
-            max_diff = (out - baseline).abs().max().item()
-            correctness[name] = max_diff
-        except Exception as e:
-            correctness[name] = str(e)
+            grouped_gemm_tilelang_v2(X_fp16, W_fp16_IH, expert_indices)
+            results['TL-v2'] = bench_fn(
+                lambda: grouped_gemm_tilelang_v2(X_fp16, W_fp16_IH, expert_indices),
+                warmup=warmup, rep=rep)
+        except Exception:
+            results['TL-v2'] = float('inf')
 
-    # Performance
-    latencies = {}
-    for name, func in versions.items():
-        try:
-            _ = func(X, W, expert_indices)
-            torch.cuda.synchronize()
-            lat = benchmark_function(func, X, W, expert_indices,
-                                     warmup=warmup, rep=rep)
-            latencies[name] = lat
-        except Exception as e:
-            latencies[name] = float('inf')
-            if verbose:
-                print(f"  {config_name} T={total_tokens} {name}: FAILED ({e})")
-
-    return latencies, correctness
+    return results, tokens_per_expert, routed_tokens_local
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Grouped GEMM Benchmark")
-    parser.add_argument("--models", type=str, default=None,
-                        help="Comma-separated model names to benchmark (default: all)")
-    parser.add_argument("--tokens", type=str, default=None,
-                        help="Comma-separated token counts (default: 256,1024,4096,16384)")
-    parser.add_argument("--warmup", type=int, default=50)
-    parser.add_argument("--rep", type=int, default=500)
-    parser.add_argument("--dist", type=str, default="zipf",
-                        choices=["zipf", "uniform"],
-                        help="Expert token distribution (default: zipf)")
-    parser.add_argument("--dtype", type=str, default="bf16",
-                        choices=["fp16", "bf16"],
-                        help="Data type (default: bf16, required by torch._grouped_mm)")
+    parser = argparse.ArgumentParser(description="Grouped GEMM Benchmark v2")
+    parser.add_argument("--models", type=str, default=None)
+    parser.add_argument("--input-tokens", type=str, default=None)
+    parser.add_argument("--warmup", type=int, default=20)
+    parser.add_argument("--rep", type=int, default=200)
     args = parser.parse_args()
 
-    dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
-
-    # Filter models
     if args.models:
         model_filter = set(args.models.split(","))
         configs = [c for c in MODEL_CONFIGS if c[0] in model_filter]
     else:
         configs = MODEL_CONFIGS
 
-    # Token sweep
-    if args.tokens:
-        token_sweep = [int(t) for t in args.tokens.split(",")]
+    if args.input_tokens:
+        input_sweep = [int(t) for t in args.input_tokens.split(",")]
     else:
-        token_sweep = TOKEN_SWEEP
+        input_sweep = INPUT_TOKENS_SWEEP
 
-    versions = get_versions()
-    version_names = list(versions.keys())
-
-    print("=" * 80)
-    print("Grouped GEMM Benchmark — Real MoE Model Configurations")
-    print("=" * 80)
-
-    if not torch.cuda.is_available():
-        print("CUDA not available!")
-        return
-
-    print(f"Device: {torch.cuda.get_device_name()}")
-    print(f"PyTorch: {torch.__version__}")
-    print(f"Versions: {', '.join(version_names)}")
-    print(f"Token sweep: {token_sweep}")
-    print(f"Distribution: {args.dist}")
-    print(f"Dtype: {args.dtype}")
+    print("=" * 100)
+    print("Grouped GEMM Benchmark v2 — Real MoE Prefill Scenarios")
+    print("=" * 100)
+    print("Device:", torch.cuda.get_device_name())
+    print("PyTorch:", torch.__version__)
+    print("torch._grouped_mm:", "available" if HAS_TORCH_GROUPED_MM else "NOT available")
+    print("TL-v2:", "available" if HAS_V2 else "NOT available")
     print()
 
-    # ============ Run all benchmarks ============
-    all_results = []  # (model_name, T, latencies, correctness)
+    all_rows = []
 
-    for model_name, H, I, E, K, desc in configs:
-        print(f"\n{'='*80}")
-        print(f"Model: {model_name}  ({desc})")
-        print(f"  H={H}, I={I}, E={E}, top_k={K}")
-        print(f"{'='*80}")
+    for name, H, I, E_total, top_k in configs:
+        e_locals = get_e_local_list(E_total)
 
-        for T in token_sweep:
-            print(f"\n  T={T}:")
-            latencies, correctness = benchmark_single(
-                H, I, E, T, model_name, versions,
-                warmup=args.warmup, rep=args.rep,
-                distribution=args.dist, dtype=dtype)
+        for E_local in e_locals:
+            print("\n{} (H={}, I={}, E_total={}, top_k={}, E_local={})".format(
+                name, H, I, E_total, top_k, E_local))
+            print("-" * 80)
 
-            # Print inline
-            parts = []
-            for v in version_names:
-                lat = latencies.get(v, float('inf'))
-                corr = correctness.get(v, "N/A")
-                if isinstance(corr, float):
-                    corr_str = f"diff={corr:.4f}"
-                else:
-                    corr_str = f"ERR:{corr[:30]}"
-                if lat == float('inf'):
-                    parts.append(f"    {v}: FAILED ({corr_str})")
-                else:
-                    parts.append(f"    {v}: {lat:.4f} ms  ({corr_str})")
-            print("\n".join(parts))
+            for input_tokens in input_sweep:
+                results, tpe, rt_local = run_single_config(
+                    name, H, I, E_local, top_k, E_total, input_tokens,
+                    warmup=args.warmup, rep=args.rep)
 
-            all_results.append((model_name, H, I, E, T, latencies))
+                # Print inline
+                parts = []
+                for v, lat in results.items():
+                    if lat == float('inf'):
+                        parts.append("{}=FAIL".format(v))
+                    else:
+                        parts.append("{}={:.4f}ms".format(v, lat))
+                print("  input_tokens={:<6} tpe={:<4} rt_local={:<6} {}".format(
+                    input_tokens, tpe, rt_local, "  ".join(parts)))
 
-    # ============ Summary: speedup matrix ============
-    print("\n\n" + "=" * 80)
-    print("SUMMARY: Latency Matrix (ms)")
-    print("=" * 80)
+                all_rows.append({
+                    'model': name, 'H': H, 'I': I,
+                    'E_total': E_total, 'E_local': E_local,
+                    'top_k': top_k, 'input_tokens': input_tokens,
+                    'tpe': tpe, 'rt_local': rt_local,
+                    **results
+                })
 
-    headers = ["Model", "H", "I", "E", "T"] + version_names
+    # ============ Summary table ============
+    print("\n\n" + "=" * 100)
+    print("SUMMARY: Latency (ms) and Speedup vs PyTorch for-loop")
+    print("=" * 100)
+
+    version_keys = ['PyTorch', 'grouped_mm', 'TL-v1', 'TL-v2']
+    version_keys = [v for v in version_keys
+                    if any(v in r for r in all_rows)]
+
+    headers = ["Model", "E_loc", "inp_tok", "tpe", "rt_loc"] + \
+              [v + "(ms)" for v in version_keys] + \
+              [v + "/Py" for v in version_keys if v != 'PyTorch']
+
     table = []
-    for model_name, H, I, E, T, latencies in all_results:
-        row = [model_name, H, I, E, T]
-        for v in version_names:
-            lat = latencies.get(v, float('inf'))
-            row.append(f"{lat:.4f}" if lat != float('inf') else "FAIL")
-        table.append(row)
-    print(tabulate(table, headers=headers, tablefmt="pipe"))
-
-    # ============ Summary: speedup vs PyTorch ============
-    print("\n" + "=" * 80)
-    print("SUMMARY: Speedup vs PyTorch")
-    print("=" * 80)
-
-    speedup_versions = [v for v in version_names if v != 'PyTorch']
-    headers2 = ["Model", "T"] + [f"{v}/PyTorch" for v in speedup_versions]
-    table2 = []
-    for model_name, H, I, E, T, latencies in all_results:
-        pytorch_lat = latencies.get('PyTorch', float('inf'))
-        if pytorch_lat == float('inf'):
-            continue
-        row = [model_name, T]
-        for v in speedup_versions:
-            lat = latencies.get(v, float('inf'))
-            if lat == float('inf'):
+    for r in all_rows:
+        py_lat = r.get('PyTorch', float('inf'))
+        row = [r['model'], r['E_local'], r['input_tokens'],
+               r['tpe'], r['rt_local']]
+        for v in version_keys:
+            lat = r.get(v, float('inf'))
+            row.append("{:.4f}".format(lat) if lat != float('inf') else "FAIL")
+        for v in version_keys:
+            if v == 'PyTorch':
+                continue
+            lat = r.get(v, float('inf'))
+            if lat == float('inf') or py_lat == float('inf'):
                 row.append("FAIL")
             else:
-                speedup = pytorch_lat / lat
-                marker = ""
-                if speedup >= 1.1:
-                    marker = " +"
-                elif speedup <= 0.9:
-                    marker = " -"
-                row.append(f"{speedup:.2f}x{marker}")
-        table2.append(row)
-    print(tabulate(table2, headers=headers2, tablefmt="pipe"))
+                sp = py_lat / lat
+                row.append("{:.2f}x".format(sp))
+        table.append(row)
 
-    # ============ Best version per config ============
-    print("\n" + "=" * 80)
-    print("SUMMARY: Best Version per Config")
-    print("=" * 80)
-
-    headers3 = ["Model", "T", "Best", "Latency (ms)", "vs PyTorch"]
-    table3 = []
-    for model_name, H, I, E, T, latencies in all_results:
-        best_name = min(latencies, key=latencies.get)
-        best_lat = latencies[best_name]
-        pytorch_lat = latencies.get('PyTorch', float('inf'))
-        speedup = pytorch_lat / best_lat if best_lat > 0 else 0
-        table3.append([model_name, T, best_name, f"{best_lat:.4f}",
-                       f"{speedup:.2f}x"])
-    print(tabulate(table3, headers=headers3, tablefmt="pipe"))
+    print(tabulate(table, headers=headers, tablefmt="pipe"))
 
 
 if __name__ == "__main__":
