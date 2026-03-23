@@ -53,6 +53,48 @@ try:
 except ImportError:
     HAS_V3 = False
 
+# Check torch._grouped_mm availability (PyTorch 2.6+, CUTLASS grouped GEMM)
+HAS_TORCH_GROUPED_MM = hasattr(torch, "_grouped_mm")
+
+
+# ============ torch._grouped_mm wrapper (CUTLASS grouped GEMM) ============
+
+def grouped_gemm_torch_grouped_mm(
+    X: torch.Tensor,
+    W: torch.Tensor,
+    expert_indices: torch.Tensor,
+) -> torch.Tensor:
+    """
+    torch._grouped_mm baseline (PyTorch 2.6+, CUTLASS Hopper grouped GEMM).
+    Requires BFloat16. Single kernel launch for all experts.
+
+    Args:
+        X: (total_tokens, H) fp16 input
+        W: (E, I, H) fp16 weights
+        expert_indices: (total_tokens,) expert IDs
+    Returns:
+        Y: (total_tokens, I) fp16 output
+    """
+    total_tokens, H = X.shape
+    E, I, _ = W.shape
+    device = X.device
+
+    sorted_indices = expert_indices.argsort()
+    X_sorted = X[sorted_indices].to(torch.bfloat16)
+
+    expert_counts = torch.bincount(expert_indices, minlength=E)
+    offs = torch.cumsum(expert_counts, dim=0).to(torch.int32)
+
+    # W: (E, I, H) -> need (E, H, I) for A @ B = (tokens, H) @ (H, I)
+    W_transposed = W.transpose(1, 2).contiguous().to(torch.bfloat16)
+
+    # torch._grouped_mm(A, B, offs) -> C
+    Y_sorted_bf16 = torch._grouped_mm(X_sorted, W_transposed, offs)
+
+    Y = torch.empty(total_tokens, I, device=device, dtype=X.dtype)
+    Y[sorted_indices] = Y_sorted_bf16.to(X.dtype)
+    return Y
+
 
 # ============ Benchmark infra ============
 try:
@@ -118,8 +160,10 @@ def get_versions() -> Dict[str, callable]:
     """Build version dict based on available implementations."""
     versions = {
         'PyTorch': grouped_gemm_pytorch,
-        'TL-v1': grouped_gemm_tilelang,
     }
+    if HAS_TORCH_GROUPED_MM:
+        versions['torch.grouped_mm'] = grouped_gemm_torch_grouped_mm
+    versions['TL-v1'] = grouped_gemm_tilelang
     if HAS_V2:
         versions['TL-v2'] = grouped_gemm_tilelang_v2
     if HAS_V3:
