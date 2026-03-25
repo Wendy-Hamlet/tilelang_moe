@@ -299,7 +299,7 @@ def _grouped_gemm_v3_kernel(
 @tilelang.jit(out_idx=[2])
 def _grouped_gemm_v4_kernel(
     batch_sizes_list, K, N,
-    block_M=128, block_N=128, block_K=128,
+    block_M=128, block_N=128, block_K=64,
     num_stages=4, threads=256, dtype=T.float16
 ):
     """
@@ -368,7 +368,15 @@ def _grouped_gemm_v4_kernel(
 def _get_v4_block_config(H, I, E, total_tokens):
     """Select block parameters for v4 based on problem geometry.
 
-    Mirrors Triton-TMA's autotune search space with static heuristic.
+    Shared memory budget: (A_shared + B_shared) * stages + C_shared
+      = (BM*BK + BK*BN) * stages + BM*BN, all in bf16 (2 bytes)
+    H100 limit ~228 KB. We target ≤160 KB for safe occupancy.
+
+    Feasible configs (bf16):
+      BM=128 BN=128 BK=64 stages=4 → 160 KB ✓
+      BM=128 BN=128 BK=64 stages=3 → 128 KB ✓
+      BM=64  BN=128 BK=64 stages=4 → 112 KB ✓
+      BM=64  BN=128 BK=64 stages=3 →  88 KB ✓
     """
     avg_tokens_per_expert = max(1, total_tokens // E)
 
@@ -378,27 +386,15 @@ def _get_v4_block_config(H, I, E, total_tokens):
     else:
         block_M = 128
 
-    # block_N: match output dimension
-    if I <= 256:
-        block_N = 64
-    elif I >= 2048:
-        block_N = 256
-    else:
-        block_N = 128
+    # block_N: always 128 (256 blows shared memory)
+    block_N = 128
 
-    # block_K: larger = fewer iterations (Triton-TMA uses 64-128)
-    if H >= 2048:
-        block_K = 128
-    else:
-        block_K = 64
+    # block_K: keep at 64 (128 blows shared memory with any reasonable BN)
+    block_K = 64
 
-    # More stages and threads for larger blocks
-    if block_K >= 128 and block_N >= 128:
-        num_stages = 4
-        threads = 256
-    else:
-        num_stages = 3
-        threads = 128
+    # Key v4 improvement: more stages (4) and more threads (256)
+    num_stages = 4
+    threads = 256
 
     return block_M, block_N, block_K, num_stages, threads
 
