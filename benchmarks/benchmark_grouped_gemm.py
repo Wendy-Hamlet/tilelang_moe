@@ -1,18 +1,10 @@
 """
-Grouped GEMM Benchmark v2 — Real MoE Prefill Scenarios
+Grouped GEMM Benchmark v2 — Real MoE Prefill Scenarios (Pure Kernel Latency, BF16)
 
-Key changes from v1:
-- Variable: input_tokens (not T), routed_tokens = input_tokens * top_k
-- Prefill only: input_tokens = [1024, 2048, 4096, 8192, 16384]
-- For E>32 models, simulate single-GPU with E_local = 8, 16, 32 (expert parallel)
-- tokens_per_expert = input_tokens * top_k / E (same regardless of parallelism)
-- routed_tokens_local = E_local * tokens_per_expert
-
-Implementations compared:
-- PyTorch: for-loop torch.mm (cuBLAS per expert)
-- torch._grouped_mm: CUTLASS grouped GEMM (single kernel)
-- TL-v1: TileLang official grouped GEMM
-- TL-v2: TileLang optimized (padded output + TMA store + O(1) expert lookup)
+Key changes:
+- Strip host-side preprocessing overhead (sorting, bincount, metadata allocation, JIT compilation)
+- Measure only pure kernel launch and execution latency
+- Use BFloat16 uniformly for fair comparison (PyTorch vs TileLang vs torch._grouped_mm)
 """
 
 import sys
@@ -24,10 +16,11 @@ from pathlib import Path
 
 warnings.filterwarnings('ignore', category=UserWarning, module='torch._inductor')
 
-project_root = Path(__file__).parent.parent
+project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
 import torch
+import tilelang.language as T
 from typing import Dict, List, Tuple
 from tabulate import tabulate
 
@@ -35,11 +28,13 @@ torch.set_float32_matmul_precision('high')
 
 # ============ Import implementations ============
 from kernels.grouped_gemm_tilelang import (
-    grouped_gemm_pytorch,
-    grouped_gemm_tilelang,
+    _grouped_gemm_kernel,  # low-level v1 kernel
 )
 try:
-    from kernels.grouped_gemm_tilelang import grouped_gemm_tilelang_v2
+    from kernels.grouped_gemm_tilelang import (
+        _grouped_gemm_v2_kernel,  # low-level v2 kernel
+        _get_v2_block_config
+    )
     HAS_V2 = True
 except ImportError:
     HAS_V2 = False
@@ -65,11 +60,8 @@ def bench_fn(fn, warmup=50, rep=500):
 # ============ Real MoE model configs ============
 # (name, H, I, E_total, top_k)
 MODEL_CONFIGS = [
-    ("OLMoE-1B",      2048,  1024,  64, 8),
-    ("Mixtral-8x7B",  4096, 14336,   8, 2),
     ("Qwen3-235B",    4096,  3072, 128, 8),
     ("DeepSeek-V2",   5120,  1536, 160, 6),
-    ("DBRX",          6144, 10752,  16, 4),
     ("DeepSeek-V3",   7168,  2048, 256, 8),
 ]
 
@@ -101,26 +93,82 @@ def run_single_config(name, H, I, E_local, top_k, E_total, input_tokens,
     # Uniform distribution on local experts
     expert_indices = torch.arange(routed_tokens_local, device=device) % E_local
 
-    # BF16 data (for fair grouped_mm comparison)
+    # Unified BF16 data for fair comparison
     X_bf16 = torch.randn(routed_tokens_local, H, device=device, dtype=torch.bfloat16)
     W_bf16_HI = torch.randn(E_local, H, I, device=device, dtype=torch.bfloat16)
     W_bf16_IH = W_bf16_HI.transpose(1, 2).contiguous()
 
-    # FP16 data (for TileLang)
-    X_fp16 = X_bf16.to(torch.float16)
-    W_fp16_IH = W_bf16_IH.to(torch.float16)  # (E, I, H) for TileLang wrapper
-
+    # ==========================================
+    # Preprocessing (host-side, NOT included in latency)
+    # ==========================================
     sorted_indices = expert_indices.argsort()
     X_sorted_bf16 = X_bf16[sorted_indices]
-    X_sorted_fp16 = X_fp16[sorted_indices]
 
     counts = torch.bincount(expert_indices, minlength=E_local)
-    offs = torch.cumsum(counts, dim=0).to(torch.int32)
     batch_sizes = counts.tolist()
+    offs = torch.cumsum(counts, dim=0).to(torch.int32)
 
     Y_bf16 = torch.empty(routed_tokens_local, I, device=device, dtype=torch.bfloat16)
 
+    # Pre-extract views for PyTorch for-loop to eliminate per-call transpose overhead
+    W_bf16_IH_views = [W_bf16_IH[eid].T for eid in range(E_local)]
+
+    # --- Prepare TL-v1 metadata ---
+    block_M, block_N, block_K = 64, 64, 64
+    batch_offsets_list = [0]
+    batch_padded_offsets_list = [0]
+    for i in range(E_local - 1):
+        batch_offsets_list.append(batch_offsets_list[-1] + batch_sizes[i])
+        batch_padded_offsets_list.append(
+            batch_padded_offsets_list[-1] +
+            math.ceil(batch_sizes[i] / block_M) * block_M
+        )
+
+    batch_sizes_t_v1 = torch.tensor(batch_sizes, device=device, dtype=torch.int32)
+    batch_offsets_t_v1 = torch.tensor(batch_offsets_list, device=device, dtype=torch.int32)
+    batch_padded_offsets_t_v1 = torch.tensor(batch_padded_offsets_list, device=device, dtype=torch.int32)
+
+    # Pre-compile TL-v1 kernel (dtype=T.bfloat16)
+    kernel_v1 = _grouped_gemm_kernel(
+        tuple(batch_sizes), K=H, N=I,
+        block_M=block_M, block_N=block_N, block_K=block_K,
+        num_stages=2, threads=256, dtype=T.bfloat16
+    )
+
+    # --- Prepare TL-v2 metadata ---
+    if HAS_V2:
+        v2_bm, v2_bn, v2_bk, v2_stages, v2_threads = _get_v2_block_config(H, I, E_local, routed_tokens_local)
+
+        batch_offsets_v2 = [0]
+        batch_padded_offsets_v2 = [0]
+        for i in range(E_local - 1):
+            batch_offsets_v2.append(batch_offsets_v2[-1] + batch_sizes[i])
+            batch_padded_offsets_v2.append(
+                batch_padded_offsets_v2[-1]
+                + math.ceil(batch_sizes[i] / v2_bm) * v2_bm
+            )
+
+        tile_expert_ids_list = []
+        for expert_id, size in enumerate(batch_sizes):
+            n_blocks = math.ceil(size / v2_bm) if size > 0 else 0
+            tile_expert_ids_list.extend([expert_id] * n_blocks)
+
+        batch_offsets_t_v2 = torch.tensor(batch_offsets_v2, device=device, dtype=torch.int32)
+        batch_padded_offsets_t_v2 = torch.tensor(batch_padded_offsets_v2, device=device, dtype=torch.int32)
+        tile_expert_ids_t_v2 = torch.tensor(tile_expert_ids_list, device=device, dtype=torch.int32)
+
+        # Pre-compile TL-v2 kernel (dtype=T.bfloat16)
+        kernel_v2 = _grouped_gemm_v2_kernel(
+            tuple(batch_sizes), K=H, N=I,
+            block_M=v2_bm, block_N=v2_bn, block_K=v2_bk,
+            num_stages=v2_stages, threads=v2_threads, dtype=T.bfloat16
+        )
+
     results = {}
+
+    # ==========================================
+    # Pure kernel benchmark (strictly timed region)
+    # ==========================================
 
     # --- PyTorch for-loop (bf16, cuBLAS) ---
     def loop_fn():
@@ -129,39 +177,41 @@ def run_single_config(name, H, I, E_local, top_k, E_total, input_tokens,
             sz = batch_sizes[eid]
             if sz == 0:
                 continue
-            torch.mm(X_sorted_bf16[start:start+sz], W_bf16_IH[eid].T,
+            torch.mm(X_sorted_bf16[start:start+sz], W_bf16_IH_views[eid],
                      out=Y_bf16[start:start+sz])
             start += sz
 
     results['PyTorch'] = bench_fn(loop_fn, warmup=warmup, rep=rep)
 
-    # --- torch._grouped_mm (CUTLASS) ---
+    # --- torch._grouped_mm (CUTLASS, bf16) ---
     if HAS_TORCH_GROUPED_MM:
         try:
-            torch._grouped_mm(X_sorted_bf16, W_bf16_HI, offs)  # verify
+            torch._grouped_mm(X_sorted_bf16, W_bf16_HI, offs)  # verify/warmup
             results['grouped_mm'] = bench_fn(
                 lambda: torch._grouped_mm(X_sorted_bf16, W_bf16_HI, offs),
                 warmup=warmup, rep=rep)
-        except Exception as e:
+        except Exception:
             results['grouped_mm'] = float('inf')
 
-    # --- TileLang v1 (fp16) ---
+    # --- TileLang v1 (bf16) ---
     try:
-        grouped_gemm_tilelang(X_fp16, W_fp16_IH, expert_indices)
+        kernel_v1(X_sorted_bf16, W_bf16_HI, batch_sizes_t_v1, batch_offsets_t_v1, batch_padded_offsets_t_v1)
         results['TL-v1'] = bench_fn(
-            lambda: grouped_gemm_tilelang(X_fp16, W_fp16_IH, expert_indices),
+            lambda: kernel_v1(X_sorted_bf16, W_bf16_HI, batch_sizes_t_v1, batch_offsets_t_v1, batch_padded_offsets_t_v1),
             warmup=warmup, rep=rep)
-    except Exception:
+    except Exception as e:
+        print(f"\n[TL-v1 Error] {e}")
         results['TL-v1'] = float('inf')
 
-    # --- TileLang v2 (fp16) ---
+    # --- TileLang v2 (bf16) ---
     if HAS_V2:
         try:
-            grouped_gemm_tilelang_v2(X_fp16, W_fp16_IH, expert_indices)
+            kernel_v2(X_sorted_bf16, W_bf16_HI, batch_offsets_t_v2, batch_padded_offsets_t_v2, tile_expert_ids_t_v2)
             results['TL-v2'] = bench_fn(
-                lambda: grouped_gemm_tilelang_v2(X_fp16, W_fp16_IH, expert_indices),
+                lambda: kernel_v2(X_sorted_bf16, W_bf16_HI, batch_offsets_t_v2, batch_padded_offsets_t_v2, tile_expert_ids_t_v2),
                 warmup=warmup, rep=rep)
-        except Exception:
+        except Exception as e:
+            print(f"\n[TL-v2 Error] {e}")
             results['TL-v2'] = float('inf')
 
     return results, tokens_per_expert, routed_tokens_local
@@ -187,7 +237,7 @@ def main():
         input_sweep = INPUT_TOKENS_SWEEP
 
     print("=" * 100)
-    print("Grouped GEMM Benchmark v2 — Real MoE Prefill Scenarios")
+    print("Grouped GEMM Benchmark v2 — Real MoE Prefill Scenarios (Pure Kernel BF16)")
     print("=" * 100)
     print("Device:", torch.cuda.get_device_name())
     print("PyTorch:", torch.__version__)
@@ -230,7 +280,7 @@ def main():
 
     # ============ Summary table ============
     print("\n\n" + "=" * 100)
-    print("SUMMARY: Latency (ms) and Speedup vs PyTorch for-loop")
+    print("SUMMARY: Pure Kernel Latency (ms) and Speedup vs PyTorch for-loop (BF16)")
     print("=" * 100)
 
     version_keys = ['PyTorch', 'grouped_mm', 'TL-v1', 'TL-v2']
