@@ -294,6 +294,118 @@ def _grouped_gemm_v3_kernel(
     return kernel
 
 
+# ============ V4: Larger Blocks + More Warps/Stages (Triton-TMA-inspired) ============
+
+@tilelang.jit(out_idx=[2])
+def _grouped_gemm_v4_kernel(
+    batch_sizes_list, K, N,
+    block_M=128, block_N=128, block_K=128,
+    num_stages=4, threads=256, dtype=T.float16
+):
+    """
+    V4 grouped GEMM kernel — combines Triton-TMA's block/pipeline config
+    with our v2 optimizations (O(1) expert lookup, padded output, TMA store).
+
+    Key changes vs v2:
+    - Larger block_K (128 vs 64): fewer K-loop iterations, better compute density
+    - More threads (256 vs 128 = 8 warps vs 4): higher SM occupancy
+    - More pipeline stages (4 vs 3): better latency hiding
+    - Supports block_N=256 for large output dimensions
+    """
+    batch_sum = sum(batch_sizes_list)
+    batch_count = len(batch_sizes_list)
+    batch_padded_sum = sum(
+        ((s + block_M - 1) // block_M) * block_M for s in batch_sizes_list
+    )
+    accum_dtype = T.float32
+    total_m_blocks = sum(
+        (size + block_M - 1) // block_M for size in batch_sizes_list
+    )
+
+    @T.prim_func
+    def kernel(
+        A: T.Tensor([batch_sum, K], dtype),
+        B: T.Tensor([batch_count, K, N], dtype),
+        C_padded: T.Tensor([batch_padded_sum, N], dtype),
+        batch_offsets: T.Tensor([batch_count], T.int32),
+        batch_padded_offsets: T.Tensor([batch_count], T.int32),
+        tile_expert_ids: T.Tensor([total_m_blocks], T.int32),
+    ):
+        with T.Kernel(total_m_blocks, T.ceildiv(N, block_N), threads=threads) as (bx, by):
+            A_shared = T.alloc_shared([block_M, block_K], dtype)
+            B_shared = T.alloc_shared([block_K, block_N], dtype)
+            C_local = T.alloc_fragment([block_M, block_N], accum_dtype)
+            C_shared = T.alloc_shared([block_M, block_N], dtype)
+
+            T.annotate_layout({
+                A_shared: tilelang.layout.make_swizzled_layout(A_shared),
+                B_shared: tilelang.layout.make_swizzled_layout(B_shared),
+            })
+            T.use_swizzle(10)
+
+            m_start_padded = bx * block_M
+
+            # O(1) expert lookup via pre-computed table
+            cur_batch_idx = tile_expert_ids[bx]
+
+            m_start = (m_start_padded
+                       - batch_padded_offsets[cur_batch_idx]
+                       + batch_offsets[cur_batch_idx])
+
+            T.clear(C_local)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
+                T.copy(A[m_start, k * block_K], A_shared)
+                T.copy(B[cur_batch_idx, k * block_K, by * block_N], B_shared)
+                T.gemm(A_shared, B_shared, C_local)
+
+            # Two-step store: fragment → shared → global (TMA store path)
+            T.copy(C_local, C_shared)
+            T.copy(C_shared, C_padded[m_start_padded, by * block_N])
+
+    return kernel
+
+
+def _get_v4_block_config(H, I, E, total_tokens):
+    """Select block parameters for v4 based on problem geometry.
+
+    Mirrors Triton-TMA's autotune search space with static heuristic.
+    """
+    avg_tokens_per_expert = max(1, total_tokens // E)
+
+    # block_M: match token density
+    if avg_tokens_per_expert <= 64:
+        block_M = 64
+    else:
+        block_M = 128
+
+    # block_N: match output dimension
+    if I <= 256:
+        block_N = 64
+    elif I >= 2048:
+        block_N = 256
+    else:
+        block_N = 128
+
+    # block_K: larger = fewer iterations (Triton-TMA uses 64-128)
+    if H >= 2048:
+        block_K = 128
+    else:
+        block_K = 64
+
+    # More stages and threads for larger blocks
+    if block_K >= 128 and block_N >= 128:
+        num_stages = 4
+        threads = 256
+    else:
+        num_stages = 3
+        threads = 128
+
+    return block_M, block_N, block_K, num_stages, threads
+
+
+_kernel_cache_v4: Dict[Tuple, any] = {}
+
+
 def _build_expert_grouped_tile_order(batch_sizes_list, block_M, n_blocks):
     """
     Build tile ordering that groups tiles by expert for L2 cache locality.
