@@ -171,49 +171,52 @@ def grouped_matmul_tma_kernel(
 def prepare_triton_metadata(X_sorted, W_HI, batch_sizes, device="cuda"):
     """Convert contiguous MoE data to Triton's pointer-based format.
 
-    Args:
-        X_sorted: (routed_tokens_local, H) BF16, sorted by expert
-        W_HI: (E_local, H, I) BF16 weight tensor
-        batch_sizes: list of int, tokens per expert
-
-    Returns:
-        Tuple of device tensors for kernel launch (all outside timing).
-        Also returns Y (output tensor) and group_C (list of output slices).
+    The Triton tutorial kernel assumes full tiles (no boundary checks).
+    We pad each expert's M to a multiple of 256 (max BLOCK_SIZE_M in autotune)
+    to avoid out-of-bounds access. Padding is done on copies outside timing.
     """
+    PAD_M = 256  # max BLOCK_SIZE_M across autotune configs
     E_local = len(batch_sizes)
     H = X_sorted.shape[1]
     I = W_HI.shape[2]
 
+    # Pad input: allocate padded copies for each expert
+    padded_As = []
+    padded_Cs = []
     A_addrs = []
     B_addrs = []
     C_addrs = []
     g_sizes = []
     g_lds = []
 
-    # Allocate output
-    Y = torch.empty(X_sorted.shape[0], I, device=device, dtype=X_sorted.dtype)
-
     offset = 0
     for eid in range(E_local):
         M = batch_sizes[eid]
+        M_padded = ((M + PAD_M - 1) // PAD_M) * PAD_M if M > 0 else 0
         if M == 0:
-            # Triton kernel iterates over group_size, need a valid entry
-            # Use dummy 0-tile problem
             A_addrs.append(X_sorted.data_ptr())
             B_addrs.append(W_HI[eid].data_ptr())
-            C_addrs.append(Y.data_ptr())
+            C_pad = torch.zeros(PAD_M, I, device=device, dtype=X_sorted.dtype)
+            padded_Cs.append(C_pad)
+            C_addrs.append(C_pad.data_ptr())
             g_sizes += [0, I, H]
             g_lds += [H, I, I]
         else:
-            # A = X_sorted[offset:offset+M] shape (M, H), stride(0)=H
-            A_addrs.append(X_sorted[offset].data_ptr())
-            # B = W_HI[eid] shape (H, I), stride(0)=I
+            # Create padded A slice
+            A_pad = torch.zeros(M_padded, H, device=device, dtype=X_sorted.dtype)
+            A_pad[:M] = X_sorted[offset:offset + M]
+            padded_As.append(A_pad)
+            A_addrs.append(A_pad.data_ptr())
             B_addrs.append(W_HI[eid].data_ptr())
-            # C = Y[offset:offset+M] shape (M, I), stride(0)=I
-            C_addrs.append(Y[offset].data_ptr())
-            g_sizes += [M, I, H]  # M, N, K
-            g_lds += [H, I, I]    # lda, ldb, ldc
+            C_pad = torch.empty(M_padded, I, device=device, dtype=X_sorted.dtype)
+            padded_Cs.append(C_pad)
+            C_addrs.append(C_pad.data_ptr())
+            g_sizes += [M_padded, I, H]
+            g_lds += [H, I, I]
         offset += M
+
+    # Keep references alive
+    Y_ref = (padded_As, padded_Cs)
 
     d_a_ptrs = torch.tensor(A_addrs, device=device)
     d_b_ptrs = torch.tensor(B_addrs, device=device)
@@ -221,42 +224,55 @@ def prepare_triton_metadata(X_sorted, W_HI, batch_sizes, device="cuda"):
     d_g_sizes = torch.tensor(g_sizes, dtype=torch.int32, device=device)
     d_g_lds = torch.tensor(g_lds, dtype=torch.int32, device=device)
 
-    return d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, Y
+    return d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, Y_ref
 
 
 def prepare_triton_tma_metadata(X_sorted, W_HI, batch_sizes, device="cuda"):
-    """Prepare metadata for TMA kernel. B must be transposed to (N, K) = (I, H)."""
+    """Prepare metadata for TMA kernel. B must be transposed to (N, K) = (I, H).
+
+    Pads each expert's M to a multiple of 256 to avoid OOB access.
+    """
+    PAD_M = 256
     E_local = len(batch_sizes)
     H = X_sorted.shape[1]
     I = W_HI.shape[2]
 
-    # TMA kernel expects B in (N, K) layout, i.e. W transposed to (I, H)
     W_IH = W_HI.transpose(1, 2).contiguous()  # (E_local, I, H)
 
+    padded_As = []
+    padded_Cs = []
     A_addrs = []
     B_addrs = []
     C_addrs = []
     g_sizes = []
     g_lds = []
 
-    Y = torch.empty(X_sorted.shape[0], I, device=device, dtype=X_sorted.dtype)
-
     offset = 0
     for eid in range(E_local):
         M = batch_sizes[eid]
+        M_padded = ((M + PAD_M - 1) // PAD_M) * PAD_M if M > 0 else 0
         if M == 0:
             A_addrs.append(X_sorted.data_ptr())
             B_addrs.append(W_IH[eid].data_ptr())
-            C_addrs.append(Y.data_ptr())
+            C_pad = torch.zeros(PAD_M, I, device=device, dtype=X_sorted.dtype)
+            padded_Cs.append(C_pad)
+            C_addrs.append(C_pad.data_ptr())
             g_sizes += [0, I, H]
-            g_lds += [H, H, I]  # lda=H, ldb=H (B is (I,H), stride(0)=H), ldc=I
+            g_lds += [H, H, I]
         else:
-            A_addrs.append(X_sorted[offset].data_ptr())
+            A_pad = torch.zeros(M_padded, H, device=device, dtype=X_sorted.dtype)
+            A_pad[:M] = X_sorted[offset:offset + M]
+            padded_As.append(A_pad)
+            A_addrs.append(A_pad.data_ptr())
             B_addrs.append(W_IH[eid].data_ptr())
-            C_addrs.append(Y[offset].data_ptr())
-            g_sizes += [M, I, H]
+            C_pad = torch.empty(M_padded, I, device=device, dtype=X_sorted.dtype)
+            padded_Cs.append(C_pad)
+            C_addrs.append(C_pad.data_ptr())
+            g_sizes += [M_padded, I, H]
             g_lds += [H, H, I]
         offset += M
+
+    Y_ref = (padded_As, padded_Cs)
 
     d_a_ptrs = torch.tensor(A_addrs, device=device)
     d_b_ptrs = torch.tensor(B_addrs, device=device)
@@ -264,7 +280,7 @@ def prepare_triton_tma_metadata(X_sorted, W_HI, batch_sizes, device="cuda"):
     d_g_sizes = torch.tensor(g_sizes, dtype=torch.int32, device=device)
     d_g_lds = torch.tensor(g_lds, dtype=torch.int32, device=device)
 
-    return d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, Y
+    return d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, Y_ref
 
 
 def triton_grouped_gemm(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, group_size):
