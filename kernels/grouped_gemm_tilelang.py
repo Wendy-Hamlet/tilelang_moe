@@ -365,38 +365,60 @@ def _grouped_gemm_v4_kernel(
     return kernel
 
 
+def _smem_bytes(bm, bn, bk, stages):
+    """Shared memory in bytes for grouped GEMM (bf16): (A+B)*stages + C."""
+    return (bm * bk + bk * bn) * stages * 2 + bm * bn * 2
+
+
+# Candidate configs sorted by output tile area (largest first).
+# Each: (BM, BN, BK, stages, threads)
+# TileLang adds a 128-thread TMA producer warpgroup on top of `threads`.
+_V4_CANDIDATES = [
+    # --- Tier 1: largest output tile (match Triton-TMA's 128×256) ---
+    (128, 256, 64, 3, 256),   # 208 KB — matches Triton-TMA best config
+    # --- Tier 2: 128×128 output tile ---
+    (128, 128, 64, 4, 256),   # 160 KB — more stages, high throughput
+    (128, 128, 64, 3, 256),   # 128 KB — safe fallback
+    # --- Tier 3: 64× output tile (small tokens_per_expert) ---
+    (64,  256, 64, 3, 256),   # 160 KB — wide N for small M
+    (64,  128, 64, 4, 256),   # 112 KB — v4-original config
+    (64,  128, 64, 3, 128),   #  88 KB — most conservative
+]
+
+# H100 dynamic shared memory limit (bytes)
+_SMEM_LIMIT = 228 * 1024  # 228 KB = 233472 bytes (conservative)
+
+
 def _get_v4_block_config(H, I, E, total_tokens):
-    """Select block parameters for v4 based on problem geometry.
+    """Select the best v4 block config based on problem geometry.
 
-    Shared memory budget: (A_shared + B_shared) * stages + C_shared
-      = (BM*BK + BK*BN) * stages + BM*BN, all in bf16 (2 bytes)
-    H100 limit ~228 KB. We target ≤160 KB for safe occupancy.
+    Strategy: pick the largest output tile (BM×BN) that fits in shared memory
+    and is compatible with the problem dimensions.
 
-    Feasible configs (bf16):
-      BM=128 BN=128 BK=64 stages=4 → 160 KB ✓
-      BM=128 BN=128 BK=64 stages=3 → 128 KB ✓
-      BM=64  BN=128 BK=64 stages=4 → 112 KB ✓
-      BM=64  BN=128 BK=64 stages=3 →  88 KB ✓
+    Selection criteria (in priority order):
+    1. Shared memory ≤ 228 KB
+    2. BN ≤ I (no point having BN > output dimension)
+    3. Prefer larger BM×BN (more compute per CTA)
+    4. Among equal tile sizes, prefer more stages
     """
     avg_tokens_per_expert = max(1, total_tokens // E)
 
-    # block_M: match token density
-    if avg_tokens_per_expert <= 64:
-        block_M = 64
-    else:
-        block_M = 128
+    for bm, bn, bk, stages, threads in _V4_CANDIDATES:
+        # Check shared memory budget
+        if _smem_bytes(bm, bn, bk, stages) > _SMEM_LIMIT:
+            continue
+        # BN should not exceed I (wastes shared memory on padding)
+        if bn > I:
+            continue
+        # BM much larger than tokens_per_expert wastes compute on padding,
+        # but Triton-TMA proves BM=128 with tpe=64 can still win due to
+        # larger tile throughput. Only skip if extremely wasteful (BM > 4×tpe).
+        if bm > avg_tokens_per_expert * 4 and bm > 64:
+            continue
+        return bm, bn, bk, stages, threads
 
-    # block_N: always 128 (256 blows shared memory)
-    block_N = 128
-
-    # block_K: keep at 64 (128 blows shared memory with any reasonable BN)
-    block_K = 64
-
-    # Key v4 improvement: more stages (4) and more threads (256)
-    num_stages = 4
-    threads = 256
-
-    return block_M, block_N, block_K, num_stages, threads
+    # Ultimate fallback
+    return 64, 128, 64, 3, 128
 
 
 _kernel_cache_v4: Dict[Tuple, any] = {}
