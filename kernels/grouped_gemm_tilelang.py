@@ -424,6 +424,89 @@ def _get_v4_block_config(H, I, E, total_tokens):
 _kernel_cache_v4: Dict[Tuple, any] = {}
 
 
+# ============ V5: Persistent V4 (same tile config, multi-tile per CTA) ============
+
+@tilelang.jit(out_idx=[2])
+def _grouped_gemm_v5_kernel(
+    batch_sizes_list, K, N, sm_num,
+    block_M=128, block_N=128, block_K=64,
+    num_stages=3, threads=256, dtype=T.float16
+):
+    """
+    V5 persistent grouped GEMM kernel — v4 tile config + persistent scheduling.
+
+    Differences from v3 (previous persistent attempt):
+    - Uses v4's larger tile config (BM=128, BN=256, etc.)
+    - NO tile_order indirection — simple linear tile_id → (bx, by) mapping
+    - Same O(1) tile_expert_ids lookup, swizzled layout, TMA store
+
+    Differences from v4:
+    - Grid = sm_num (persistent), not total_m_blocks × n_blocks
+    - Each CTA processes multiple tiles via T.serial(waves)
+    """
+    batch_sum = sum(batch_sizes_list)
+    batch_count = len(batch_sizes_list)
+    batch_padded_sum = sum(
+        ((s + block_M - 1) // block_M) * block_M for s in batch_sizes_list
+    )
+    accum_dtype = T.float32
+
+    n_blocks = (N + block_N - 1) // block_N
+    total_m_blocks = sum(
+        (size + block_M - 1) // block_M for size in batch_sizes_list
+    )
+    total_tiles = total_m_blocks * n_blocks
+    waves = (total_tiles + sm_num - 1) // sm_num
+
+    @T.prim_func
+    def kernel(
+        A: T.Tensor([batch_sum, K], dtype),
+        B: T.Tensor([batch_count, K, N], dtype),
+        C_padded: T.Tensor([batch_padded_sum, N], dtype),
+        batch_offsets: T.Tensor([batch_count], T.int32),
+        batch_padded_offsets: T.Tensor([batch_count], T.int32),
+        tile_expert_ids: T.Tensor([total_m_blocks], T.int32),
+    ):
+        with T.Kernel(sm_num, threads=threads) as (block_id):
+            A_shared = T.alloc_shared([block_M, block_K], dtype)
+            B_shared = T.alloc_shared([block_K, block_N], dtype)
+            C_local = T.alloc_fragment([block_M, block_N], accum_dtype)
+            C_shared = T.alloc_shared([block_M, block_N], dtype)
+
+            T.annotate_layout({
+                A_shared: tilelang.layout.make_swizzled_layout(A_shared),
+                B_shared: tilelang.layout.make_swizzled_layout(B_shared),
+            })
+
+            for w in T.serial(waves):
+                tile_id = sm_num * w + block_id
+
+                if tile_id < total_tiles:
+                    # Linear tile_id → (bx, by), no indirection table
+                    bx = tile_id // n_blocks
+                    by = tile_id % n_blocks
+
+                    cur_batch_idx = tile_expert_ids[bx]
+                    m_start_padded = bx * block_M
+                    m_start = (m_start_padded
+                               - batch_padded_offsets[cur_batch_idx]
+                               + batch_offsets[cur_batch_idx])
+
+                    T.clear(C_local)
+                    for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
+                        T.copy(A[m_start, k * block_K], A_shared)
+                        T.copy(B[cur_batch_idx, k * block_K, by * block_N], B_shared)
+                        T.gemm(A_shared, B_shared, C_local)
+
+                    T.copy(C_local, C_shared)
+                    T.copy(C_shared, C_padded[m_start_padded, by * block_N])
+
+    return kernel
+
+
+_kernel_cache_v5: Dict[Tuple, any] = {}
+
+
 def _build_expert_grouped_tile_order(batch_sizes_list, block_M, n_blocks):
     """
     Build tile ordering that groups tiles by expert for L2 cache locality.
