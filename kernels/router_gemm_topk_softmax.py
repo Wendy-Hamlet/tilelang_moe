@@ -23,13 +23,13 @@ import tilelang.language as T
 
 # TileLang pass configs to disable features that conflict with manual thread control
 _pass_configs = {
-    "tl::TL_DISABLE_WARP_SPECIALIZED": True,
+    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
 }
 
 _bitonic_pass_configs = {
-    "tl::TL_DISABLE_THREAD_STORAGE_SYNC": True,
-    "tl::TL_DISABLE_TMA_LOWER": True,
-    "tl::TL_DISABLE_WARP_SPECIALIZED": True,
+    tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
+    tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
 }
 
 
@@ -203,7 +203,7 @@ def fused_router_selection_kernel(
 # Bitonic Sort v1 Fused Kernel
 # ============================================================================
 
-@tilelang.jit(out_idx=[1, 2], pass_configs=_bitonic_pass_configs)
+@tilelang.jit(out_idx=[1, 2], pass_configs=_pass_configs)
 def fused_router_bitonic_kernel(
     num_tokens, H, E, top_k,
     block_M=64, block_K=64, num_stages=2, threads=256,
@@ -333,7 +333,7 @@ def _bitonic_v3_thread_config(E, top_k):
     return N_padded, K_padded, threads_per_row, elems_per_thread
 
 
-@tilelang.jit(out_idx=[1, 2], pass_configs=_bitonic_pass_configs)
+@tilelang.jit(out_idx=[1, 2], pass_configs=_pass_configs)
 def fused_router_bitonic_v3_kernel(
     num_tokens, H, E, top_k,
     block_M=64, block_K=64, num_stages=2, threads=256,
