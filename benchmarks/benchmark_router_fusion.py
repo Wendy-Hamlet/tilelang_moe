@@ -89,7 +89,7 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
     fused_kernels = {}
     tl_gemm_kernel = None
     if HAS_FUSED:
-        for algo in ["selection", "bitonic", "bitonic_v3"]:
+        for algo in ["selection", "bitonic"]:
             try:
                 fused_kernels[algo] = get_fused_router_kernel(
                     algo, num_tokens, H, E, K, dtype=T.bfloat16)
@@ -143,7 +143,6 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
     algo_names = {
         "selection": "Fused-Sel",
         "bitonic": "Fused-Bit",
-        "bitonic_v3": "Fused-BV3",
     }
     for algo, label in algo_names.items():
         if algo in fused_kernels:
@@ -218,7 +217,7 @@ def main():
     print("SUMMARY: Latency (ms) and Speedup vs PyTorch separate")
     print("=" * 100)
 
-    version_keys = ['PyTorch', 'TL-sep', 'Fused-Sel', 'Fused-Bit', 'Fused-BV3']
+    version_keys = ['PyTorch', 'TL-sep', 'Fused-Sel', 'Fused-Bit']
     version_keys = [v for v in version_keys if any(v in r for r in all_rows)]
 
     headers = ["Model", "T"] + \
