@@ -21,8 +21,13 @@ import tilelang
 import tilelang.language as T
 
 
-# Let TileLang auto-optimize — no manual pass_configs overrides
-_pass_configs = {}
+# Disable warp specialization (epilogue uses T.sync_threads / T.get_thread_binding)
+# AND disable TMA lowering (T.Pipelined falls back to cp.async, no mbarrier needed).
+# The GEMM uses cp.async pipeline instead of TMA — slightly slower but compatible.
+_pass_configs = {
+    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+}
 
 _bitonic_pass_configs = {
     tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
