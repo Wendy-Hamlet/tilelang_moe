@@ -21,10 +21,8 @@ import tilelang
 import tilelang.language as T
 
 
-# TileLang pass configs to disable features that conflict with manual thread control
-_pass_configs = {
-    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-}
+# Let TileLang auto-optimize — no manual pass_configs overrides
+_pass_configs = {}
 
 _bitonic_pass_configs = {
     tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
