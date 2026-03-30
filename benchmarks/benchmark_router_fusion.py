@@ -53,7 +53,7 @@ except ImportError:
     HAS_TL_TOPK = False
 
 try:
-    from kernels.router_gemm_topk_softmax import get_fused_router_kernel
+    from kernels.router_gemm_topk_softmax import get_fused_router_kernel, get_router_gemm_kernel
     import tilelang.language as T
     HAS_FUSED = True
 except ImportError:
@@ -87,6 +87,7 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
 
     # Pre-compile fused kernels
     fused_kernels = {}
+    tl_gemm_kernel = None
     if HAS_FUSED:
         for algo in ["selection", "bitonic", "bitonic_v3"]:
             try:
@@ -94,6 +95,11 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
                     algo, num_tokens, H, E, K, dtype=T.bfloat16)
             except Exception as e:
                 print(f"\n[Fused-{algo} compile error] {e}")
+        # Compile standalone TileLang GEMM (same structure as fused, minus epilogue)
+        try:
+            tl_gemm_kernel = get_router_gemm_kernel(num_tokens, H, E, dtype=T.bfloat16)
+        except Exception as e:
+            print(f"\n[TL-GEMM compile error] {e}")
 
     # Pre-compile TileLang topk (warmup call)
     if HAS_TL_TOPK:
@@ -118,10 +124,12 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
 
     results['PyTorch'] = bench_fn(pytorch_sep, warmup=warmup, rep=rep)
 
-    # --- BL-TileLang: torch.mm + topk_softmax_best ---
-    if HAS_TL_TOPK:
+    # --- BL-TileLang: TileLang GEMM + topk_softmax_best ---
+    # Uses the same GEMM tile structure as fused kernels, so the only
+    # difference vs fused is the epilogue (global store + separate topk).
+    if HAS_TL_TOPK and tl_gemm_kernel is not None:
         def tilelang_sep():
-            logits = torch.mm(X_bf16, W_bf16).float()
+            logits = tl_gemm_kernel(X_bf16, W_bf16)
             return topk_softmax_best(logits, K)
 
         try:

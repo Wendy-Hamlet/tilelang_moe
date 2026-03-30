@@ -34,6 +34,73 @@ _bitonic_pass_configs = {
 
 
 # ============================================================================
+# Standalone Router GEMM (same structure as fused, writes logits to global)
+# Used as the GEMM half of the TileLang-separate baseline.
+# ============================================================================
+
+@tilelang.jit(out_idx=[1], pass_configs=_pass_configs)
+def router_gemm_kernel(
+    num_tokens, H, E,
+    block_M=64, block_K=64, num_stages=2, threads=256,
+    dtype=T.bfloat16,
+):
+    """
+    Standalone router GEMM: X(T,H) @ W(H,E) → logits(T,E).
+
+    Same tile structure as the fused kernel (1D grid, BN=E) so the only
+    difference in the TL-sep baseline vs fused is the epilogue.
+    """
+    num_m_blocks = (num_tokens + block_M - 1) // block_M
+    accum_dtype = T.float32
+
+    @T.prim_func
+    def kernel(
+        X: T.Tensor([num_tokens, H], dtype),
+        logits: T.Tensor([num_tokens, E], accum_dtype),
+        W: T.Tensor([H, E], dtype),
+    ):
+        with T.Kernel(num_m_blocks, threads=threads) as (bx):
+            A_shared = T.alloc_shared([block_M, block_K], dtype)
+            B_shared = T.alloc_shared([block_K, E], dtype)
+            C_local = T.alloc_fragment([block_M, E], accum_dtype)
+            C_shared = T.alloc_shared([block_M, E], accum_dtype)
+
+            T.annotate_layout({
+                A_shared: tilelang.layout.make_swizzled_layout(A_shared),
+                B_shared: tilelang.layout.make_swizzled_layout(B_shared),
+            })
+
+            m_start = bx * block_M
+
+            T.clear(C_local)
+            for k in T.Pipelined(T.ceildiv(H, block_K), num_stages=num_stages):
+                T.copy(X[m_start, k * block_K], A_shared)
+                T.copy(W[k * block_K, 0], B_shared)
+                T.gemm(A_shared, B_shared, C_local)
+
+            # Store logits to global memory (the cost fused kernel avoids)
+            T.copy(C_local, C_shared)
+            T.copy(C_shared, logits[m_start, 0])
+
+    return kernel
+
+
+_gemm_cache: Dict[str, any] = {}
+
+
+def get_router_gemm_kernel(num_tokens, H, E, dtype=T.bfloat16):
+    """Get or compile the standalone router GEMM kernel."""
+    cache_key = f"gemm_{num_tokens}_{H}_{E}"
+    if cache_key in _gemm_cache:
+        return _gemm_cache[cache_key]
+    kernel = router_gemm_kernel(
+        num_tokens, H, E,
+        block_M=64, block_K=64, num_stages=2, threads=256, dtype=dtype)
+    _gemm_cache[cache_key] = kernel
+    return kernel
+
+
+# ============================================================================
 # Selection Sort Fused Kernel
 # ============================================================================
 
