@@ -297,7 +297,7 @@ def fused_router_selection_kernel(
 # Bitonic Sort v1 Fused Kernel
 # ============================================================================
 
-@tilelang.jit(out_idx=[1, 2], pass_configs=_pass_configs)
+@tilelang.jit(out_idx=[1, 2], pass_configs=_bitonic_pass_configs)
 def fused_router_bitonic_kernel(
     num_tokens, H, E, top_k,
     block_M=64, block_K=64, num_stages=2, threads=256,
@@ -365,9 +365,9 @@ def fused_router_bitonic_kernel(
                     T.sync_threads()
 
                     # Bitonic sort (descending)
-                    # Fully unrolled at Python/TIR-construction time to avoid
-                    # TileLang codegen issues with T.serial loops + sync_threads.
-                    # All sort parameters (_bs, _hb, _ash) are Python constants.
+                    # Uses _bitonic_pass_configs (TL_DISABLE_THREAD_STORAGE_SYNC)
+                    # to prevent TileLang from inserting __syncthreads() inside
+                    # divergent swap branches, which would cause GPU deadlock.
                     for _i1 in range(num_iters):
                         for _i2 in range(_i1 + 1):
                             _bs = 1 << (_i1 - _i2 + 1)
