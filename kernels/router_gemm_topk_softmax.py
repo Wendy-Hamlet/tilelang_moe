@@ -365,40 +365,38 @@ def fused_router_bitonic_kernel(
                     T.sync_threads()
 
                     # Bitonic sort (descending)
-                    # NOTE: inner loop uses fixed bound (num_iters) + guard
-                    # instead of T.serial(i1+1), because variable-bound
-                    # T.serial with T.sync_threads inside causes GPU deadlock
-                    # in TileLang codegen.
-                    for i1 in T.serial(num_iters):
-                        for i2 in T.serial(num_iters):
-                            if i2 <= i1:
-                                if tx < N_padded:
-                                    block_size_sort = 1 << (i1 - i2 + 1)
-                                    half_block = block_size_sort >> 1
-                                    group = tx // block_size_sort
-                                    pos_in_block = tx % block_size_sort
+                    # Fully unrolled at Python/TIR-construction time to avoid
+                    # TileLang codegen issues with T.serial loops + sync_threads.
+                    # All sort parameters (_bs, _hb, _ash) are Python constants.
+                    for _i1 in range(num_iters):
+                        for _i2 in range(_i1 + 1):
+                            _bs = 1 << (_i1 - _i2 + 1)
+                            _hb = _bs >> 1
+                            _ash = _i1 + 1
+                            if tx < N_padded:
+                                group = tx // _bs
+                                pos_in_block = tx % _bs
 
-                                    if pos_in_block < half_block:
-                                        j = group * block_size_sort + (block_size_sort - 1 - pos_in_block)
-                                        # Descending: swap if s_vals[tx] < s_vals[j]
-                                        ascending = (tx >> (i1 + 1)) & 1
-                                        if ascending == 1:
-                                            if s_vals[tx] > s_vals[j]:
-                                                tmp_v = s_vals[tx]
-                                                s_vals[tx] = s_vals[j]
-                                                s_vals[j] = tmp_v
-                                                tmp_i = s_idx[tx]
-                                                s_idx[tx] = s_idx[j]
-                                                s_idx[j] = tmp_i
-                                        else:
-                                            if s_vals[tx] < s_vals[j]:
-                                                tmp_v = s_vals[tx]
-                                                s_vals[tx] = s_vals[j]
-                                                s_vals[j] = tmp_v
-                                                tmp_i = s_idx[tx]
-                                                s_idx[tx] = s_idx[j]
-                                                s_idx[j] = tmp_i
-                                T.sync_threads()
+                                if pos_in_block < _hb:
+                                    j = group * _bs + (_bs - 1 - pos_in_block)
+                                    ascending = (tx >> _ash) & 1
+                                    if ascending == 1:
+                                        if s_vals[tx] > s_vals[j]:
+                                            tmp_v = s_vals[tx]
+                                            s_vals[tx] = s_vals[j]
+                                            s_vals[j] = tmp_v
+                                            tmp_i = s_idx[tx]
+                                            s_idx[tx] = s_idx[j]
+                                            s_idx[j] = tmp_i
+                                    else:
+                                        if s_vals[tx] < s_vals[j]:
+                                            tmp_v = s_vals[tx]
+                                            s_vals[tx] = s_vals[j]
+                                            s_vals[j] = tmp_v
+                                            tmp_i = s_idx[tx]
+                                            s_idx[tx] = s_idx[j]
+                                            s_idx[j] = tmp_i
+                            T.sync_threads()
 
                     # Softmax over top-K (sorted descending, top-K are s_vals[0..K-1])
                     if tx < top_k:
