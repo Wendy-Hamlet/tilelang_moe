@@ -82,8 +82,14 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
     X_bf16 = torch.randn(num_tokens, H, device=device, dtype=torch.bfloat16)
     W_bf16 = torch.randn(H, E, device=device, dtype=torch.bfloat16)
 
-    # Pre-allocate outputs for PyTorch baseline
-    logits_buf = torch.empty(num_tokens, E, device=device, dtype=torch.float32)
+    # Pre-pad W for non-power-of-2 E (done ONCE, outside timing loop)
+    import math
+    E_padded = 1 << math.ceil(math.log2(max(E, 2)))
+    if E != E_padded:
+        W_padded = torch.zeros(H, E_padded, device=device, dtype=torch.bfloat16)
+        W_padded[:, :E] = W_bf16
+    else:
+        W_padded = W_bf16
 
     # Pre-compile fused kernels
     fused_kernels = {}
@@ -118,8 +124,32 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
     results = {}
 
     # ==========================================
-    # Pure kernel benchmark
+    # Pure kernel benchmark (NO wrapper overhead in timing)
     # ==========================================
+
+    # --- GEMM-only: torch.mm vs TileLang GEMM ---
+    print(f"    [torch.mm] timing...", end=" ", flush=True)
+    results['torch.mm'] = bench_fn(
+        lambda: torch.mm(X_bf16, W_bf16), warmup=warmup, rep=rep)
+    print(f"{results['torch.mm']:.4f}ms", flush=True)
+
+    if tl_gemm_kernel is not None:
+        # Call the raw compiled kernel with pre-padded W (no wrapper overhead)
+        from kernels.router_gemm_topk_softmax import _next_pow2, router_gemm_kernel
+        _Ep = _next_pow2(E)
+        try:
+            raw_gemm = router_gemm_kernel(
+                num_tokens, H, _Ep,
+                block_M=64, block_K=64, num_stages=2, threads=256,
+                dtype=T.bfloat16)
+            raw_gemm(X_bf16, W_padded)  # verify
+            torch.cuda.synchronize()
+            print(f"    [TL-GEMM] timing...", end=" ", flush=True)
+            results['TL-GEMM'] = bench_fn(
+                lambda: raw_gemm(X_bf16, W_padded), warmup=warmup, rep=rep)
+            print(f"{results['TL-GEMM']:.4f}ms", flush=True)
+        except Exception as e:
+            print(f"    [TL-GEMM] FAIL: {e}", flush=True)
 
     # --- BL-PyTorch: torch.mm + torch.topk + torch.softmax ---
     def pytorch_sep():
@@ -136,8 +166,6 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
     print(f"{results['PyTorch']:.4f}ms", flush=True)
 
     # --- BL-TileLang: TileLang GEMM + topk_softmax_best ---
-    # Uses the same GEMM tile structure as fused kernels, so the only
-    # difference vs fused is the epilogue (global store + separate topk).
     if HAS_TL_TOPK and tl_gemm_kernel is not None:
         def tilelang_sep():
             logits = tl_gemm_kernel(X_bf16, W_bf16)
@@ -154,7 +182,7 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
             print(f"FAIL: {e}", flush=True)
             results['TL-sep'] = float('inf')
 
-    # --- Fused variants ---
+    # --- Fused variants: call raw kernel with pre-padded W ---
     algo_names = {
         "selection": "Fused-Sel",
         "bitonic": "Fused-Bit",
@@ -164,11 +192,11 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
             kern = fused_kernels[algo]
             try:
                 print(f"    [{label}] verify...", end=" ", flush=True)
-                kern(X_bf16, W_bf16)
+                kern(X_bf16, W_padded)
                 torch.cuda.synchronize()
                 print("OK, timing...", end=" ", flush=True)
                 results[label] = bench_fn(
-                    lambda k=kern: k(X_bf16, W_bf16),
+                    lambda k=kern: k(X_bf16, W_padded),
                     warmup=warmup, rep=rep)
                 print(f"{results[label]:.4f}ms", flush=True)
             except Exception as e:

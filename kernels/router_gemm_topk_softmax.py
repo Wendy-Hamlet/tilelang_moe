@@ -30,18 +30,14 @@ def _next_pow2(n):
     return 1 << math.ceil(math.log2(max(n, 2)))
 
 
-# Disable warp specialization (epilogue uses T.sync_threads / T.get_thread_binding)
-# AND disable TMA lowering (T.Pipelined falls back to cp.async, no mbarrier needed).
-# The GEMM uses cp.async pipeline instead of TMA -- slightly slower but compatible.
-_pass_configs = {
+# Fused epilogue pass configs: disable warp specialization (epilogue uses
+# T.sync_threads / T.get_thread_binding) and auto thread-storage sync
+# (prevents TileLang from inserting __syncthreads in divergent branches).
+# TMA is left ENABLED -- it only affects global->shared copy lowering in
+# the GEMM pipeline, not the epilogue.
+_fused_pass_configs = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-    tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-}
-
-_bitonic_pass_configs = {
     tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
-    tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
 }
 
 
@@ -50,7 +46,7 @@ _bitonic_pass_configs = {
 # Used as the GEMM half of the TileLang-separate baseline.
 # ============================================================================
 
-@tilelang.jit(out_idx=[1], pass_configs=_pass_configs)
+@tilelang.jit(out_idx=[1])
 def router_gemm_kernel(
     num_tokens, H, E_padded,
     block_M=64, block_K=64, num_stages=2, threads=256,
@@ -130,7 +126,7 @@ def get_router_gemm_kernel(num_tokens, H, E, dtype=T.bfloat16):
 # Selection Sort Fused Kernel
 # ============================================================================
 
-@tilelang.jit(out_idx=[1, 2], pass_configs=_pass_configs)
+@tilelang.jit(out_idx=[1, 2], pass_configs=_fused_pass_configs)
 def fused_router_selection_kernel(
     num_tokens, H, E, E_padded, top_k,
     block_M=64, block_K=64, num_stages=2, threads=256,
@@ -297,7 +293,7 @@ def fused_router_selection_kernel(
 # Bitonic Sort v1 Fused Kernel
 # ============================================================================
 
-@tilelang.jit(out_idx=[1, 2], pass_configs=_bitonic_pass_configs)
+@tilelang.jit(out_idx=[1, 2], pass_configs=_fused_pass_configs)
 def fused_router_bitonic_kernel(
     num_tokens, H, E, top_k,
     block_M=64, block_K=64, num_stages=2, threads=256,
@@ -430,7 +426,7 @@ def _bitonic_v3_thread_config(E, top_k):
     return N_padded, K_padded, threads_per_row, elems_per_thread
 
 
-@tilelang.jit(out_idx=[1, 2], pass_configs=_pass_configs)
+@tilelang.jit(out_idx=[1, 2], pass_configs=_fused_pass_configs)
 def fused_router_bitonic_v3_kernel(
     num_tokens, H, E, top_k,
     block_M=64, block_K=64, num_stages=2, threads=256,
