@@ -70,7 +70,6 @@ def router_gemm_kernel(
 
             T.annotate_layout({
                 A_shared: tilelang.layout.make_swizzled_layout(A_shared),
-                B_shared: tilelang.layout.make_swizzled_layout(B_shared),
             })
 
             m_start = bx * block_M
@@ -148,7 +147,6 @@ def fused_router_selection_kernel(
 
             T.annotate_layout({
                 A_shared: tilelang.layout.make_swizzled_layout(A_shared),
-                B_shared: tilelang.layout.make_swizzled_layout(B_shared),
             })
 
             m_start = bx * block_M
@@ -311,7 +309,6 @@ def fused_router_bitonic_kernel(
 
             T.annotate_layout({
                 A_shared: tilelang.layout.make_swizzled_layout(A_shared),
-                B_shared: tilelang.layout.make_swizzled_layout(B_shared),
             })
 
             m_start = bx * block_M
@@ -438,7 +435,6 @@ def fused_router_bitonic_v3_kernel(
 
             T.annotate_layout({
                 A_shared: tilelang.layout.make_swizzled_layout(A_shared),
-                B_shared: tilelang.layout.make_swizzled_layout(B_shared),
             })
 
             m_start = bx * block_M

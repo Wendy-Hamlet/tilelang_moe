@@ -91,23 +91,29 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
     if HAS_FUSED:
         for algo in ["selection", "bitonic"]:
             try:
+                print(f"    Compiling fused-{algo} T={num_tokens} E={E}...", end=" ", flush=True)
                 fused_kernels[algo] = get_fused_router_kernel(
                     algo, num_tokens, H, E, K, dtype=T.bfloat16)
+                print("OK", flush=True)
             except Exception as e:
-                print(f"\n[Fused-{algo} compile error] {e}")
+                print(f"FAIL: {e}", flush=True)
         # Compile standalone TileLang GEMM (same structure as fused, minus epilogue)
         try:
+            print(f"    Compiling TL-GEMM T={num_tokens} E={E}...", end=" ", flush=True)
             tl_gemm_kernel = get_router_gemm_kernel(num_tokens, H, E, dtype=T.bfloat16)
+            print("OK", flush=True)
         except Exception as e:
-            print(f"\n[TL-GEMM compile error] {e}")
+            print(f"FAIL: {e}", flush=True)
 
     # Pre-compile TileLang topk (warmup call)
     if HAS_TL_TOPK:
         try:
+            print(f"    Compiling TL-topk T={num_tokens} E={E}...", end=" ", flush=True)
             test_logits = torch.randn(num_tokens, E, device=device, dtype=torch.float32)
             topk_softmax_best(test_logits, K)
-        except Exception:
-            pass
+            print("OK", flush=True)
+        except Exception as e:
+            print(f"FAIL: {e}", flush=True)
 
     results = {}
 
