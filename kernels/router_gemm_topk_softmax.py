@@ -5,25 +5,34 @@ Fuses the MoE router linear projection (GEMM) with TopK+Softmax into a single
 kernel, eliminating the intermediate logits (T,E) global memory round-trip.
 
 Pipeline:
-  Separate: X(T,H) @ W(H,E) → [global] logits(T,E) → [global] (scores,indices)(T,K)
-  Fused:    X(T,H) @ W(H,E) → [shared] logits(BM,E) → [global] (scores,indices)(T,K)
+  Separate: X(T,H) @ W(H,E) -> [global] logits(T,E) -> [global] (scores,indices)(T,K)
+  Fused:    X(T,H) @ W(H,E) -> [shared] logits(BM,E) -> [global] (scores,indices)(T,K)
 
 Three TopK epilogue variants:
   1. Selection sort: O(K*E) parallel max-reduction, simplest
-  2. Bitonic v1: O(E*log²E) parallel bitonic sort, full sort then extract
+  2. Bitonic v1: O(E*log^2 E) parallel bitonic sort, full sort then extract
   3. Bitonic v3: register-based partial sort + warp shuffle merge
+
+NOTE: All internal GEMM buffers are padded to E_padded (next power of 2) because
+TileLang's T.gemm and make_swizzled_layout require power-of-2 N dimension.
+The wrapper pads W and (for standalone GEMM) truncates the output.
 """
 
 import math
 from typing import Dict, Tuple
 
+import torch
 import tilelang
 import tilelang.language as T
 
 
+def _next_pow2(n):
+    return 1 << math.ceil(math.log2(max(n, 2)))
+
+
 # Disable warp specialization (epilogue uses T.sync_threads / T.get_thread_binding)
 # AND disable TMA lowering (T.Pipelined falls back to cp.async, no mbarrier needed).
-# The GEMM uses cp.async pipeline instead of TMA — slightly slower but compatible.
+# The GEMM uses cp.async pipeline instead of TMA -- slightly slower but compatible.
 _pass_configs = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
@@ -43,15 +52,16 @@ _bitonic_pass_configs = {
 
 @tilelang.jit(out_idx=[1], pass_configs=_pass_configs)
 def router_gemm_kernel(
-    num_tokens, H, E,
+    num_tokens, H, E_padded,
     block_M=64, block_K=64, num_stages=2, threads=256,
     dtype=T.bfloat16,
 ):
     """
-    Standalone router GEMM: X(T,H) @ W(H,E) → logits(T,E).
+    Standalone router GEMM: X(T,H) @ W(H,E_padded) -> logits(T,E_padded).
 
-    Same tile structure as the fused kernel (1D grid, BN=E) so the only
+    Same tile structure as the fused kernel (1D grid, BN=E_padded) so the only
     difference in the TL-sep baseline vs fused is the epilogue.
+    W must be zero-padded from E to E_padded by the caller.
     """
     num_m_blocks = (num_tokens + block_M - 1) // block_M
     accum_dtype = T.float32
@@ -59,17 +69,18 @@ def router_gemm_kernel(
     @T.prim_func
     def kernel(
         X: T.Tensor([num_tokens, H], dtype),
-        logits: T.Tensor([num_tokens, E], accum_dtype),
-        W: T.Tensor([H, E], dtype),
+        logits: T.Tensor([num_tokens, E_padded], accum_dtype),
+        W: T.Tensor([H, E_padded], dtype),
     ):
         with T.Kernel(num_m_blocks, threads=threads) as (bx):
             A_shared = T.alloc_shared([block_M, block_K], dtype)
-            B_shared = T.alloc_shared([block_K, E], dtype)
-            C_local = T.alloc_fragment([block_M, E], accum_dtype)
-            C_shared = T.alloc_shared([block_M, E], accum_dtype)
+            B_shared = T.alloc_shared([block_K, E_padded], dtype)
+            C_local = T.alloc_fragment([block_M, E_padded], accum_dtype)
+            C_shared = T.alloc_shared([block_M, E_padded], accum_dtype)
 
             T.annotate_layout({
                 A_shared: tilelang.layout.make_swizzled_layout(A_shared),
+                B_shared: tilelang.layout.make_swizzled_layout(B_shared),
             })
 
             m_start = bx * block_M
@@ -91,15 +102,28 @@ _gemm_cache: Dict[str, any] = {}
 
 
 def get_router_gemm_kernel(num_tokens, H, E, dtype=T.bfloat16):
-    """Get or compile the standalone router GEMM kernel."""
+    """Get or compile the standalone router GEMM kernel.
+
+    Returns a callable that takes (X, W) with W shape [H, E] and returns
+    logits of shape [num_tokens, E].  Internally pads to E_padded.
+    """
+    E_padded = _next_pow2(E)
     cache_key = f"gemm_{num_tokens}_{H}_{E}"
     if cache_key in _gemm_cache:
         return _gemm_cache[cache_key]
     kernel = router_gemm_kernel(
-        num_tokens, H, E,
+        num_tokens, H, E_padded,
         block_M=64, block_K=64, num_stages=2, threads=256, dtype=dtype)
-    _gemm_cache[cache_key] = kernel
-    return kernel
+    if E == E_padded:
+        _gemm_cache[cache_key] = kernel
+    else:
+        def padded_wrapper(X, W):
+            W_p = torch.zeros(H, E_padded, device=W.device, dtype=W.dtype)
+            W_p[:, :E] = W
+            logits_p = kernel(X, W_p)
+            return logits_p[:, :E].contiguous()
+        _gemm_cache[cache_key] = padded_wrapper
+    return _gemm_cache[cache_key]
 
 
 # ============================================================================
@@ -108,15 +132,15 @@ def get_router_gemm_kernel(num_tokens, H, E, dtype=T.bfloat16):
 
 @tilelang.jit(out_idx=[1, 2], pass_configs=_pass_configs)
 def fused_router_selection_kernel(
-    num_tokens, H, E, top_k,
+    num_tokens, H, E, E_padded, top_k,
     block_M=64, block_K=64, num_stages=2, threads=256,
     dtype=T.bfloat16,
 ):
     """
     Fused Router GEMM + Selection-Sort TopK + Softmax.
 
-    GEMM: X(num_tokens, H) @ W(H, E) → logits(BM, E) in shared memory
-    Epilogue: selection sort topk + softmax on shared memory logits
+    GEMM: X(num_tokens, H) @ W(H, E_padded) -> logits(BM, E_padded) in shared memory
+    Epilogue: selection sort topk + softmax on the first E columns
 
     Grid: 1D over M-blocks. Each CTA computes BM full logits rows,
     then does topk+softmax epilogue before writing (scores, indices).
@@ -130,14 +154,14 @@ def fused_router_selection_kernel(
         X: T.Tensor([num_tokens, H], dtype),
         scores: T.Tensor([num_tokens, top_k], T.float32),
         indices: T.Tensor([num_tokens, top_k], T.int32),
-        W: T.Tensor([H, E], dtype),
+        W: T.Tensor([H, E_padded], dtype),
     ):
         with T.Kernel(num_m_blocks, threads=threads) as (bx):
             # --- Shared memory allocations ---
             A_shared = T.alloc_shared([block_M, block_K], dtype)
-            B_shared = T.alloc_shared([block_K, E], dtype)
-            C_local = T.alloc_fragment([block_M, E], accum_dtype)
-            C_shared = T.alloc_shared([block_M, E], accum_dtype)
+            B_shared = T.alloc_shared([block_K, E_padded], dtype)
+            C_local = T.alloc_fragment([block_M, E_padded], accum_dtype)
+            C_shared = T.alloc_shared([block_M, E_padded], accum_dtype)
 
             # TopK workspace (reuses shared memory after GEMM pipeline is done)
             s_topk_vals = T.alloc_shared([top_k], T.float32)
@@ -147,6 +171,7 @@ def fused_router_selection_kernel(
 
             T.annotate_layout({
                 A_shared: tilelang.layout.make_swizzled_layout(A_shared),
+                B_shared: tilelang.layout.make_swizzled_layout(B_shared),
             })
 
             m_start = bx * block_M
@@ -164,6 +189,7 @@ def fused_router_selection_kernel(
 
             # ======== TopK + Softmax Epilogue ========
             # Process each row (token) sequentially; all threads cooperate per row
+            # NOTE: epilogue uses E (original), not E_padded -- padded columns are zero
             for row in T.serial(block_M):
                 token_idx = m_start + row
                 if token_idx < num_tokens:
@@ -281,11 +307,11 @@ def fused_router_bitonic_kernel(
     Fused Router GEMM + Bitonic-Sort TopK + Softmax.
 
     After GEMM, uses parallel bitonic sort on shared memory logits.
-    Requires threads >= E_padded for the sort phase.
+    Requires threads >= N_padded for the sort phase.
     """
     num_m_blocks = (num_tokens + block_M - 1) // block_M
     accum_dtype = T.float32
-    N_padded = 1 << math.ceil(math.log2(max(E, 2)))
+    N_padded = _next_pow2(E)  # also serves as E_padded for GEMM buffers
     num_iters = int(math.log2(N_padded))
 
     @T.prim_func
@@ -293,13 +319,13 @@ def fused_router_bitonic_kernel(
         X: T.Tensor([num_tokens, H], dtype),
         scores: T.Tensor([num_tokens, top_k], T.float32),
         indices: T.Tensor([num_tokens, top_k], T.int32),
-        W: T.Tensor([H, E], dtype),
+        W: T.Tensor([H, N_padded], dtype),
     ):
         with T.Kernel(num_m_blocks, threads=threads) as (bx):
             A_shared = T.alloc_shared([block_M, block_K], dtype)
-            B_shared = T.alloc_shared([block_K, E], dtype)
-            C_local = T.alloc_fragment([block_M, E], accum_dtype)
-            C_shared = T.alloc_shared([block_M, E], accum_dtype)
+            B_shared = T.alloc_shared([block_K, N_padded], dtype)
+            C_local = T.alloc_fragment([block_M, N_padded], accum_dtype)
+            C_shared = T.alloc_shared([block_M, N_padded], accum_dtype)
 
             # Bitonic sort workspace
             s_vals = T.alloc_shared([N_padded], T.float32)
@@ -309,6 +335,7 @@ def fused_router_bitonic_kernel(
 
             T.annotate_layout({
                 A_shared: tilelang.layout.make_swizzled_layout(A_shared),
+                B_shared: tilelang.layout.make_swizzled_layout(B_shared),
             })
 
             m_start = bx * block_M
@@ -327,7 +354,7 @@ def fused_router_bitonic_kernel(
             for row in T.serial(block_M):
                 token_idx = m_start + row
                 if token_idx < num_tokens:
-                    # Load logits into sort buffer
+                    # Load logits into sort buffer (E valid + padding = -inf)
                     if tx < N_padded:
                         if tx < E:
                             s_vals[tx] = C_shared[row, tx]
@@ -393,8 +420,8 @@ def fused_router_bitonic_kernel(
 
 def _bitonic_v3_thread_config(E, top_k):
     """Compute thread layout for bitonic v3 epilogue."""
-    N_padded = 1 << math.ceil(math.log2(max(E, 2)))
-    K_padded = 1 << math.ceil(math.log2(max(top_k, 2)))
+    N_padded = _next_pow2(E)
+    K_padded = _next_pow2(top_k)
     threads_per_row = max(min(N_padded // top_k, 32, N_padded // 64), 1)
     elems_per_thread = N_padded // threads_per_row
     return N_padded, K_padded, threads_per_row, elems_per_thread
@@ -425,16 +452,17 @@ def fused_router_bitonic_v3_kernel(
         X: T.Tensor([num_tokens, H], dtype),
         scores: T.Tensor([num_tokens, top_k], T.float32),
         indices: T.Tensor([num_tokens, top_k], T.int32),
-        W: T.Tensor([H, E], dtype),
+        W: T.Tensor([H, N_padded], dtype),
     ):
         with T.Kernel(num_m_blocks, threads=threads) as (bx):
             A_shared = T.alloc_shared([block_M, block_K], dtype)
-            B_shared = T.alloc_shared([block_K, E], dtype)
-            C_local = T.alloc_fragment([block_M, E], accum_dtype)
-            C_shared = T.alloc_shared([block_M, E], accum_dtype)
+            B_shared = T.alloc_shared([block_K, N_padded], dtype)
+            C_local = T.alloc_fragment([block_M, N_padded], accum_dtype)
+            C_shared = T.alloc_shared([block_M, N_padded], accum_dtype)
 
             T.annotate_layout({
                 A_shared: tilelang.layout.make_swizzled_layout(A_shared),
+                B_shared: tilelang.layout.make_swizzled_layout(B_shared),
             })
 
             m_start = bx * block_M
@@ -584,13 +612,29 @@ def fused_router_bitonic_v3_kernel(
 
 
 # ============================================================================
-# Kernel Cache
+# Kernel Cache + Wrapper (handles W padding for non-power-of-2 E)
 # ============================================================================
 _fused_cache: Dict[str, any] = {}
 
 
+def _pad_W(W, E, E_padded):
+    """Pad W from [H, E] to [H, E_padded] with zeros."""
+    if E == E_padded:
+        return W
+    H = W.shape[0]
+    W_p = torch.zeros(H, E_padded, device=W.device, dtype=W.dtype)
+    W_p[:, :E] = W
+    return W_p
+
+
 def get_fused_router_kernel(algo, num_tokens, H, E, top_k, dtype=T.bfloat16):
-    """Get or compile a fused router kernel."""
+    """Get or compile a fused router kernel.
+
+    Returns a callable(X, W) where W is [H, E] (original, unpadded).
+    Padding to E_padded is handled internally.
+    """
+    E_padded = _next_pow2(E)
+
     # Adaptive block config
     block_M = 64
     block_K = 64
@@ -603,7 +647,7 @@ def get_fused_router_kernel(algo, num_tokens, H, E, top_k, dtype=T.bfloat16):
 
     if algo == "selection":
         kernel = fused_router_selection_kernel(
-            num_tokens, H, E, top_k,
+            num_tokens, H, E, E_padded, top_k,
             block_M=block_M, block_K=block_K,
             num_stages=num_stages, threads=threads, dtype=dtype)
     elif algo == "bitonic":
@@ -619,5 +663,11 @@ def get_fused_router_kernel(algo, num_tokens, H, E, top_k, dtype=T.bfloat16):
     else:
         raise ValueError(f"Unknown algorithm: {algo}")
 
-    _fused_cache[cache_key] = kernel
-    return kernel
+    if E == E_padded:
+        _fused_cache[cache_key] = kernel
+    else:
+        def padded_wrapper(X, W, _k=kernel, _E=E, _Ep=E_padded):
+            return _k(X, _pad_W(W, _E, _Ep))
+        _fused_cache[cache_key] = padded_wrapper
+
+    return _fused_cache[cache_key]
