@@ -23,6 +23,7 @@ import torch
 import tilelang.language as T
 from typing import Dict, List, Tuple
 from tabulate import tabulate
+from tilelang.profiler import do_bench
 
 torch.set_float32_matmul_precision('high')
 
@@ -40,22 +41,6 @@ except ImportError:
     HAS_V2 = False
 
 HAS_TORCH_GROUPED_MM = hasattr(torch, "_grouped_mm")
-
-
-# ============ Benchmark infra ============
-def bench_fn(fn, warmup=50, rep=500):
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    s = torch.cuda.Event(enable_timing=True)
-    e = torch.cuda.Event(enable_timing=True)
-    s.record()
-    for _ in range(rep):
-        fn()
-    e.record()
-    torch.cuda.synchronize()
-    return s.elapsed_time(e) / rep
-
 
 # ============ Real MoE model configs ============
 # (name, H, I, E_total, top_k)
@@ -181,13 +166,13 @@ def run_single_config(name, H, I, E_local, top_k, E_total, input_tokens,
                      out=Y_bf16[start:start+sz])
             start += sz
 
-    results['PyTorch'] = bench_fn(loop_fn, warmup=warmup, rep=rep)
+    results['PyTorch'] = do_bench(loop_fn, warmup=warmup, rep=rep)
 
     # --- torch._grouped_mm (CUTLASS, bf16) ---
     if HAS_TORCH_GROUPED_MM:
         try:
             torch._grouped_mm(X_sorted_bf16, W_bf16_HI, offs)  # verify/warmup
-            results['grouped_mm'] = bench_fn(
+            results['grouped_mm'] = do_bench(
                 lambda: torch._grouped_mm(X_sorted_bf16, W_bf16_HI, offs),
                 warmup=warmup, rep=rep)
         except Exception:
@@ -196,7 +181,7 @@ def run_single_config(name, H, I, E_local, top_k, E_total, input_tokens,
     # --- TileLang v1 (bf16) ---
     try:
         kernel_v1(X_sorted_bf16, W_bf16_HI, batch_sizes_t_v1, batch_offsets_t_v1, batch_padded_offsets_t_v1)
-        results['TL-v1'] = bench_fn(
+        results['TL-v1'] = do_bench(
             lambda: kernel_v1(X_sorted_bf16, W_bf16_HI, batch_sizes_t_v1, batch_offsets_t_v1, batch_padded_offsets_t_v1),
             warmup=warmup, rep=rep)
     except Exception as e:
@@ -207,7 +192,7 @@ def run_single_config(name, H, I, E_local, top_k, E_total, input_tokens,
     if HAS_V2:
         try:
             kernel_v2(X_sorted_bf16, W_bf16_HI, batch_offsets_t_v2, batch_padded_offsets_t_v2, tile_expert_ids_t_v2)
-            results['TL-v2'] = bench_fn(
+            results['TL-v2'] = do_bench(
                 lambda: kernel_v2(X_sorted_bf16, W_bf16_HI, batch_offsets_t_v2, batch_padded_offsets_t_v2, tile_expert_ids_t_v2),
                 warmup=warmup, rep=rep)
         except Exception as e:
@@ -221,7 +206,7 @@ def main():
     parser = argparse.ArgumentParser(description="Grouped GEMM Benchmark v2")
     parser.add_argument("--models", type=str, default=None)
     parser.add_argument("--input-tokens", type=str, default=None)
-    parser.add_argument("--warmup", type=int, default=20)
+    parser.add_argument("--warmup", type=int, default=25, help="Warmup time budget in ms")
     parser.add_argument("--rep", type=int, default=200)
     args = parser.parse_args()
 

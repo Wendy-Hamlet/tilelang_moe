@@ -28,21 +28,7 @@ sys.path.insert(0, str(project_root))
 
 import torch
 from tabulate import tabulate
-
-
-# ============ Benchmark timing ============
-def bench_fn(fn, warmup=50, rep=500):
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    s = torch.cuda.Event(enable_timing=True)
-    e = torch.cuda.Event(enable_timing=True)
-    s.record()
-    for _ in range(rep):
-        fn()
-    e.record()
-    torch.cuda.synchronize()
-    return s.elapsed_time(e) / rep
+from tilelang.profiler import do_bench
 
 
 # ============ Import TileLang kernels ============
@@ -146,7 +132,7 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
 
     # --- GEMM-only: torch.mm vs TileLang GEMM ---
     print(f"    [torch.mm] timing...", end=" ", flush=True)
-    results['torch.mm'] = bench_fn(
+    results['torch.mm'] = do_bench(
         lambda: torch.mm(X_bf16, W_bf16), warmup=warmup, rep=rep)
     print(f"{results['torch.mm']:.4f}ms", flush=True)
 
@@ -155,7 +141,7 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
             raw_gemm(X_bf16, W_padded)  # verify
             torch.cuda.synchronize()
             print(f"    [TL-GEMM] timing...", end=" ", flush=True)
-            results['TL-GEMM'] = bench_fn(
+            results['TL-GEMM'] = do_bench(
                 lambda: raw_gemm(X_bf16, W_padded), warmup=warmup, rep=rep)
             print(f"{results['TL-GEMM']:.4f}ms", flush=True)
         except Exception as e:
@@ -172,7 +158,7 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
     pytorch_sep()
     torch.cuda.synchronize()
     print("OK, timing...", end=" ", flush=True)
-    results['PyTorch'] = bench_fn(pytorch_sep, warmup=warmup, rep=rep)
+    results['PyTorch'] = do_bench(pytorch_sep, warmup=warmup, rep=rep)
     print(f"{results['PyTorch']:.4f}ms", flush=True)
 
     # --- BL-TileLang: TileLang GEMM + topk_softmax_best ---
@@ -186,7 +172,7 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
             tilelang_sep()
             torch.cuda.synchronize()
             print("OK, timing...", end=" ", flush=True)
-            results['TL-sep'] = bench_fn(tilelang_sep, warmup=warmup, rep=rep)
+            results['TL-sep'] = do_bench(tilelang_sep, warmup=warmup, rep=rep)
             print(f"{results['TL-sep']:.4f}ms", flush=True)
         except Exception as e:
             print(f"FAIL: {e}", flush=True)
@@ -205,7 +191,7 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
                 kern(X_bf16, W_padded)
                 torch.cuda.synchronize()
                 print("OK, timing...", end=" ", flush=True)
-                results[label] = bench_fn(
+                results[label] = do_bench(
                     lambda k=kern: k(X_bf16, W_padded),
                     warmup=warmup, rep=rep)
                 print(f"{results[label]:.4f}ms", flush=True)
@@ -220,8 +206,8 @@ def main():
     parser = argparse.ArgumentParser(description="Router Fusion Benchmark")
     parser.add_argument("--models", type=str, default=None)
     parser.add_argument("--input-tokens", type=str, default=None)
-    parser.add_argument("--warmup", type=int, default=20)
-    parser.add_argument("--rep", type=int, default=200)
+    parser.add_argument("--warmup", type=int, default=25, help="Warmup time budget in ms")
+    parser.add_argument("--rep", type=int, default=100, help="Benchmark time budget in ms")
     args = parser.parse_args()
 
     if args.models:
