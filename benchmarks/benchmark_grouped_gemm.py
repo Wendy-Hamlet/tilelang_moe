@@ -5,6 +5,8 @@ Key changes:
 - Strip host-side preprocessing overhead (sorting, bincount, metadata allocation, JIT compilation)
 - Measure only pure kernel launch and execution latency
 - Use BFloat16 uniformly for fair comparison (PyTorch vs TileLang vs torch._grouped_mm)
+- TileLang kernels use profiler.do_bench (adapter-level, no JIT wrapper overhead)
+- PyTorch / grouped_mm / Triton use do_bench (function-level)
 """
 
 import sys
@@ -40,7 +42,35 @@ try:
 except ImportError:
     HAS_V2 = False
 
+try:
+    from kernels.grouped_gemm_tilelang import (
+        _grouped_gemm_v4_kernel,
+        _get_v4_block_config
+    )
+    HAS_V4 = True
+except ImportError:
+    HAS_V4 = False
+
+try:
+    from kernels.grouped_gemm_tilelang import _grouped_gemm_v5_kernel
+    HAS_V5 = True
+except ImportError:
+    HAS_V5 = False
+
 HAS_TORCH_GROUPED_MM = hasattr(torch, "_grouped_mm")
+
+try:
+    from kernels.grouped_gemm_triton import (
+        prepare_triton_metadata,
+        prepare_triton_tma_metadata,
+        triton_grouped_gemm,
+        triton_grouped_gemm_tma,
+        _supports_tma,
+    )
+    HAS_TRITON = True
+except ImportError:
+    HAS_TRITON = False
+
 
 # ============ Real MoE model configs ============
 # (name, H, I, E_total, top_k)
@@ -64,7 +94,7 @@ def get_e_local_list(E_total):
 
 
 def run_single_config(name, H, I, E_local, top_k, E_total, input_tokens,
-                      warmup=20, rep=200):
+                      warmup=25, rep=100):
     """Run benchmark for one (model, E_local, input_tokens) config.
 
     Returns dict of {version_name: latency_ms}.
@@ -149,10 +179,51 @@ def run_single_config(name, H, I, E_local, top_k, E_total, input_tokens,
             num_stages=v2_stages, threads=v2_threads, dtype=T.bfloat16
         )
 
+    # --- Prepare TL-v4 metadata ---
+    v4_cfg = ""
+    if HAS_V4:
+        v4_bm, v4_bn, v4_bk, v4_stages, v4_threads = _get_v4_block_config(H, I, E_local, routed_tokens_local)
+        v4_cfg = "{}x{}x{}_s{}_t{}".format(v4_bm, v4_bn, v4_bk, v4_stages, v4_threads)
+
+        batch_offsets_v4 = [0]
+        batch_padded_offsets_v4 = [0]
+        for i in range(E_local - 1):
+            batch_offsets_v4.append(batch_offsets_v4[-1] + batch_sizes[i])
+            batch_padded_offsets_v4.append(
+                batch_padded_offsets_v4[-1]
+                + math.ceil(batch_sizes[i] / v4_bm) * v4_bm
+            )
+
+        tile_expert_ids_v4_list = []
+        for expert_id, size in enumerate(batch_sizes):
+            n_blocks = math.ceil(size / v4_bm) if size > 0 else 0
+            tile_expert_ids_v4_list.extend([expert_id] * n_blocks)
+
+        batch_offsets_t_v4 = torch.tensor(batch_offsets_v4, device=device, dtype=torch.int32)
+        batch_padded_offsets_t_v4 = torch.tensor(batch_padded_offsets_v4, device=device, dtype=torch.int32)
+        tile_expert_ids_t_v4 = torch.tensor(tile_expert_ids_v4_list, device=device, dtype=torch.int32)
+
+        kernel_v4 = _grouped_gemm_v4_kernel(
+            tuple(batch_sizes), K=H, N=I,
+            block_M=v4_bm, block_N=v4_bn, block_K=v4_bk,
+            num_stages=v4_stages, threads=v4_threads, dtype=T.bfloat16
+        )
+
+    # --- Prepare TL-v5 (persistent v4) ---
+    if HAS_V5 and HAS_V4:
+        sm_num = torch.cuda.get_device_properties(device).multi_processor_count
+        kernel_v5 = _grouped_gemm_v5_kernel(
+            tuple(batch_sizes), K=H, N=I, sm_num=sm_num,
+            block_M=v4_bm, block_N=v4_bn, block_K=v4_bk,
+            num_stages=v4_stages, threads=v4_threads, dtype=T.bfloat16
+        )
+
     results = {}
 
     # ==========================================
-    # Pure kernel benchmark (strictly timed region)
+    # Pure kernel benchmark
+    # - PyTorch / grouped_mm / Triton: do_bench (function-level)
+    # - TileLang kernels: profiler.do_bench (adapter-level, no JIT wrapper overhead)
     # ==========================================
 
     # --- PyTorch for-loop (bf16, cuBLAS) ---
@@ -178,7 +249,7 @@ def run_single_config(name, H, I, E_local, top_k, E_total, input_tokens,
         except Exception:
             results['grouped_mm'] = float('inf')
 
-    # --- TileLang v1 (bf16) — profiler.do_bench via adapter (no JIT wrapper overhead) ---
+    # --- TileLang v1 (bf16) — profiler.do_bench via adapter ---
     try:
         kernel_v1(X_sorted_bf16, W_bf16_HI, batch_sizes_t_v1, batch_offsets_t_v1, batch_padded_offsets_t_v1)
         profiler_v1 = kernel_v1.get_profiler()
@@ -186,7 +257,7 @@ def run_single_config(name, H, I, E_local, top_k, E_total, input_tokens,
             input_tensors=[X_sorted_bf16, W_bf16_HI, batch_sizes_t_v1, batch_offsets_t_v1, batch_padded_offsets_t_v1],
             warmup=warmup, rep=rep)
     except Exception as e:
-        print(f"\n[TL-v1 Error] {e}")
+        print("\n[TL-v1 Error] {}".format(e))
         results['TL-v1'] = float('inf')
 
     # --- TileLang v2 (bf16) — profiler.do_bench via adapter ---
@@ -198,10 +269,62 @@ def run_single_config(name, H, I, E_local, top_k, E_total, input_tokens,
                 input_tensors=[X_sorted_bf16, W_bf16_HI, batch_offsets_t_v2, batch_padded_offsets_t_v2, tile_expert_ids_t_v2],
                 warmup=warmup, rep=rep)
         except Exception as e:
-            print(f"\n[TL-v2 Error] {e}")
+            print("\n[TL-v2 Error] {}".format(e))
             results['TL-v2'] = float('inf')
 
-    return results, tokens_per_expert, routed_tokens_local
+    # --- TileLang v4 (bf16) — profiler.do_bench via adapter ---
+    if HAS_V4:
+        try:
+            kernel_v4(X_sorted_bf16, W_bf16_HI, batch_offsets_t_v4, batch_padded_offsets_t_v4, tile_expert_ids_t_v4)
+            profiler_v4 = kernel_v4.get_profiler()
+            results['TL-v4'] = profiler_v4.do_bench(
+                input_tensors=[X_sorted_bf16, W_bf16_HI, batch_offsets_t_v4, batch_padded_offsets_t_v4, tile_expert_ids_t_v4],
+                warmup=warmup, rep=rep)
+        except Exception as e:
+            print("\n[TL-v4 Error] {}".format(e))
+            results['TL-v4'] = float('inf')
+
+    # --- TileLang v5 (persistent v4, bf16) — profiler.do_bench via adapter ---
+    if HAS_V5 and HAS_V4:
+        try:
+            kernel_v5(X_sorted_bf16, W_bf16_HI, batch_offsets_t_v4, batch_padded_offsets_t_v4, tile_expert_ids_t_v4)
+            profiler_v5 = kernel_v5.get_profiler()
+            results['TL-v5'] = profiler_v5.do_bench(
+                input_tensors=[X_sorted_bf16, W_bf16_HI, batch_offsets_t_v4, batch_padded_offsets_t_v4, tile_expert_ids_t_v4],
+                warmup=warmup, rep=rep)
+        except Exception as e:
+            print("\n[TL-v5 Error] {}".format(e))
+            results['TL-v5'] = float('inf')
+
+    # --- Triton grouped GEMM (bf16, non-TMA) ---
+    if HAS_TRITON:
+        try:
+            tri_a, tri_b, tri_c, tri_sizes, tri_lds, tri_Y = prepare_triton_metadata(
+                X_sorted_bf16, W_bf16_HI, batch_sizes, device=device)
+            group_size = E_local
+            # Warmup (includes autotune)
+            triton_grouped_gemm(tri_a, tri_b, tri_c, tri_sizes, tri_lds, group_size)
+            results['Triton'] = do_bench(
+                lambda: triton_grouped_gemm(tri_a, tri_b, tri_c, tri_sizes, tri_lds, group_size),
+                warmup=warmup, rep=rep)
+        except Exception as e:
+            print("\n[Triton Error] {}".format(e))
+            results['Triton'] = float('inf')
+
+        # --- Triton grouped GEMM (bf16, TMA, Hopper+ only) ---
+        if _supports_tma():
+            try:
+                tma_a, tma_b, tma_c, tma_sizes, tma_lds, tma_Y = prepare_triton_tma_metadata(
+                    X_sorted_bf16, W_bf16_HI, batch_sizes, device=device)
+                triton_grouped_gemm_tma(tma_a, tma_b, tma_c, tma_sizes, tma_lds, group_size)
+                results['Triton-TMA'] = do_bench(
+                    lambda: triton_grouped_gemm_tma(tma_a, tma_b, tma_c, tma_sizes, tma_lds, group_size),
+                    warmup=warmup, rep=rep)
+            except Exception as e:
+                print("\n[Triton-TMA Error] {}".format(e))
+                results['Triton-TMA'] = float('inf')
+
+    return results, tokens_per_expert, routed_tokens_local, v4_cfg
 
 
 def main():
@@ -209,7 +332,7 @@ def main():
     parser.add_argument("--models", type=str, default=None)
     parser.add_argument("--input-tokens", type=str, default=None)
     parser.add_argument("--warmup", type=int, default=25, help="Warmup time budget in ms")
-    parser.add_argument("--rep", type=int, default=200)
+    parser.add_argument("--rep", type=int, default=100, help="Benchmark time budget in ms")
     args = parser.parse_args()
 
     if args.models:
@@ -230,6 +353,11 @@ def main():
     print("PyTorch:", torch.__version__)
     print("torch._grouped_mm:", "available" if HAS_TORCH_GROUPED_MM else "NOT available")
     print("TL-v2:", "available" if HAS_V2 else "NOT available")
+    print("TL-v4:", "available" if HAS_V4 else "NOT available")
+    print("TL-v5:", "available" if HAS_V5 else "NOT available")
+    print("Triton:", "available" if HAS_TRITON else "NOT available")
+    if HAS_TRITON:
+        print("Triton-TMA:", "available" if _supports_tma() else "NOT available (need Hopper+)")
     print()
 
     all_rows = []
@@ -243,7 +371,7 @@ def main():
             print("-" * 80)
 
             for input_tokens in input_sweep:
-                results, tpe, rt_local = run_single_config(
+                results, tpe, rt_local, v4_tag = run_single_config(
                     name, H, I, E_local, top_k, E_total, input_tokens,
                     warmup=args.warmup, rep=args.rep)
 
@@ -254,8 +382,9 @@ def main():
                         parts.append("{}=FAIL".format(v))
                     else:
                         parts.append("{}={:.4f}ms".format(v, lat))
-                print("  input_tokens={:<6} tpe={:<4} rt_local={:<6} {}".format(
-                    input_tokens, tpe, rt_local, "  ".join(parts)))
+                cfg_str = " [v4:{}]".format(v4_tag) if v4_tag else ""
+                print("  input_tokens={:<6} tpe={:<4} rt_local={:<6} {}{}".format(
+                    input_tokens, tpe, rt_local, "  ".join(parts), cfg_str))
 
                 all_rows.append({
                     'model': name, 'H': H, 'I': I,
@@ -270,13 +399,14 @@ def main():
     print("SUMMARY: Pure Kernel Latency (ms) and Speedup vs PyTorch for-loop (BF16)")
     print("=" * 100)
 
-    version_keys = ['PyTorch', 'grouped_mm', 'TL-v1', 'TL-v2']
+    version_keys = ['PyTorch', 'grouped_mm', 'TL-v1', 'TL-v2', 'TL-v4', 'TL-v5', 'Triton', 'Triton-TMA']
     version_keys = [v for v in version_keys
                     if any(v in r for r in all_rows)]
 
     headers = ["Model", "E_loc", "inp_tok", "tpe", "rt_loc"] + \
               [v + "(ms)" for v in version_keys] + \
-              [v + "/Py" for v in version_keys if v != 'PyTorch']
+              [v + "/Py" for v in version_keys if v != 'PyTorch'] + \
+              ["Best"]
 
     table = []
     for r in all_rows:
@@ -295,6 +425,14 @@ def main():
             else:
                 sp = py_lat / lat
                 row.append("{:.2f}x".format(sp))
+        # Find best implementation
+        best_name, best_lat = "N/A", float('inf')
+        for v in version_keys:
+            lat = r.get(v, float('inf'))
+            if lat < best_lat:
+                best_lat = lat
+                best_name = v
+        row.append(best_name)
         table.append(row)
 
     print(tabulate(table, headers=headers, tablefmt="pipe"))
