@@ -128,7 +128,12 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
         scores = torch.softmax(topk_vals, dim=-1)
         return scores, topk_idx
 
+    print(f"    [PyTorch] verify...", end=" ", flush=True)
+    pytorch_sep()
+    torch.cuda.synchronize()
+    print("OK, timing...", end=" ", flush=True)
     results['PyTorch'] = bench_fn(pytorch_sep, warmup=warmup, rep=rep)
+    print(f"{results['PyTorch']:.4f}ms", flush=True)
 
     # --- BL-TileLang: TileLang GEMM + topk_softmax_best ---
     # Uses the same GEMM tile structure as fused kernels, so the only
@@ -139,10 +144,14 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
             return topk_softmax_best(logits, K)
 
         try:
-            tilelang_sep()  # verify
+            print(f"    [TL-sep] verify...", end=" ", flush=True)
+            tilelang_sep()
+            torch.cuda.synchronize()
+            print("OK, timing...", end=" ", flush=True)
             results['TL-sep'] = bench_fn(tilelang_sep, warmup=warmup, rep=rep)
+            print(f"{results['TL-sep']:.4f}ms", flush=True)
         except Exception as e:
-            print(f"\n[TL-sep Error] {e}")
+            print(f"FAIL: {e}", flush=True)
             results['TL-sep'] = float('inf')
 
     # --- Fused variants ---
@@ -154,10 +163,14 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
         if algo in fused_kernels:
             kern = fused_kernels[algo]
             try:
-                kern(X_bf16, W_bf16)  # verify
+                print(f"    [{label}] verify...", end=" ", flush=True)
+                kern(X_bf16, W_bf16)
+                torch.cuda.synchronize()
+                print("OK, timing...", end=" ", flush=True)
                 results[label] = bench_fn(
                     lambda k=kern: k(X_bf16, W_bf16),
                     warmup=warmup, rep=rep)
+                print(f"{results[label]:.4f}ms", flush=True)
             except Exception as e:
                 print(f"\n[{label} Error] {e}")
                 results[label] = float('inf')
