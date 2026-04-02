@@ -91,22 +91,39 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
     else:
         W_padded = W_bf16
 
-    # Pre-compile fused kernels
-    fused_kernels = {}
-    tl_gemm_kernel = None
+    # Pre-compile RAW kernels (bypass wrapper to avoid padding overhead in timing)
+    from kernels.router_gemm_topk_softmax import (
+        _next_pow2, router_gemm_kernel,
+        fused_router_selection_kernel, fused_router_bitonic_kernel,
+        _fused_pass_configs,
+    )
+    _Ep = _next_pow2(E)
+
+    raw_fused = {}
+    raw_gemm = None
     if HAS_FUSED:
         for algo in ["selection", "bitonic"]:
             try:
                 print(f"    Compiling fused-{algo} T={num_tokens} E={E}...", end=" ", flush=True)
-                fused_kernels[algo] = get_fused_router_kernel(
-                    algo, num_tokens, H, E, K, dtype=T.bfloat16)
+                if algo == "selection":
+                    raw_fused[algo] = fused_router_selection_kernel(
+                        num_tokens, H, E, _Ep, K,
+                        block_M=64, block_K=64, num_stages=2, threads=256,
+                        dtype=T.bfloat16)
+                else:
+                    raw_fused[algo] = fused_router_bitonic_kernel(
+                        num_tokens, H, E, K,
+                        block_M=64, block_K=64, num_stages=2, threads=256,
+                        dtype=T.bfloat16)
                 print("OK", flush=True)
             except Exception as e:
                 print(f"FAIL: {e}", flush=True)
-        # Compile standalone TileLang GEMM (same structure as fused, minus epilogue)
         try:
             print(f"    Compiling TL-GEMM T={num_tokens} E={E}...", end=" ", flush=True)
-            tl_gemm_kernel = get_router_gemm_kernel(num_tokens, H, E, dtype=T.bfloat16)
+            raw_gemm = router_gemm_kernel(
+                num_tokens, H, _Ep,
+                block_M=64, block_K=64, num_stages=2, threads=256,
+                dtype=T.bfloat16)
             print("OK", flush=True)
         except Exception as e:
             print(f"FAIL: {e}", flush=True)
@@ -124,7 +141,7 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
     results = {}
 
     # ==========================================
-    # Pure kernel benchmark (NO wrapper overhead in timing)
+    # Pure kernel benchmark (raw kernels + pre-padded W, NO wrapper overhead)
     # ==========================================
 
     # --- GEMM-only: torch.mm vs TileLang GEMM ---
@@ -133,15 +150,8 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
         lambda: torch.mm(X_bf16, W_bf16), warmup=warmup, rep=rep)
     print(f"{results['torch.mm']:.4f}ms", flush=True)
 
-    if tl_gemm_kernel is not None:
-        # Call the raw compiled kernel with pre-padded W (no wrapper overhead)
-        from kernels.router_gemm_topk_softmax import _next_pow2, router_gemm_kernel
-        _Ep = _next_pow2(E)
+    if raw_gemm is not None:
         try:
-            raw_gemm = router_gemm_kernel(
-                num_tokens, H, _Ep,
-                block_M=64, block_K=64, num_stages=2, threads=256,
-                dtype=T.bfloat16)
             raw_gemm(X_bf16, W_padded)  # verify
             torch.cuda.synchronize()
             print(f"    [TL-GEMM] timing...", end=" ", flush=True)
@@ -166,12 +176,10 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
     print(f"{results['PyTorch']:.4f}ms", flush=True)
 
     # --- BL-TileLang: TileLang GEMM + topk_softmax_best ---
-    if HAS_TL_TOPK and tl_gemm_kernel is not None:
-        # Use raw kernel + pre-padded W to avoid wrapper overhead in timing
+    if HAS_TL_TOPK and raw_gemm is not None:
         def tilelang_sep():
             logits_p = raw_gemm(X_bf16, W_padded)
-            logits = logits_p[:, :E]
-            return topk_softmax_best(logits, K)
+            return topk_softmax_best(logits_p[:, :E].contiguous(), K)
 
         try:
             print(f"    [TL-sep] verify...", end=" ", flush=True)
@@ -184,14 +192,14 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
             print(f"FAIL: {e}", flush=True)
             results['TL-sep'] = float('inf')
 
-    # --- Fused variants: call raw kernel with pre-padded W ---
+    # --- Fused variants: raw kernel + pre-padded W ---
     algo_names = {
         "selection": "Fused-Sel",
         "bitonic": "Fused-Bit",
     }
     for algo, label in algo_names.items():
-        if algo in fused_kernels:
-            kern = fused_kernels[algo]
+        if algo in raw_fused:
+            kern = raw_fused[algo]
             try:
                 print(f"    [{label}] verify...", end=" ", flush=True)
                 kern(X_bf16, W_padded)
