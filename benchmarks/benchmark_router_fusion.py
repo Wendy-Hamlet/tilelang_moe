@@ -141,8 +141,9 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
             raw_gemm(X_bf16, W_padded)  # verify
             torch.cuda.synchronize()
             print(f"    [TL-GEMM] timing...", end=" ", flush=True)
-            results['TL-GEMM'] = do_bench(
-                lambda: raw_gemm(X_bf16, W_padded), warmup=warmup, rep=rep)
+            profiler_gemm = raw_gemm.get_profiler()
+            results['TL-GEMM'] = profiler_gemm.do_bench(
+                input_tensors=[X_bf16, W_padded], warmup=warmup, rep=rep)
             print(f"{results['TL-GEMM']:.4f}ms", flush=True)
         except Exception as e:
             print(f"    [TL-GEMM] FAIL: {e}", flush=True)
@@ -162,6 +163,8 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
     print(f"{results['PyTorch']:.4f}ms", flush=True)
 
     # --- BL-TileLang: TileLang GEMM + topk_softmax_best ---
+    # Note: TL-sep is a multi-kernel pipeline (GEMM + topk), so we use do_bench
+    # at the function level (not profiler.do_bench) since it involves multiple kernels.
     if HAS_TL_TOPK and raw_gemm is not None:
         def tilelang_sep():
             logits_p = raw_gemm(X_bf16, W_padded)
@@ -178,7 +181,7 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
             print(f"FAIL: {e}", flush=True)
             results['TL-sep'] = float('inf')
 
-    # --- Fused variants: raw kernel + pre-padded W ---
+    # --- Fused variants: profiler.do_bench via adapter (no JIT wrapper overhead) ---
     algo_names = {
         "selection": "Fused-Sel",
         "bitonic": "Fused-Bit",
@@ -191,9 +194,9 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
                 kern(X_bf16, W_padded)
                 torch.cuda.synchronize()
                 print("OK, timing...", end=" ", flush=True)
-                results[label] = do_bench(
-                    lambda k=kern: k(X_bf16, W_padded),
-                    warmup=warmup, rep=rep)
+                profiler_fused = kern.get_profiler()
+                results[label] = profiler_fused.do_bench(
+                    input_tensors=[X_bf16, W_padded], warmup=warmup, rep=rep)
                 print(f"{results[label]:.4f}ms", flush=True)
             except Exception as e:
                 print(f"\n[{label} Error] {e}")

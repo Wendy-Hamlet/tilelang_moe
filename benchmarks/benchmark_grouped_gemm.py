@@ -178,22 +178,24 @@ def run_single_config(name, H, I, E_local, top_k, E_total, input_tokens,
         except Exception:
             results['grouped_mm'] = float('inf')
 
-    # --- TileLang v1 (bf16) ---
+    # --- TileLang v1 (bf16) — profiler.do_bench via adapter (no JIT wrapper overhead) ---
     try:
         kernel_v1(X_sorted_bf16, W_bf16_HI, batch_sizes_t_v1, batch_offsets_t_v1, batch_padded_offsets_t_v1)
-        results['TL-v1'] = do_bench(
-            lambda: kernel_v1(X_sorted_bf16, W_bf16_HI, batch_sizes_t_v1, batch_offsets_t_v1, batch_padded_offsets_t_v1),
+        profiler_v1 = kernel_v1.get_profiler()
+        results['TL-v1'] = profiler_v1.do_bench(
+            input_tensors=[X_sorted_bf16, W_bf16_HI, batch_sizes_t_v1, batch_offsets_t_v1, batch_padded_offsets_t_v1],
             warmup=warmup, rep=rep)
     except Exception as e:
         print(f"\n[TL-v1 Error] {e}")
         results['TL-v1'] = float('inf')
 
-    # --- TileLang v2 (bf16) ---
+    # --- TileLang v2 (bf16) — profiler.do_bench via adapter ---
     if HAS_V2:
         try:
             kernel_v2(X_sorted_bf16, W_bf16_HI, batch_offsets_t_v2, batch_padded_offsets_t_v2, tile_expert_ids_t_v2)
-            results['TL-v2'] = do_bench(
-                lambda: kernel_v2(X_sorted_bf16, W_bf16_HI, batch_offsets_t_v2, batch_padded_offsets_t_v2, tile_expert_ids_t_v2),
+            profiler_v2 = kernel_v2.get_profiler()
+            results['TL-v2'] = profiler_v2.do_bench(
+                input_tensors=[X_sorted_bf16, W_bf16_HI, batch_offsets_t_v2, batch_padded_offsets_t_v2, tile_expert_ids_t_v2],
                 warmup=warmup, rep=rep)
         except Exception as e:
             print(f"\n[TL-v2 Error] {e}")
