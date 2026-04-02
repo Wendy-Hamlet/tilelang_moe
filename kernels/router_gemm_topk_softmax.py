@@ -31,13 +31,13 @@ def _next_pow2(n):
 
 
 # Fused epilogue pass configs: disable warp specialization (epilogue uses
-# T.sync_threads / T.get_thread_binding) and auto thread-storage sync
-# (prevents TileLang from inserting __syncthreads in divergent branches).
-# TMA is left ENABLED -- it only affects global->shared copy lowering in
-# the GEMM pipeline, not the epilogue.
+# T.sync_threads / T.get_thread_binding), auto thread-storage sync (prevents
+# TileLang from inserting __syncthreads in divergent branches), and TMA
+# lowering (TMA generates mbarrier-based sync incompatible with epilogue).
 _fused_pass_configs = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
+    tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
 }
 
 

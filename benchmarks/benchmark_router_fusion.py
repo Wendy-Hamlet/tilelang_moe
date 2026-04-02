@@ -167,8 +167,10 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
 
     # --- BL-TileLang: TileLang GEMM + topk_softmax_best ---
     if HAS_TL_TOPK and tl_gemm_kernel is not None:
+        # Use raw kernel + pre-padded W to avoid wrapper overhead in timing
         def tilelang_sep():
-            logits = tl_gemm_kernel(X_bf16, W_bf16)
+            logits_p = raw_gemm(X_bf16, W_padded)
+            logits = logits_p[:, :E]
             return topk_softmax_best(logits, K)
 
         try:
