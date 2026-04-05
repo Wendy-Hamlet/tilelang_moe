@@ -126,7 +126,16 @@ def get_router_gemm_kernel(num_tokens, H, E, dtype=T.bfloat16):
 # Warp-Specialized Selection Sort Fused Kernel (TMA + ws enabled)
 # ============================================================================
 
-@tilelang.jit(out_idx=[1, 2])
+# Warp-specialized kernel only needs TL_DISABLE_THREAD_STORAGE_SYNC
+# (prevent auto-inserted __syncthreads in divergent shared memory access).
+# TMA + warp specialization are LEFT ENABLED (no TL_DISABLE_TMA_LOWER,
+# no TL_DISABLE_WARP_SPECIALIZED) since we use explicit T.ws() blocks.
+_ws_pass_configs = {
+    tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
+}
+
+
+@tilelang.jit(out_idx=[1, 2], pass_configs=_ws_pass_configs)
 def fused_router_ws_selection_kernel(
     num_tokens, H, E, E_padded, top_k,
     block_M=64, block_K=64, num_stages=2, threads=256,
