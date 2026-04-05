@@ -144,16 +144,16 @@ def fused_router_ws_selection_kernel(
     """
     Fused Router GEMM + Selection-Sort TopK + Softmax with warp specialization.
 
-    GEMM phase uses TMA + warp specialization (producer=128 copy threads,
-    consumer=256 compute threads, total=384). Epilogue runs on consumer
-    warps only, using __barrier_sync for sub-block synchronization.
-
-    Same logic as fused_router_selection_kernel but ~1.5-2x faster GEMM.
+    GEMM phase uses TMA + warp specialization. Manual T.ws() mode splits
+    threads 50/50: consumer=threads/2, producer=threads/2.
+    With threads=256: 128 consumer (compute+epilogue) + 128 producer (TMA copy).
+    Epilogue uses __barrier_sync for consumer-only synchronization.
     """
     num_m_blocks = (num_tokens + block_M - 1) // block_M
     accum_dtype = T.float32
-    elems_per_thread = (E + threads - 1) // threads
-    CONSUMER_THREADS = threads  # 256 consumer threads (= user-specified threads)
+    # Manual ws splits threads 50/50
+    CONSUMER_THREADS = threads // 2  # 128
+    elems_per_thread = (E + CONSUMER_THREADS - 1) // CONSUMER_THREADS
 
     @T.prim_func
     def kernel(
@@ -172,8 +172,8 @@ def fused_router_ws_selection_kernel(
             # TopK workspace
             s_topk_vals = T.alloc_shared([top_k], T.float32)
             s_topk_idx = T.alloc_shared([top_k], T.int32)
-            s_thread_vals = T.alloc_shared([threads], T.float32)
-            s_thread_idx = T.alloc_shared([threads], T.int32)
+            s_thread_vals = T.alloc_shared([CONSUMER_THREADS], T.float32)
+            s_thread_idx = T.alloc_shared([CONSUMER_THREADS], T.int32)
 
             # mbarrier for GEMM producer-consumer pipeline
             data_ready = T.alloc_barrier(arrive_count=128)
@@ -236,12 +236,7 @@ def fused_router_ws_selection_kernel(
                             s_thread_idx[tx] = thread_max_idx
                             T.sync_threads(barrier_id=1, arrive_count=CONSUMER_THREADS)
 
-                            # Tree reduction to find global max
-                            if tx < 128:
-                                if s_thread_vals[tx + 128] > s_thread_vals[tx]:
-                                    s_thread_vals[tx] = s_thread_vals[tx + 128]
-                                    s_thread_idx[tx] = s_thread_idx[tx + 128]
-                            T.sync_threads(barrier_id=1, arrive_count=CONSUMER_THREADS)
+                            # Tree reduction to find global max (128 consumer threads → 7 levels)
                             if tx < 64:
                                 if s_thread_vals[tx + 64] > s_thread_vals[tx]:
                                     s_thread_vals[tx] = s_thread_vals[tx + 64]
