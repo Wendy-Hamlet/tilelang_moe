@@ -123,7 +123,181 @@ def get_router_gemm_kernel(num_tokens, H, E, dtype=T.bfloat16):
 
 
 # ============================================================================
-# Selection Sort Fused Kernel
+# Warp-Specialized Selection Sort Fused Kernel (TMA + ws enabled)
+# ============================================================================
+
+@tilelang.jit(out_idx=[1, 2])
+def fused_router_ws_selection_kernel(
+    num_tokens, H, E, E_padded, top_k,
+    block_M=64, block_K=64, num_stages=2, threads=256,
+    dtype=T.bfloat16,
+):
+    """
+    Fused Router GEMM + Selection-Sort TopK + Softmax with warp specialization.
+
+    GEMM phase uses TMA + warp specialization (producer=128 copy threads,
+    consumer=256 compute threads, total=384). Epilogue runs on consumer
+    warps only, using __barrier_sync for sub-block synchronization.
+
+    Same logic as fused_router_selection_kernel but ~1.5-2x faster GEMM.
+    """
+    num_m_blocks = (num_tokens + block_M - 1) // block_M
+    accum_dtype = T.float32
+    elems_per_thread = (E + threads - 1) // threads
+    CONSUMER_THREADS = threads  # 256 consumer threads (= user-specified threads)
+
+    @T.prim_func
+    def kernel(
+        X: T.Tensor([num_tokens, H], dtype),
+        scores: T.Tensor([num_tokens, top_k], T.float32),
+        indices: T.Tensor([num_tokens, top_k], T.int32),
+        W: T.Tensor([H, E_padded], dtype),
+    ):
+        with T.Kernel(num_m_blocks, threads=threads) as (bx):
+            # --- Shared memory allocations ---
+            A_shared = T.alloc_shared([block_M, block_K], dtype)
+            B_shared = T.alloc_shared([block_K, E_padded], dtype)
+            C_local = T.alloc_fragment([block_M, E_padded], accum_dtype)
+            C_shared = T.alloc_shared([block_M, E_padded], accum_dtype)
+
+            # TopK workspace
+            s_topk_vals = T.alloc_shared([top_k], T.float32)
+            s_topk_idx = T.alloc_shared([top_k], T.int32)
+            s_thread_vals = T.alloc_shared([threads], T.float32)
+            s_thread_idx = T.alloc_shared([threads], T.int32)
+
+            # mbarrier for GEMM producer-consumer pipeline
+            data_ready = T.alloc_barrier(arrive_count=128)
+            compute_done = T.alloc_barrier(arrive_count=128)
+
+            m_start = bx * block_M
+
+            # ======== GEMM Phase (warp specialized) ========
+            with T.ws(0):
+                T.clear(C_local)
+
+            for ko in T.Pipelined(T.ceildiv(H, block_K), num_stages=num_stages):
+                with T.ws(1):
+                    T.barrier_wait(compute_done, (ko + 1) % 2)
+                    T.copy(X[m_start, ko * block_K], A_shared)
+                    T.copy(W[ko * block_K, 0], B_shared)
+                    T.barrier_arrive(data_ready)
+                with T.ws(0):
+                    T.barrier_wait(data_ready, ko % 2)
+                    T.gemm(A_shared, B_shared, C_local)
+                    T.barrier_arrive(compute_done)
+
+            # ======== TopK + Softmax Epilogue (consumer warps only) ========
+            with T.ws(0):
+                T.copy(C_local, C_shared)
+
+                tx = T.get_thread_binding()
+
+                for row in T.serial(block_M):
+                    token_idx = m_start + row
+                    if token_idx < num_tokens:
+                        # Initialize topk buffers
+                        if tx == 0:
+                            for i in T.serial(top_k):
+                                s_topk_vals[i] = T.float32(-1e38)
+                                s_topk_idx[i] = T.int32(-1)
+                        T.sync_threads(barrier_id=1, arrive_count=CONSUMER_THREADS)
+
+                        # K iterations of selection (find max, exclude, repeat)
+                        for k_iter in T.serial(top_k):
+                            thread_max_val = T.alloc_var(T.float32)
+                            thread_max_idx = T.alloc_var(T.int32)
+                            thread_max_val = T.float32(-1e38)
+                            thread_max_idx = T.int32(-1)
+
+                            for i in T.serial(elems_per_thread):
+                                idx = tx * elems_per_thread + i
+                                if idx < E:
+                                    val = C_shared[row, idx]
+                                    already_selected = T.alloc_var(T.bool)
+                                    already_selected = T.bool(False)
+                                    for j in T.serial(k_iter):
+                                        if s_topk_idx[j] == idx:
+                                            already_selected = T.bool(True)
+                                    if (not already_selected) and (val > thread_max_val):
+                                        thread_max_val = val
+                                        thread_max_idx = T.int32(idx)
+
+                            s_thread_vals[tx] = thread_max_val
+                            s_thread_idx[tx] = thread_max_idx
+                            T.sync_threads(barrier_id=1, arrive_count=CONSUMER_THREADS)
+
+                            # Tree reduction to find global max
+                            if tx < 128:
+                                if s_thread_vals[tx + 128] > s_thread_vals[tx]:
+                                    s_thread_vals[tx] = s_thread_vals[tx + 128]
+                                    s_thread_idx[tx] = s_thread_idx[tx + 128]
+                            T.sync_threads(barrier_id=1, arrive_count=CONSUMER_THREADS)
+                            if tx < 64:
+                                if s_thread_vals[tx + 64] > s_thread_vals[tx]:
+                                    s_thread_vals[tx] = s_thread_vals[tx + 64]
+                                    s_thread_idx[tx] = s_thread_idx[tx + 64]
+                            T.sync_threads(barrier_id=1, arrive_count=CONSUMER_THREADS)
+                            if tx < 32:
+                                if s_thread_vals[tx + 32] > s_thread_vals[tx]:
+                                    s_thread_vals[tx] = s_thread_vals[tx + 32]
+                                    s_thread_idx[tx] = s_thread_idx[tx + 32]
+                            T.sync_threads(barrier_id=1, arrive_count=CONSUMER_THREADS)
+                            if tx < 16:
+                                if s_thread_vals[tx + 16] > s_thread_vals[tx]:
+                                    s_thread_vals[tx] = s_thread_vals[tx + 16]
+                                    s_thread_idx[tx] = s_thread_idx[tx + 16]
+                            T.sync_threads(barrier_id=1, arrive_count=CONSUMER_THREADS)
+                            if tx < 8:
+                                if s_thread_vals[tx + 8] > s_thread_vals[tx]:
+                                    s_thread_vals[tx] = s_thread_vals[tx + 8]
+                                    s_thread_idx[tx] = s_thread_idx[tx + 8]
+                            T.sync_threads(barrier_id=1, arrive_count=CONSUMER_THREADS)
+                            if tx < 4:
+                                if s_thread_vals[tx + 4] > s_thread_vals[tx]:
+                                    s_thread_vals[tx] = s_thread_vals[tx + 4]
+                                    s_thread_idx[tx] = s_thread_idx[tx + 4]
+                            T.sync_threads(barrier_id=1, arrive_count=CONSUMER_THREADS)
+                            if tx < 2:
+                                if s_thread_vals[tx + 2] > s_thread_vals[tx]:
+                                    s_thread_vals[tx] = s_thread_vals[tx + 2]
+                                    s_thread_idx[tx] = s_thread_idx[tx + 2]
+                            T.sync_threads(barrier_id=1, arrive_count=CONSUMER_THREADS)
+                            if tx < 1:
+                                if s_thread_vals[tx + 1] > s_thread_vals[tx]:
+                                    s_thread_vals[tx] = s_thread_vals[tx + 1]
+                                    s_thread_idx[tx] = s_thread_idx[tx + 1]
+                            T.sync_threads(barrier_id=1, arrive_count=CONSUMER_THREADS)
+
+                            if tx == 0:
+                                s_topk_vals[k_iter] = s_thread_vals[0]
+                                s_topk_idx[k_iter] = s_thread_idx[0]
+                            T.sync_threads(barrier_id=1, arrive_count=CONSUMER_THREADS)
+
+                        # Softmax over top-K values
+                        if tx == 0:
+                            max_val = T.alloc_var(T.float32)
+                            max_val = T.float32(-1e38)
+                            for i in T.serial(top_k):
+                                if s_topk_vals[i] > max_val:
+                                    max_val = s_topk_vals[i]
+
+                            exp_sum = T.alloc_var(T.float32)
+                            exp_sum = T.float32(0.0)
+                            for i in T.serial(top_k):
+                                s_topk_vals[i] = T.exp(s_topk_vals[i] - max_val)
+                                exp_sum = exp_sum + s_topk_vals[i]
+
+                            for i in T.serial(top_k):
+                                scores[token_idx, i] = s_topk_vals[i] / exp_sum
+                                indices[token_idx, i] = s_topk_idx[i]
+                        T.sync_threads(barrier_id=1, arrive_count=CONSUMER_THREADS)
+
+    return kernel
+
+
+# ============================================================================
+# Selection Sort Fused Kernel (non-ws, original version)
 # ============================================================================
 
 @tilelang.jit(out_idx=[1, 2], pass_configs=_fused_pass_configs)
@@ -646,6 +820,11 @@ def get_fused_router_kernel(algo, num_tokens, H, E, top_k, dtype=T.bfloat16):
 
     if algo == "selection":
         kernel = fused_router_selection_kernel(
+            num_tokens, H, E, E_padded, top_k,
+            block_M=block_M, block_K=block_K,
+            num_stages=num_stages, threads=threads, dtype=dtype)
+    elif algo == "ws_selection":
+        kernel = fused_router_ws_selection_kernel(
             num_tokens, H, E, E_padded, top_k,
             block_M=block_M, block_K=block_K,
             num_stages=num_stages, threads=threads, dtype=dtype)

@@ -81,6 +81,7 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
     from kernels.router_gemm_topk_softmax import (
         _next_pow2, router_gemm_kernel,
         fused_router_selection_kernel, fused_router_bitonic_kernel,
+        fused_router_ws_selection_kernel,
         _fused_pass_configs,
     )
     _Ep = _next_pow2(E)
@@ -88,11 +89,12 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
     raw_fused = {}
     raw_gemm = None
     if HAS_FUSED:
-        for algo in ["selection", "bitonic"]:
+        for algo in ["selection", "ws_selection", "bitonic"]:
             try:
                 print(f"    Compiling fused-{algo} T={num_tokens} E={E}...", end=" ", flush=True)
-                if algo == "selection":
-                    raw_fused[algo] = fused_router_selection_kernel(
+                if algo in ("selection", "ws_selection"):
+                    fn = fused_router_ws_selection_kernel if algo == "ws_selection" else fused_router_selection_kernel
+                    raw_fused[algo] = fn(
                         num_tokens, H, E, _Ep, K,
                         block_M=64, block_K=64, num_stages=2, threads=256,
                         dtype=T.bfloat16)
@@ -127,17 +129,17 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
     results = {}
 
     # ==========================================
-    # Pure kernel benchmark — all use do_bench(backend="cupti") for fair
-    # comparison: CUPTI measures pure CUDA kernel time via PyTorch profiler,
-    # automatically excluding host overhead (Python calls, tensor allocation).
+    # Pure kernel benchmark:
+    # - PyTorch / multi-kernel pipelines: do_bench (per-iteration events + L2 flush)
+    # - TileLang single kernels: profiler.do_bench (adapter-level, no JIT wrapper overhead)
+    # Note: CUPTI backend tested but rejected — profiling overhead is non-uniform
+    # across implementations (2-10x inflation for TileLang JIT calls).
     # ==========================================
-
-    BACKEND = "cupti"
 
     # --- GEMM-only: torch.mm vs TileLang GEMM ---
     print(f"    [torch.mm] timing...", end=" ", flush=True)
     results['torch.mm'] = do_bench(
-        lambda: torch.mm(X_bf16, W_bf16), warmup=warmup, rep=rep, backend=BACKEND)
+        lambda: torch.mm(X_bf16, W_bf16), warmup=warmup, rep=rep)
     print(f"{results['torch.mm']:.4f}ms", flush=True)
 
     if raw_gemm is not None:
@@ -145,8 +147,9 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
             raw_gemm(X_bf16, W_padded)  # verify
             torch.cuda.synchronize()
             print(f"    [TL-GEMM] timing...", end=" ", flush=True)
-            results['TL-GEMM'] = do_bench(
-                lambda: raw_gemm(X_bf16, W_padded), warmup=warmup, rep=rep, backend=BACKEND)
+            profiler_gemm = raw_gemm.get_profiler()
+            results['TL-GEMM'] = profiler_gemm.do_bench(
+                input_tensors=[X_bf16, W_padded], warmup=warmup, rep=rep)
             print(f"{results['TL-GEMM']:.4f}ms", flush=True)
         except Exception as e:
             print(f"    [TL-GEMM] FAIL: {e}", flush=True)
@@ -162,10 +165,11 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
     pytorch_sep()
     torch.cuda.synchronize()
     print("OK, timing...", end=" ", flush=True)
-    results['PyTorch'] = do_bench(pytorch_sep, warmup=warmup, rep=rep, backend=BACKEND)
+    results['PyTorch'] = do_bench(pytorch_sep, warmup=warmup, rep=rep)
     print(f"{results['PyTorch']:.4f}ms", flush=True)
 
     # --- BL-TileLang: TileLang GEMM + topk_softmax_best ---
+    # Multi-kernel pipeline — use do_bench at function level
     if HAS_TL_TOPK and raw_gemm is not None:
         def tilelang_sep():
             logits_p = raw_gemm(X_bf16, W_padded)
@@ -176,15 +180,16 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
             tilelang_sep()
             torch.cuda.synchronize()
             print("OK, timing...", end=" ", flush=True)
-            results['TL-sep'] = do_bench(tilelang_sep, warmup=warmup, rep=rep, backend=BACKEND)
+            results['TL-sep'] = do_bench(tilelang_sep, warmup=warmup, rep=rep)
             print(f"{results['TL-sep']:.4f}ms", flush=True)
         except Exception as e:
             print(f"FAIL: {e}", flush=True)
             results['TL-sep'] = float('inf')
 
-    # --- Fused variants ---
+    # --- Fused variants: profiler.do_bench via adapter ---
     algo_names = {
         "selection": "Fused-Sel",
+        "ws_selection": "Fused-WS",
         "bitonic": "Fused-Bit",
     }
     for algo, label in algo_names.items():
@@ -195,9 +200,9 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
                 kern(X_bf16, W_padded)
                 torch.cuda.synchronize()
                 print("OK, timing...", end=" ", flush=True)
-                results[label] = do_bench(
-                    lambda k=kern: k(X_bf16, W_padded),
-                    warmup=warmup, rep=rep, backend=BACKEND)
+                profiler_fused = kern.get_profiler()
+                results[label] = profiler_fused.do_bench(
+                    input_tensors=[X_bf16, W_padded], warmup=warmup, rep=rep)
                 print(f"{results[label]:.4f}ms", flush=True)
             except Exception as e:
                 print(f"\n[{label} Error] {e}")
@@ -264,7 +269,7 @@ def main():
     print("SUMMARY: Latency (ms) and Speedup vs PyTorch separate")
     print("=" * 100)
 
-    version_keys = ['PyTorch', 'TL-sep', 'Fused-Sel', 'Fused-Bit']
+    version_keys = ['PyTorch', 'TL-sep', 'Fused-Sel', 'Fused-WS', 'Fused-Bit']
     version_keys = [v for v in version_keys if any(v in r for r in all_rows)]
 
     headers = ["Model", "T"] + \
