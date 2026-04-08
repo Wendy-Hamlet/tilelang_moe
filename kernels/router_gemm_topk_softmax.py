@@ -212,7 +212,7 @@ def fused_router_ws_selection_kernel(
                                 s_topk_idx[i] = T.int32(-1)
                         T.sync_threads(barrier_id=1, arrive_count=CONSUMER_THREADS)
 
-                        # K iterations of selection (find max, exclude, repeat)
+                        # K iterations of selection: find max, mask with -inf, repeat
                         for k_iter in T.serial(top_k):
                             thread_max_val = T.alloc_var(T.float32)
                             thread_max_idx = T.alloc_var(T.int32)
@@ -223,12 +223,7 @@ def fused_router_ws_selection_kernel(
                                 idx = tx * elems_per_thread + i
                                 if idx < E:
                                     val = C_shared[row, idx]
-                                    already_selected = T.alloc_var(T.bool)
-                                    already_selected = T.bool(False)
-                                    for j in T.serial(k_iter):
-                                        if s_topk_idx[j] == idx:
-                                            already_selected = T.bool(True)
-                                    if (not already_selected) and (val > thread_max_val):
+                                    if val > thread_max_val:
                                         thread_max_val = val
                                         thread_max_idx = T.int32(idx)
 
@@ -273,9 +268,11 @@ def fused_router_ws_selection_kernel(
                                     s_thread_idx[tx] = s_thread_idx[tx + 1]
                             T.sync_threads(barrier_id=1, arrive_count=CONSUMER_THREADS)
 
+                            # Store result and mask selected position with -inf
                             if tx == 0:
                                 s_topk_vals[k_iter] = s_thread_vals[0]
                                 s_topk_idx[k_iter] = s_thread_idx[0]
+                                C_shared[row, s_thread_idx[0]] = T.float32(-1e38)
                             T.sync_threads(barrier_id=1, arrive_count=CONSUMER_THREADS)
 
                         # Softmax over top-K values
@@ -374,7 +371,7 @@ def fused_router_selection_kernel(
                             s_topk_idx[i] = T.int32(-1)
                     T.sync_threads()
 
-                    # K iterations of selection (find max, exclude, repeat)
+                    # K iterations of selection: find max, mask with -inf, repeat
                     for k_iter in T.serial(top_k):
                         thread_max_val = T.alloc_var(T.float32)
                         thread_max_idx = T.alloc_var(T.int32)
@@ -385,12 +382,7 @@ def fused_router_selection_kernel(
                             idx = tx * elems_per_thread + i
                             if idx < E:
                                 val = C_shared[row, idx]
-                                already_selected = T.alloc_var(T.bool)
-                                already_selected = T.bool(False)
-                                for j in T.serial(k_iter):
-                                    if s_topk_idx[j] == idx:
-                                        already_selected = T.bool(True)
-                                if (not already_selected) and (val > thread_max_val):
+                                if val > thread_max_val:
                                     thread_max_val = val
                                     thread_max_idx = T.int32(idx)
 
@@ -440,9 +432,11 @@ def fused_router_selection_kernel(
                                 s_thread_idx[tx] = s_thread_idx[tx + 1]
                         T.sync_threads()
 
+                        # Store result and mask selected position with -inf
                         if tx == 0:
                             s_topk_vals[k_iter] = s_thread_vals[0]
                             s_topk_idx[k_iter] = s_thread_idx[0]
+                            C_shared[row, s_thread_idx[0]] = T.float32(-1e38)
                         T.sync_threads()
 
                     # Softmax over top-K values
