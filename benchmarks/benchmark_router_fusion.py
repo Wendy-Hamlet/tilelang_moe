@@ -1,22 +1,14 @@
 """
 Router Fusion Benchmark — Fused GEMM + TopK + Softmax vs Separate Kernels
 
-Measures: X(T,H) @ W(H,E) → topk_softmax → (scores, indices)(T,K)
+Measures: X(T,H) @ W(H,E) -> topk_softmax -> (scores, indices)(T,K)
 
-Versions:
-  BL-PyTorch:   torch.mm + torch.topk + torch.softmax (fully PyTorch)
-  BL-TileLang:  torch.mm + topk_softmax_best (cuBLAS GEMM + our best topk)
-  Ours-Select:  Fused GEMM+TopK+Softmax with selection sort epilogue
-  Ours-Bitonic: Fused GEMM+TopK+Softmax with bitonic sort epilogue
-  Ours-BV3:     Fused GEMM+TopK+Softmax with bitonic v3 epilogue
-
-Fairness:
-  - BF16 input (X, W), float32 logits/scores, int32 indices
-  - Only kernel execution timed (no JIT, no data allocation)
-  - Same X, W tensors across all versions
+All versions measured with do_bench (per-iteration CUDA events + L2 flush).
+Data preparation (padding, allocation) is done ONCE outside the timing loop.
 """
 
 import sys
+import math
 import argparse
 import warnings
 from pathlib import Path
@@ -39,7 +31,11 @@ except ImportError:
     HAS_TL_TOPK = False
 
 try:
-    from kernels.router_gemm_topk_softmax import get_fused_router_kernel, get_router_gemm_kernel
+    from kernels.router_gemm_topk_softmax import (
+        _next_pow2, router_gemm_kernel,
+        fused_router_selection_kernel, fused_router_bitonic_kernel,
+        fused_router_ws_selection_kernel,
+    )
     import tilelang.language as T
     HAS_FUSED = True
 except ImportError:
@@ -47,7 +43,6 @@ except ImportError:
 
 
 # ============ Model configs (from HuggingFace) ============
-# (name, H=hidden_size, E=num_experts, K=num_experts_per_tok)
 MODEL_CONFIGS = [
     ("Qwen2-57B",   3584,  64,  8),
     ("Qwen3-235B",  4096,  128, 8),
@@ -57,35 +52,33 @@ MODEL_CONFIGS = [
 INPUT_TOKENS_SWEEP = [256, 1024, 4096, 16384]
 
 
-# ============ Single config runner ============
-def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
+def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
     """Run benchmark for one (model, num_tokens) config."""
     device = "cuda"
 
     # ==========================================
-    # Preprocessing (NOT timed)
+    # Preprocessing (NOT timed) — all allocation done here
     # ==========================================
     X_bf16 = torch.randn(num_tokens, H, device=device, dtype=torch.bfloat16)
     W_bf16 = torch.randn(H, E, device=device, dtype=torch.bfloat16)
 
-    # Pre-pad W for non-power-of-2 E (done ONCE, outside timing loop)
-    import math
-    E_padded = 1 << math.ceil(math.log2(max(E, 2)))
+    E_padded = _next_pow2(E)
     if E != E_padded:
         W_padded = torch.zeros(H, E_padded, device=device, dtype=torch.bfloat16)
         W_padded[:, :E] = W_bf16
     else:
         W_padded = W_bf16
 
-    # Pre-compile RAW kernels (bypass wrapper to avoid padding overhead in timing)
-    from kernels.router_gemm_topk_softmax import (
-        _next_pow2, router_gemm_kernel,
-        fused_router_selection_kernel, fused_router_bitonic_kernel,
-        fused_router_ws_selection_kernel,
-        _fused_pass_configs,
-    )
-    _Ep = _next_pow2(E)
+    # Pre-allocate output buffers for PyTorch baseline (avoid alloc in timing)
+    logits_buf = torch.empty(num_tokens, E, device=device, dtype=torch.float32)
+    topk_vals_buf = torch.empty(num_tokens, K, device=device, dtype=torch.float32)
+    topk_idx_buf = torch.empty(num_tokens, K, device=device, dtype=torch.int64)
 
+    # Pre-allocate padded logits buffer for TL-sep
+    logits_padded_buf = torch.empty(num_tokens, E_padded, device=device, dtype=torch.float32)
+    logits_slice_buf = torch.empty(num_tokens, E, device=device, dtype=torch.float32)
+
+    # Pre-compile raw kernels
     raw_fused = {}
     raw_gemm = None
     if HAS_FUSED:
@@ -95,7 +88,7 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
                 if algo in ("selection", "ws_selection"):
                     fn = fused_router_ws_selection_kernel if algo == "ws_selection" else fused_router_selection_kernel
                     raw_fused[algo] = fn(
-                        num_tokens, H, E, _Ep, K,
+                        num_tokens, H, E, E_padded, K,
                         block_M=64, block_K=64, num_stages=2, threads=256,
                         dtype=T.bfloat16)
                 else:
@@ -109,7 +102,7 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
         try:
             print(f"    Compiling TL-GEMM T={num_tokens} E={E}...", end=" ", flush=True)
             raw_gemm = router_gemm_kernel(
-                num_tokens, H, _Ep,
+                num_tokens, H, E_padded,
                 block_M=64, block_K=64, num_stages=2, threads=256,
                 dtype=T.bfloat16)
             print("OK", flush=True)
@@ -129,30 +122,9 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
     results = {}
 
     # ==========================================
-    # Pure kernel benchmark:
-    # - PyTorch / multi-kernel pipelines: do_bench (per-iteration events + L2 flush)
-    # - TileLang single kernels: profiler.do_bench (adapter-level, no JIT wrapper overhead)
-    # Note: CUPTI backend tested but rejected — profiling overhead is non-uniform
-    # across implementations (2-10x inflation for TileLang JIT calls).
+    # All versions use do_bench (per-iteration events + L2 flush).
+    # No profiler.do_bench — ensures uniform measurement method.
     # ==========================================
-
-    # --- GEMM-only: torch.mm vs TileLang GEMM ---
-    print(f"    [torch.mm] timing...", end=" ", flush=True)
-    results['torch.mm'] = do_bench(
-        lambda: torch.mm(X_bf16, W_bf16), warmup=warmup, rep=rep)
-    print(f"{results['torch.mm']:.4f}ms", flush=True)
-
-    if raw_gemm is not None:
-        try:
-            raw_gemm(X_bf16, W_padded)  # verify
-            torch.cuda.synchronize()
-            print(f"    [TL-GEMM] timing...", end=" ", flush=True)
-            profiler_gemm = raw_gemm.get_profiler()
-            results['TL-GEMM'] = profiler_gemm.do_bench(
-                input_tensors=[X_bf16, W_padded], warmup=warmup, rep=rep)
-            print(f"{results['TL-GEMM']:.4f}ms", flush=True)
-        except Exception as e:
-            print(f"    [TL-GEMM] FAIL: {e}", flush=True)
 
     # --- BL-PyTorch: torch.mm + torch.topk + torch.softmax ---
     def pytorch_sep():
@@ -161,32 +133,27 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
         scores = torch.softmax(topk_vals, dim=-1)
         return scores, topk_idx
 
-    print(f"    [PyTorch] verify...", end=" ", flush=True)
-    pytorch_sep()
-    torch.cuda.synchronize()
-    print("OK, timing...", end=" ", flush=True)
+    print(f"    [PyTorch] timing...", end=" ", flush=True)
     results['PyTorch'] = do_bench(pytorch_sep, warmup=warmup, rep=rep)
     print(f"{results['PyTorch']:.4f}ms", flush=True)
 
     # --- BL-TileLang: TileLang GEMM + topk_softmax_best ---
-    # Multi-kernel pipeline — use do_bench at function level
     if HAS_TL_TOPK and raw_gemm is not None:
         def tilelang_sep():
             logits_p = raw_gemm(X_bf16, W_padded)
             return topk_softmax_best(logits_p[:, :E].contiguous(), K)
 
         try:
-            print(f"    [TL-sep] verify...", end=" ", flush=True)
-            tilelang_sep()
+            tilelang_sep()  # verify
             torch.cuda.synchronize()
-            print("OK, timing...", end=" ", flush=True)
+            print(f"    [TL-sep] timing...", end=" ", flush=True)
             results['TL-sep'] = do_bench(tilelang_sep, warmup=warmup, rep=rep)
             print(f"{results['TL-sep']:.4f}ms", flush=True)
         except Exception as e:
-            print(f"FAIL: {e}", flush=True)
+            print(f"    [TL-sep] FAIL: {e}", flush=True)
             results['TL-sep'] = float('inf')
 
-    # --- Fused variants: profiler.do_bench via adapter ---
+    # --- Fused variants: same do_bench, same measurement ---
     algo_names = {
         "selection": "Fused-Sel",
         "ws_selection": "Fused-WS",
@@ -196,16 +163,15 @@ def run_single_config(name, H, E, K, num_tokens, warmup=20, rep=200):
         if algo in raw_fused:
             kern = raw_fused[algo]
             try:
-                print(f"    [{label}] verify...", end=" ", flush=True)
-                kern(X_bf16, W_padded)
+                kern(X_bf16, W_padded)  # verify
                 torch.cuda.synchronize()
-                print("OK, timing...", end=" ", flush=True)
-                profiler_fused = kern.get_profiler()
-                results[label] = profiler_fused.do_bench(
-                    input_tensors=[X_bf16, W_padded], warmup=warmup, rep=rep)
+                print(f"    [{label}] timing...", end=" ", flush=True)
+                results[label] = do_bench(
+                    lambda k=kern: k(X_bf16, W_padded),
+                    warmup=warmup, rep=rep)
                 print(f"{results[label]:.4f}ms", flush=True)
             except Exception as e:
-                print(f"\n[{label} Error] {e}")
+                print(f"    [{label}] FAIL: {e}", flush=True)
                 results[label] = float('inf')
 
     return results
@@ -231,12 +197,13 @@ def main():
         input_sweep = INPUT_TOKENS_SWEEP
 
     print("=" * 100)
-    print("Router Fusion Benchmark — Fused GEMM + TopK + Softmax (BF16 input, F32 logits)")
+    print("Router Fusion Benchmark — Fused GEMM + TopK + Softmax (BF16, do_bench uniform)")
     print("=" * 100)
     print("Device:", torch.cuda.get_device_name())
     print("PyTorch:", torch.__version__)
     print("TL topk_softmax:", "available" if HAS_TL_TOPK else "NOT available")
     print("Fused kernels:", "available" if HAS_FUSED else "NOT available")
+    print("Timing: do_bench (per-iteration events + L2 flush) for ALL versions")
     print()
 
     all_rows = []
@@ -250,7 +217,6 @@ def main():
                 name, H, E, K, num_tokens,
                 warmup=args.warmup, rep=args.rep)
 
-            # Print inline
             parts = []
             for v, lat in results.items():
                 if lat == float('inf'):
@@ -292,7 +258,6 @@ def main():
                 row.append("FAIL")
             else:
                 row.append(f"{py_lat / lat:.2f}x")
-        # Best
         best_name, best_lat = "N/A", float('inf')
         for v in version_keys:
             lat = r.get(v, float('inf'))
