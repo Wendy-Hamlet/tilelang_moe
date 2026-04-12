@@ -358,6 +358,11 @@ def fused_router_warp_selection_kernel(
 
             T.copy(C_local, C_shared)
 
+            # CRITICAL: sync after C_shared write before epilogue reads.
+            # TL_DISABLE_THREAD_STORAGE_SYNC suppresses auto-sync, so we
+            # must manually ensure all C_shared writes are visible.
+            T.sync_threads()
+
             # ======== Warp-Parallel TopK + Softmax Epilogue ========
             # 8 warps × 8 rounds = 64 rows. Each warp independently processes 1 row.
             for rnd in T.serial(num_rounds):
@@ -383,17 +388,17 @@ def fused_router_warp_selection_kernel(
                         # Warp-level argmax via shuffle (no sync_threads)
                         warp_max = T.warp_reduce_max(my_max_val)
 
-                        # Find which lane holds the max and broadcast its index.
-                        # Each lane sets its candidate: real index if it has the
-                        # max, or -1 otherwise. Then warp_reduce_max on the
-                        # candidate gives the winner index (since real indices > -1).
-                        my_candidate = T.alloc_var(T.int32)
+                        # Find which lane holds the max: set candidate to real
+                        # index if this lane has the max, else -1. Reduce with
+                        # max gives the winner (real index > -1). Use float to
+                        # avoid potential int warp_reduce issues.
+                        my_candidate_f = T.alloc_var(T.float32)
                         if my_max_val == warp_max:
-                            my_candidate = my_max_idx
+                            my_candidate_f = T.cast(my_max_idx, T.float32)
                         else:
-                            my_candidate = T.int32(-1)
-                        # Max of candidates: the real index wins over -1
-                        winner_idx = T.warp_reduce_max(my_candidate)
+                            my_candidate_f = T.float32(-1.0)
+                        winner_idx_f = T.warp_reduce_max(my_candidate_f)
+                        winner_idx = T.cast(winner_idx_f, T.int32)
 
                         # Store topk result and mask with -inf (lane 0 only)
                         if lane_id == 0:
