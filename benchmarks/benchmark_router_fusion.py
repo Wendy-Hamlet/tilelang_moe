@@ -35,6 +35,7 @@ try:
         _next_pow2, router_gemm_kernel,
         fused_router_selection_kernel, fused_router_bitonic_kernel,
         fused_router_ws_selection_kernel, fused_router_warp_selection_kernel,
+        fused_router_warp_selection_v2_kernel,
     )
     import tilelang.language as T
     HAS_FUSED = True
@@ -82,13 +83,14 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
     raw_fused = {}
     raw_gemm = None
     if HAS_FUSED:
-        for algo in ["selection", "warp_selection", "ws_selection", "bitonic"]:
+        for algo in ["selection", "warp_selection", "warp_selection_v2", "ws_selection", "bitonic"]:
             try:
                 print(f"    Compiling fused-{algo} T={num_tokens} E={E}...", end=" ", flush=True)
-                if algo in ("selection", "ws_selection", "warp_selection"):
+                if algo in ("selection", "ws_selection", "warp_selection", "warp_selection_v2"):
                     fn = {
                         "selection": fused_router_selection_kernel,
                         "warp_selection": fused_router_warp_selection_kernel,
+                        "warp_selection_v2": fused_router_warp_selection_v2_kernel,
                         "ws_selection": fused_router_ws_selection_kernel,
                     }[algo]
                     raw_fused[algo] = fn(
@@ -161,6 +163,7 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
     algo_names = {
         "selection": "Fused-Sel",
         "warp_selection": "Fused-Warp",
+        "warp_selection_v2": "Fused-WarpV2",
         "ws_selection": "Fused-WS",
         "bitonic": "Fused-Bit",
     }
@@ -240,7 +243,7 @@ def main():
     print("SUMMARY: Latency (ms) and Speedup vs PyTorch separate")
     print("=" * 100)
 
-    version_keys = ['PyTorch', 'TL-sep', 'Fused-Sel', 'Fused-Warp', 'Fused-WS', 'Fused-Bit']
+    version_keys = ['PyTorch', 'TL-sep', 'Fused-Sel', 'Fused-Warp', 'Fused-WarpV2', 'Fused-WS', 'Fused-Bit']
     version_keys = [v for v in version_keys if any(v in r for r in all_rows)]
 
     headers = ["Model", "T"] + \
