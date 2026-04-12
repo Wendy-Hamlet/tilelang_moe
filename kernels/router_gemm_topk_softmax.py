@@ -339,9 +339,6 @@ def fused_router_warp_selection_kernel(
             C_local = T.alloc_fragment([block_M, E_padded], accum_dtype)
             C_shared = T.alloc_shared([block_M, E_padded], accum_dtype)
 
-            # Per-warp argmax result buffer: each warp writes its winner index
-            s_warp_max_idx = T.alloc_shared([num_warps], T.int32)
-
             T.annotate_layout({
                 A_shared: tilelang.layout.make_swizzled_layout(A_shared),
                 B_shared: tilelang.layout.make_swizzled_layout(B_shared),
@@ -386,13 +383,20 @@ def fused_router_warp_selection_kernel(
                         # Warp-level argmax via shuffle (no sync_threads)
                         warp_max = T.warp_reduce_max(my_max_val)
 
-                        # The lane that holds the max writes its index
+                        # Find which lane holds the max and broadcast its index.
+                        # Each lane sets its candidate: real index if it has the
+                        # max, or -1 otherwise. Then warp_reduce_max on the
+                        # candidate gives the winner index (since real indices > -1).
+                        my_candidate = T.alloc_var(T.int32)
                         if my_max_val == warp_max:
-                            s_warp_max_idx[warp_id] = my_max_idx
+                            my_candidate = my_max_idx
+                        else:
+                            my_candidate = T.int32(-1)
+                        # Max of candidates: the real index wins over -1
+                        winner_idx = T.warp_reduce_max(my_candidate)
 
-                        # Store topk result and mask with -inf
+                        # Store topk result and mask with -inf (lane 0 only)
                         if lane_id == 0:
-                            winner_idx = s_warp_max_idx[warp_id]
                             scores[token_idx, k_iter] = warp_max
                             indices[token_idx, k_iter] = winner_idx
                             C_shared[row, winner_idx] = T.float32(-1e38)
