@@ -298,6 +298,126 @@ def fused_router_ws_selection_kernel(
 
 
 # ============================================================================
+# Warp-Parallel Selection Sort Fused Kernel
+# Each warp independently processes a different row — 8 rows in parallel.
+# Uses warp_reduce_max (shuffle) instead of block-level tree reduction.
+# ============================================================================
+
+@tilelang.jit(out_idx=[1, 2], pass_configs=_fused_pass_configs)
+def fused_router_warp_selection_kernel(
+    num_tokens, H, E, E_padded, top_k,
+    block_M=64, block_K=64, num_stages=2, threads=256,
+    dtype=T.bfloat16,
+):
+    """
+    Fused Router GEMM + Warp-Parallel Selection TopK + Softmax.
+
+    GEMM: same as other fused kernels (block_M rows, pipelined).
+    Epilogue: 8 warps process 8 rows in parallel (8 rounds for 64 rows).
+    Each warp uses warp_reduce_max (shuffle) — no block-level sync in the
+    selection loop. ~8x fewer rounds than the serial version.
+    """
+    num_m_blocks = (num_tokens + block_M - 1) // block_M
+    accum_dtype = T.float32
+    WARP_SIZE = 32
+    num_warps = threads // WARP_SIZE  # 8
+    rows_per_round = num_warps        # 8 rows processed in parallel
+    num_rounds = (block_M + rows_per_round - 1) // rows_per_round  # 8
+    elems_per_lane = (E + WARP_SIZE - 1) // WARP_SIZE  # elements per thread within a warp
+
+    @T.prim_func
+    def kernel(
+        X: T.Tensor([num_tokens, H], dtype),
+        scores: T.Tensor([num_tokens, top_k], T.float32),
+        indices: T.Tensor([num_tokens, top_k], T.int32),
+        W: T.Tensor([H, E_padded], dtype),
+    ):
+        with T.Kernel(num_m_blocks, threads=threads) as (bx):
+            # --- Shared memory allocations ---
+            A_shared = T.alloc_shared([block_M, block_K], dtype)
+            B_shared = T.alloc_shared([block_K, E_padded], dtype)
+            C_local = T.alloc_fragment([block_M, E_padded], accum_dtype)
+            C_shared = T.alloc_shared([block_M, E_padded], accum_dtype)
+
+            # Per-warp argmax result buffer: each warp writes its winner index
+            s_warp_max_idx = T.alloc_shared([num_warps], T.int32)
+
+            T.annotate_layout({
+                A_shared: tilelang.layout.make_swizzled_layout(A_shared),
+                B_shared: tilelang.layout.make_swizzled_layout(B_shared),
+            })
+
+            m_start = bx * block_M
+            tx = T.get_thread_binding()
+            warp_id = tx // WARP_SIZE
+            lane_id = tx % WARP_SIZE
+
+            # ======== GEMM Phase ========
+            T.clear(C_local)
+            for k in T.Pipelined(T.ceildiv(H, block_K), num_stages=num_stages):
+                T.copy(X[m_start, k * block_K], A_shared)
+                T.copy(W[k * block_K, 0], B_shared)
+                T.gemm(A_shared, B_shared, C_local)
+
+            T.copy(C_local, C_shared)
+
+            # ======== Warp-Parallel TopK + Softmax Epilogue ========
+            # 8 warps × 8 rounds = 64 rows. Each warp independently processes 1 row.
+            for rnd in T.serial(num_rounds):
+                row = rnd * rows_per_round + warp_id
+                token_idx = m_start + row
+                if token_idx < num_tokens:
+                    # --- Selection sort: K iterations ---
+                    for k_iter in T.serial(top_k):
+                        # Each lane scans its portion of the row
+                        my_max_val = T.alloc_var(T.float32)
+                        my_max_idx = T.alloc_var(T.int32)
+                        my_max_val = T.float32(-1e38)
+                        my_max_idx = T.int32(-1)
+
+                        for i in T.serial(elems_per_lane):
+                            col = lane_id * elems_per_lane + i
+                            if col < E:
+                                val = C_shared[row, col]
+                                if val > my_max_val:
+                                    my_max_val = val
+                                    my_max_idx = T.int32(col)
+
+                        # Warp-level argmax via shuffle (no sync_threads)
+                        warp_max = T.warp_reduce_max(my_max_val)
+
+                        # The lane that holds the max writes its index
+                        if my_max_val == warp_max:
+                            s_warp_max_idx[warp_id] = my_max_idx
+
+                        # Store topk result and mask with -inf
+                        if lane_id == 0:
+                            winner_idx = s_warp_max_idx[warp_id]
+                            scores[token_idx, k_iter] = warp_max
+                            indices[token_idx, k_iter] = winner_idx
+                            C_shared[row, winner_idx] = T.float32(-1e38)
+
+                    # --- Softmax over top-K values (lane 0 of each warp) ---
+                    if lane_id == 0:
+                        max_val = T.alloc_var(T.float32)
+                        max_val = T.float32(-1e38)
+                        for i in T.serial(top_k):
+                            if scores[token_idx, i] > max_val:
+                                max_val = scores[token_idx, i]
+
+                        exp_sum = T.alloc_var(T.float32)
+                        exp_sum = T.float32(0.0)
+                        for i in T.serial(top_k):
+                            scores[token_idx, i] = T.exp(scores[token_idx, i] - max_val)
+                            exp_sum = exp_sum + scores[token_idx, i]
+
+                        for i in T.serial(top_k):
+                            scores[token_idx, i] = scores[token_idx, i] / exp_sum
+
+    return kernel
+
+
+# ============================================================================
 # Selection Sort Fused Kernel (non-ws, original version)
 # ============================================================================
 
@@ -818,6 +938,11 @@ def get_fused_router_kernel(algo, num_tokens, H, E, top_k, dtype=T.bfloat16):
 
     if algo == "selection":
         kernel = fused_router_selection_kernel(
+            num_tokens, H, E, E_padded, top_k,
+            block_M=block_M, block_K=block_K,
+            num_stages=num_stages, threads=threads, dtype=dtype)
+    elif algo == "warp_selection":
+        kernel = fused_router_warp_selection_kernel(
             num_tokens, H, E, E_padded, top_k,
             block_M=block_M, block_K=block_K,
             num_stages=num_stages, threads=threads, dtype=dtype)

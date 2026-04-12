@@ -34,7 +34,7 @@ try:
     from kernels.router_gemm_topk_softmax import (
         _next_pow2, router_gemm_kernel,
         fused_router_selection_kernel, fused_router_bitonic_kernel,
-        fused_router_ws_selection_kernel,
+        fused_router_ws_selection_kernel, fused_router_warp_selection_kernel,
     )
     import tilelang.language as T
     HAS_FUSED = True
@@ -82,11 +82,15 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
     raw_fused = {}
     raw_gemm = None
     if HAS_FUSED:
-        for algo in ["selection", "ws_selection", "bitonic"]:
+        for algo in ["selection", "warp_selection", "ws_selection", "bitonic"]:
             try:
                 print(f"    Compiling fused-{algo} T={num_tokens} E={E}...", end=" ", flush=True)
-                if algo in ("selection", "ws_selection"):
-                    fn = fused_router_ws_selection_kernel if algo == "ws_selection" else fused_router_selection_kernel
+                if algo in ("selection", "ws_selection", "warp_selection"):
+                    fn = {
+                        "selection": fused_router_selection_kernel,
+                        "warp_selection": fused_router_warp_selection_kernel,
+                        "ws_selection": fused_router_ws_selection_kernel,
+                    }[algo]
                     raw_fused[algo] = fn(
                         num_tokens, H, E, E_padded, K,
                         block_M=64, block_K=64, num_stages=2, threads=256,
@@ -156,6 +160,7 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
     # --- Fused variants: same do_bench, same measurement ---
     algo_names = {
         "selection": "Fused-Sel",
+        "warp_selection": "Fused-Warp",
         "ws_selection": "Fused-WS",
         "bitonic": "Fused-Bit",
     }
@@ -235,7 +240,7 @@ def main():
     print("SUMMARY: Latency (ms) and Speedup vs PyTorch separate")
     print("=" * 100)
 
-    version_keys = ['PyTorch', 'TL-sep', 'Fused-Sel', 'Fused-WS', 'Fused-Bit']
+    version_keys = ['PyTorch', 'TL-sep', 'Fused-Sel', 'Fused-Warp', 'Fused-WS', 'Fused-Bit']
     version_keys = [v for v in version_keys if any(v in r for r in all_rows)]
 
     headers = ["Model", "T"] + \
