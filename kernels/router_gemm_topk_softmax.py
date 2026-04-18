@@ -486,8 +486,12 @@ def fused_router_tma_selection_kernel(
                     T.mbarrier_wait_parity(
                         mbarrier=ko % num_stages + num_stages,
                         parity=((ko // num_stages) % num_stages) ^ 1)
-                    T.copy(X[m_start, ko * block_K], A_shared[ko % num_stages, :, :])
-                    T.copy(W[ko * block_K, 0], B_shared[ko % num_stages, :, :])
+                    T.copy(
+                        X[m_start:m_start + block_M, ko * block_K:(ko + 1) * block_K],
+                        A_shared[ko % num_stages, :, :])
+                    T.copy(
+                        W[ko * block_K:(ko + 1) * block_K, 0:E_padded],
+                        B_shared[ko % num_stages, :, :])
                     T.mbarrier_arrive(mbarrier=ko % num_stages)
                 with T.ws(0):  # consumer: WGMMA compute
                     T.mbarrier_wait_parity(
@@ -622,8 +626,12 @@ def fused_router_tma_bitonic_kernel(
                     T.mbarrier_wait_parity(
                         mbarrier=ko % num_stages + num_stages,
                         parity=((ko // num_stages) % num_stages) ^ 1)
-                    T.copy(X[m_start, ko * block_K], A_shared[ko % num_stages, :, :])
-                    T.copy(W[ko * block_K, 0], B_shared[ko % num_stages, :, :])
+                    T.copy(
+                        X[m_start:m_start + block_M, ko * block_K:(ko + 1) * block_K],
+                        A_shared[ko % num_stages, :, :])
+                    T.copy(
+                        W[ko * block_K:(ko + 1) * block_K, 0:E_padded],
+                        B_shared[ko % num_stages, :, :])
                     T.mbarrier_arrive(mbarrier=ko % num_stages)
                 with T.ws(0):
                     T.mbarrier_wait_parity(
