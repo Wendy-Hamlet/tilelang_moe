@@ -11,6 +11,10 @@ Kernel variants:
   cpasync_bitonic   : cp.async GEMM + bitonic-sort epilogue
   tma_selection     : TMA+WS GEMM  + selection-sort epilogue  (Hopper+)
   tma_bitonic       : TMA+WS GEMM  + bitonic-sort epilogue    (Hopper+)
+  tma2_selection    : TMA+WS GEMM  + selection (1prod+2cons M-split, Hopper+)
+  tma2_bitonic      : TMA+WS GEMM  + bitonic   (1prod+2cons M-split, Hopper+)
+  tma2n_selection   : TMA+WS GEMM  + selection (1prod+2cons N-split, Hopper+)
+  tma2n_bitonic     : TMA+WS GEMM  + bitonic   (1prod+2cons N-split, Hopper+)
 """
 
 import sys
@@ -43,6 +47,10 @@ try:
         fused_router_cpasync_bitonic_kernel,
         fused_router_tma_selection_kernel,
         fused_router_tma_bitonic_kernel,
+        fused_router_tma2_selection_kernel,
+        fused_router_tma2_bitonic_kernel,
+        fused_router_tma2n_selection_kernel,
+        fused_router_tma2n_bitonic_kernel,
     )
     import tilelang.language as T
     HAS_FUSED = True
@@ -64,9 +72,6 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
     """Run benchmark for one (model, num_tokens) config."""
     device = "cuda"
 
-    # ==========================================
-    # Preprocessing (NOT timed) — all allocation done here
-    # ==========================================
     X_bf16 = torch.randn(num_tokens, H, device=device, dtype=torch.bfloat16)
     W_bf16 = torch.randn(H, E, device=device, dtype=torch.bfloat16)
 
@@ -77,22 +82,25 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
     else:
         W_padded = W_bf16
 
-    # Pre-compile raw kernels
     raw_fused = {}
     raw_gemm = None
     if HAS_FUSED:
         factory_map = {
-            "cpasync_selection": fused_router_cpasync_selection_kernel,
-            "cpasync_bitonic":   fused_router_cpasync_bitonic_kernel,
-            "tma_selection":     fused_router_tma_selection_kernel,
-            "tma_bitonic":       fused_router_tma_bitonic_kernel,
+            "cpasync_selection": (fused_router_cpasync_selection_kernel,  256),
+            "cpasync_bitonic":   (fused_router_cpasync_bitonic_kernel,    256),
+            "tma_selection":     (fused_router_tma_selection_kernel,      256),
+            "tma_bitonic":       (fused_router_tma_bitonic_kernel,        256),
+            "tma2_selection":    (fused_router_tma2_selection_kernel,     384),
+            "tma2_bitonic":      (fused_router_tma2_bitonic_kernel,       384),
+            "tma2n_selection":   (fused_router_tma2n_selection_kernel,    384),
+            "tma2n_bitonic":     (fused_router_tma2n_bitonic_kernel,      384),
         }
-        for algo, factory in factory_map.items():
+        for algo, (factory, th) in factory_map.items():
             try:
                 print(f"    Compiling {algo} T={num_tokens} E={E}...", end=" ", flush=True)
                 raw_fused[algo] = factory(
                     num_tokens, H, E, E_padded, K,
-                    block_M=64, block_K=64, num_stages=2, threads=256,
+                    block_M=64, block_K=64, num_stages=2, threads=th,
                     dtype=T.bfloat16)
                 print("OK", flush=True)
             except Exception as e:
@@ -108,7 +116,6 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
         except Exception as e:
             print(f"FAIL: {e}", flush=True)
 
-    # Pre-compile TileLang topk (warmup call)
     if HAS_TL_TOPK:
         try:
             print(f"    Compiling TL-topk T={num_tokens} E={E}...", end=" ", flush=True)
@@ -120,11 +127,6 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
 
     results = {}
 
-    # ==========================================
-    # All versions use do_bench (per-iteration events + L2 flush).
-    # ==========================================
-
-    # --- BL-PyTorch: torch.mm + torch.topk + torch.softmax ---
     def pytorch_sep():
         logits = torch.mm(X_bf16, W_bf16).float()
         topk_vals, topk_idx = torch.topk(logits, K, dim=-1)
@@ -135,7 +137,6 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
     results['PyTorch'] = do_bench(pytorch_sep, warmup=warmup, rep=rep)
     print(f"{results['PyTorch']:.4f}ms", flush=True)
 
-    # --- BL-TileLang: TileLang GEMM + topk_softmax_best ---
     if HAS_TL_TOPK and raw_gemm is not None:
         def tilelang_sep():
             logits_p = raw_gemm(X_bf16, W_padded)
@@ -151,12 +152,15 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
             print(f"    [TL-sep] FAIL: {e}", flush=True)
             results['TL-sep'] = float('inf')
 
-    # --- Fused variants ---
     algo_display = {
         "cpasync_selection": "CpAsync-Sel",
         "cpasync_bitonic":   "CpAsync-Bit",
         "tma_selection":     "TMA-Sel",
         "tma_bitonic":       "TMA-Bit",
+        "tma2_selection":    "TMA2-Sel",
+        "tma2_bitonic":      "TMA2-Bit",
+        "tma2n_selection":   "TMA2N-Sel",
+        "tma2n_bitonic":     "TMA2N-Bit",
     }
     for algo, label in algo_display.items():
         if algo in raw_fused:
@@ -182,6 +186,8 @@ def main():
     parser.add_argument("--input-tokens", type=str, default=None)
     parser.add_argument("--warmup", type=int, default=25, help="Warmup time budget in ms")
     parser.add_argument("--rep", type=int, default=100, help="Benchmark time budget in ms")
+    parser.add_argument("--algos", type=str, default=None,
+                        help="Comma-separated algos to run")
     args = parser.parse_args()
 
     if args.models:
@@ -229,13 +235,13 @@ def main():
                 'T': num_tokens, **results
             })
 
-    # ============ Summary table ============
     print("\n\n" + "=" * 100)
     print("SUMMARY: Latency (ms) and Speedup vs PyTorch separate")
     print("=" * 100)
 
     version_keys = ['PyTorch', 'TL-sep',
-                    'CpAsync-Sel', 'CpAsync-Bit', 'TMA-Sel', 'TMA-Bit']
+                    'CpAsync-Sel', 'CpAsync-Bit', 'TMA-Sel', 'TMA-Bit',
+                    'TMA2-Sel', 'TMA2-Bit', 'TMA2N-Sel', 'TMA2N-Bit']
     version_keys = [v for v in version_keys if any(v in r for r in all_rows)]
 
     headers = ["Model", "T"] + \

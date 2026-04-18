@@ -41,9 +41,10 @@ def _next_pow2(n: int) -> int:
 
 
 # cp.async variants: pure cp.async path, disable both TMA and WS lowering.
+# Keep TL_DISABLE_THREAD_STORAGE_SYNC OFF so auto-sync inserts barriers between
+# shared writes (C_local->C_shared) and subsequent reads in the epilogue.
 _cpasync_pass_configs = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-    tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
     tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
 }
 
@@ -274,6 +275,10 @@ def fused_router_cpasync_bitonic_kernel(
     if elems_per_lane < 1:
         elems_per_lane = 1
     K_padded = _next_pow2(top_k)
+    # frag must accommodate both the per-lane source elements AND the K_padded
+    # working set used by the bitonic merge; otherwise frag[ki] for ki<K_padded
+    # is OOB when elems_per_lane < K_padded.
+    frag_size = max(elems_per_lane, K_padded)
     log_ept = int(math.log2(elems_per_lane)) if elems_per_lane > 1 else 0
     log_kp = int(math.log2(K_padded)) if K_padded > 1 else 0
     idx_bits = int(math.ceil(math.log2(max(E_padded, 2))))
@@ -281,6 +286,10 @@ def fused_router_cpasync_bitonic_kernel(
     num_merge_stages = int(math.log2(WARP_SIZE))  # 5
 
     NEG_INF = -T.infinity(T.float32)
+    # Pre-compute bit pattern for a "padding" entry: NEG_INF value with col=0
+    # encoded as negative (so enc bits = 0 & idx_mask = 0). After idx stripping
+    # fval stays NEG_INF, losing every compare. frag_size - elems_per_lane such
+    # slots occupy the tail when elems_per_lane < K_padded.
 
     @T.prim_func
     def kernel(
@@ -321,8 +330,12 @@ def fused_router_cpasync_bitonic_kernel(
                 row = rnd * rows_per_round + warp_id
                 token_idx = m_start + row
                 if token_idx < num_tokens:
-                    # Bit-pack E elements into register fragment
-                    frag = T.alloc_local([elems_per_lane], T.uint32)
+                    # Bit-pack E elements into register fragment.
+                    # Size = max(elems_per_lane, K_padded); pad tail with NEG_INF.
+                    # NEG_INF_BITS_CLEAN = 0xFF800000 & ~idx_mask = 0xFF800000 (low
+                    # 23 bits of -inf are already 0, so masking is a no-op).
+                    NEG_INF_BITS_CLEAN = T.uint32(0xFF800000 & ~idx_mask_val)
+                    frag = T.alloc_local([frag_size], T.uint32)
                     for e in T.serial(elems_per_lane):
                         col = lane_id * elems_per_lane + e
                         fval = T.if_then_else(col < E, C_shared[row, col], NEG_INF)
@@ -333,10 +346,13 @@ def fused_router_cpasync_bitonic_kernel(
                             (~col_u32) & idx_mask,
                             col_u32 & idx_mask)
                         frag[e] = (bits & (~idx_mask)) | encoded_idx
+                    # Pad tail slots if frag_size > elems_per_lane
+                    for e in T.serial(frag_size - elems_per_lane):
+                        frag[elems_per_lane + e] = NEG_INF_BITS_CLEAN
 
-                    # Local partial top-K_padded via selection (elems_per_lane iterations)
+                    # Local partial top-K_padded via selection over all frag_size slots.
                     for ki in T.serial(K_padded):
-                        for e in T.serial(elems_per_lane):
+                        for e in T.serial(frag_size):
                             if e > ki:
                                 fi = T.reinterpret(T.float32, frag[ki])
                                 fe = T.reinterpret(T.float32, frag[e])
@@ -601,6 +617,7 @@ def fused_router_tma_bitonic_kernel(
     if elems_per_lane < 1:
         elems_per_lane = 1
     K_padded = _next_pow2(top_k)
+    frag_size = max(elems_per_lane, K_padded)
     log_kp = int(math.log2(K_padded)) if K_padded > 1 else 0
     idx_bits = int(math.ceil(math.log2(max(E_padded, 2))))
     idx_mask_val = (1 << idx_bits) - 1
@@ -629,6 +646,7 @@ def fused_router_tma_bitonic_kernel(
             warp_id = tx // WARP_SIZE
             lane_id = tx % WARP_SIZE
             idx_mask = T.uint32(idx_mask_val)
+            NEG_INF_BITS_CLEAN = T.uint32(0xFF800000 & ~idx_mask_val)
 
             with T.ws(0):
                 T.clear(C_local)
@@ -667,7 +685,7 @@ def fused_router_tma_bitonic_kernel(
                 row = rnd * rows_per_round + warp_id
                 token_idx = m_start + row
                 if token_idx < num_tokens:
-                    frag = T.alloc_local([elems_per_lane], T.uint32)
+                    frag = T.alloc_local([frag_size], T.uint32)
                     for e in T.serial(elems_per_lane):
                         col = lane_id * elems_per_lane + e
                         fval = T.if_then_else(col < E, C_shared[row, col], NEG_INF)
@@ -678,9 +696,11 @@ def fused_router_tma_bitonic_kernel(
                             (~col_u32) & idx_mask,
                             col_u32 & idx_mask)
                         frag[e] = (bits & (~idx_mask)) | encoded_idx
+                    for e in T.serial(frag_size - elems_per_lane):
+                        frag[elems_per_lane + e] = NEG_INF_BITS_CLEAN
 
                     for ki in T.serial(K_padded):
-                        for e in T.serial(elems_per_lane):
+                        for e in T.serial(frag_size):
                             if e > ki:
                                 fi = T.reinterpret(T.float32, frag[ki])
                                 fe = T.reinterpret(T.float32, frag[e])
@@ -1002,17 +1022,894 @@ def fused_router_tma2_selection_kernel(
 
 
 # ============================================================================
+# TMA+WS 2-Consumer Bitonic (Hopper, threads=384)
+# ============================================================================
+
+@tilelang.jit(out_idx=[1, 2], pass_configs=_tma_pass_configs)
+def fused_router_tma2_bitonic_kernel(
+    num_tokens, H, E, E_padded, top_k,
+    block_M=64, block_K=64, num_stages=2, threads=384,
+    dtype=T.bfloat16,
+):
+    """Fused Router GEMM (TMA+WS, 1prod+2cons, Hopper) + Bitonic + Softmax."""
+    block_M_total = 2 * block_M
+    num_m_blocks = (num_tokens + block_M_total - 1) // block_M_total
+    accum_dtype = T.float32
+    WARP_SIZE = 32
+    num_warps_per_wg = 128 // WARP_SIZE  # 4 warps/WG
+    rows_per_round = num_warps_per_wg
+    num_rounds = (block_M + rows_per_round - 1) // rows_per_round
+
+    elems_per_lane = E_padded // WARP_SIZE if E_padded >= WARP_SIZE else 1
+    if elems_per_lane < 1:
+        elems_per_lane = 1
+    K_padded = _next_pow2(top_k)
+    frag_size = max(elems_per_lane, K_padded)
+    log_kp = int(math.log2(K_padded)) if K_padded > 1 else 0
+    idx_bits = int(math.ceil(math.log2(max(E_padded, 2))))
+    idx_mask_val = (1 << idx_bits) - 1
+    num_merge_stages = int(math.log2(WARP_SIZE))
+
+    NEG_INF = -T.infinity(T.float32)
+    NEG_INF_BITS_CLEAN_val = 0xFF800000 & ~idx_mask_val
+
+    @T.prim_func
+    def kernel(
+        X: T.Tensor([num_tokens, H], dtype),
+        scores: T.Tensor([num_tokens, top_k], T.float32),
+        indices: T.Tensor([num_tokens, top_k], T.int32),
+        W: T.Tensor([H, E_padded], dtype),
+    ):
+        with T.Kernel(num_m_blocks, threads=threads) as (bx):
+            A_shared_0 = T.alloc_shared([num_stages, block_M, block_K], dtype)
+            A_shared_1 = T.alloc_shared([num_stages, block_M, block_K], dtype)
+            B_shared   = T.alloc_shared([num_stages, block_K, E_padded], dtype)
+            C_local_0  = T.alloc_fragment([block_M, E_padded], accum_dtype)
+            C_local_1  = T.alloc_fragment([block_M, E_padded], accum_dtype)
+            C_shared_0 = T.alloc_shared([block_M, E_padded], accum_dtype)
+            C_shared_1 = T.alloc_shared([block_M, E_padded], accum_dtype)
+
+            T.create_list_of_mbarrier(
+                [128] * num_stages + [256] * num_stages + [128, 128])
+            EPI0 = 2 * num_stages
+            EPI1 = 2 * num_stages + 1
+
+            m_start_0 = bx * block_M_total
+            m_start_1 = bx * block_M_total + block_M
+            tx = T.get_thread_binding()
+            warp_id_wg = (tx // WARP_SIZE) % num_warps_per_wg
+            lane_id = tx % WARP_SIZE
+            idx_mask = T.uint32(idx_mask_val)
+            NEG_INF_BITS_CLEAN = T.uint32(NEG_INF_BITS_CLEAN_val)
+
+            with T.ws(0):
+                T.clear(C_local_0)
+            with T.ws(1):
+                T.clear(C_local_1)
+
+            for ko in range(T.ceildiv(H, block_K)):
+                with T.ws(2):  # producer
+                    T.mbarrier_wait_parity(
+                        mbarrier=ko % num_stages + num_stages,
+                        parity=((ko // num_stages) % num_stages) ^ 1)
+                    T.copy(
+                        X[m_start_0:m_start_0 + block_M,
+                          ko * block_K:(ko + 1) * block_K],
+                        A_shared_0[ko % num_stages, :, :])
+                    T.copy(
+                        X[m_start_1:m_start_1 + block_M,
+                          ko * block_K:(ko + 1) * block_K],
+                        A_shared_1[ko % num_stages, :, :])
+                    T.copy(
+                        W[ko * block_K:(ko + 1) * block_K, 0:E_padded],
+                        B_shared[ko % num_stages, :, :])
+                    T.mbarrier_arrive(mbarrier=ko % num_stages)
+                with T.ws(0):
+                    T.mbarrier_wait_parity(
+                        mbarrier=ko % num_stages,
+                        parity=(ko // num_stages) % num_stages)
+                    T.gemm(
+                        A_shared_0[ko % num_stages, :, :],
+                        B_shared[ko % num_stages, :, :],
+                        C_local_0)
+                    T.mbarrier_arrive(mbarrier=ko % num_stages + num_stages)
+                with T.ws(1):
+                    T.mbarrier_wait_parity(
+                        mbarrier=ko % num_stages,
+                        parity=(ko // num_stages) % num_stages)
+                    T.gemm(
+                        A_shared_1[ko % num_stages, :, :],
+                        B_shared[ko % num_stages, :, :],
+                        C_local_1)
+                    T.mbarrier_arrive(mbarrier=ko % num_stages + num_stages)
+
+            with T.ws(0):
+                T.copy(C_local_0, C_shared_0)
+                T.mbarrier_arrive(mbarrier=EPI0)
+            with T.ws(1):
+                T.copy(C_local_1, C_shared_1)
+                T.mbarrier_arrive(mbarrier=EPI1)
+
+            # ---- WG0 bitonic epilogue ----
+            with T.ws(0):
+                T.mbarrier_wait_parity(mbarrier=EPI0, parity=0)
+                for rnd in T.serial(num_rounds):
+                    row = rnd * rows_per_round + warp_id_wg
+                    token_idx = m_start_0 + row
+                    if token_idx < num_tokens:
+                        frag = T.alloc_local([frag_size], T.uint32)
+                        for e in T.serial(elems_per_lane):
+                            col = lane_id * elems_per_lane + e
+                            fval = T.if_then_else(col < E, C_shared_0[row, col], NEG_INF)
+                            bits = T.reinterpret(T.uint32, fval)
+                            col_u32 = T.Cast(T.uint32, col)
+                            encoded_idx = T.if_then_else(
+                                fval >= T.float32(0.0),
+                                (~col_u32) & idx_mask,
+                                col_u32 & idx_mask)
+                            frag[e] = (bits & (~idx_mask)) | encoded_idx
+                        for e in T.serial(frag_size - elems_per_lane):
+                            frag[elems_per_lane + e] = NEG_INF_BITS_CLEAN
+
+                        for ki in T.serial(K_padded):
+                            for e in T.serial(frag_size):
+                                if e > ki:
+                                    fi = T.reinterpret(T.float32, frag[ki])
+                                    fe = T.reinterpret(T.float32, frag[e])
+                                    if fe > fi:
+                                        tmp = frag[ki]
+                                        frag[ki] = frag[e]
+                                        frag[e] = tmp
+
+                        if log_kp > 0:
+                            for i1 in T.serial(log_kp):
+                                for i2 in T.serial(i1 + 1):
+                                    step = T.int32(1) << (i1 - i2)
+                                    dmask = T.int32(1) << (i1 + 1)
+                                    for i in T.serial(K_padded):
+                                        j = i ^ step
+                                        if i < j:
+                                            ascending = (i & dmask) != 0
+                                            fi = T.reinterpret(T.float32, frag[i])
+                                            fj = T.reinterpret(T.float32, frag[j])
+                                            do_swap = T.if_then_else(ascending, fi > fj, fi < fj)
+                                            if do_swap:
+                                                tmp = frag[i]
+                                                frag[i] = frag[j]
+                                                frag[j] = tmp
+
+                        partner = T.alloc_local([K_padded], T.uint32)
+                        for ms in T.serial(num_merge_stages):
+                            stride = T.int32(WARP_SIZE) >> (ms + 1)
+                            am_low = (lane_id & stride) == 0
+                            for k in T.serial(K_padded):
+                                val_i32 = T.reinterpret(T.int32, frag[k])
+                                p_i32 = T.shfl_xor(val_i32, stride)
+                                partner[k] = T.reinterpret(T.uint32, p_i32)
+                            for k in T.serial(K_padded):
+                                my_f = T.reinterpret(T.float32, frag[k])
+                                p_f = T.reinterpret(T.float32, partner[K_padded - 1 - k])
+                                should_take = T.if_then_else(am_low, p_f > my_f, my_f > p_f)
+                                if should_take:
+                                    frag[k] = partner[K_padded - 1 - k]
+                            if log_kp > 0:
+                                for i1 in T.serial(log_kp):
+                                    for i2 in T.serial(i1 + 1):
+                                        step = T.int32(1) << (i1 - i2)
+                                        dmask = T.int32(1) << (i1 + 1)
+                                        for i in T.serial(K_padded):
+                                            j = i ^ step
+                                            if i < j:
+                                                ascending = (i & dmask) != 0
+                                                fi = T.reinterpret(T.float32, frag[i])
+                                                fj = T.reinterpret(T.float32, frag[j])
+                                                do_swap = T.if_then_else(ascending, fi > fj, fi < fj)
+                                                if do_swap:
+                                                    tmp = frag[i]
+                                                    frag[i] = frag[j]
+                                                    frag[j] = tmp
+
+                        if lane_id == 0:
+                            local_vals = T.alloc_local([top_k], T.float32)
+                            local_idx = T.alloc_local([top_k], T.int32)
+                            for ki in T.serial(top_k):
+                                packed = frag[ki]
+                                cleaned = packed & (~idx_mask)
+                                fval = T.reinterpret(T.float32, cleaned)
+                                enc = packed & idx_mask
+                                col_idx = T.if_then_else(
+                                    fval >= T.float32(0.0),
+                                    (~enc) & idx_mask,
+                                    enc & idx_mask)
+                                local_vals[ki] = fval
+                                local_idx[ki] = T.Cast(T.int32, col_idx)
+                            max_val = T.alloc_var(T.float32)
+                            max_val = NEG_INF
+                            for i in T.serial(top_k):
+                                if local_vals[i] > max_val:
+                                    max_val = local_vals[i]
+                            exp_sum = T.alloc_var(T.float32)
+                            exp_sum = T.float32(0.0)
+                            for i in T.serial(top_k):
+                                local_vals[i] = T.exp(local_vals[i] - max_val)
+                                exp_sum = exp_sum + local_vals[i]
+                            for i in T.serial(top_k):
+                                scores[token_idx, i] = local_vals[i] / exp_sum
+                                indices[token_idx, i] = local_idx[i]
+
+            # ---- WG1 bitonic epilogue ----
+            with T.ws(1):
+                T.mbarrier_wait_parity(mbarrier=EPI1, parity=0)
+                for rnd in T.serial(num_rounds):
+                    row = rnd * rows_per_round + warp_id_wg
+                    token_idx = m_start_1 + row
+                    if token_idx < num_tokens:
+                        frag = T.alloc_local([frag_size], T.uint32)
+                        for e in T.serial(elems_per_lane):
+                            col = lane_id * elems_per_lane + e
+                            fval = T.if_then_else(col < E, C_shared_1[row, col], NEG_INF)
+                            bits = T.reinterpret(T.uint32, fval)
+                            col_u32 = T.Cast(T.uint32, col)
+                            encoded_idx = T.if_then_else(
+                                fval >= T.float32(0.0),
+                                (~col_u32) & idx_mask,
+                                col_u32 & idx_mask)
+                            frag[e] = (bits & (~idx_mask)) | encoded_idx
+                        for e in T.serial(frag_size - elems_per_lane):
+                            frag[elems_per_lane + e] = NEG_INF_BITS_CLEAN
+
+                        for ki in T.serial(K_padded):
+                            for e in T.serial(frag_size):
+                                if e > ki:
+                                    fi = T.reinterpret(T.float32, frag[ki])
+                                    fe = T.reinterpret(T.float32, frag[e])
+                                    if fe > fi:
+                                        tmp = frag[ki]
+                                        frag[ki] = frag[e]
+                                        frag[e] = tmp
+
+                        if log_kp > 0:
+                            for i1 in T.serial(log_kp):
+                                for i2 in T.serial(i1 + 1):
+                                    step = T.int32(1) << (i1 - i2)
+                                    dmask = T.int32(1) << (i1 + 1)
+                                    for i in T.serial(K_padded):
+                                        j = i ^ step
+                                        if i < j:
+                                            ascending = (i & dmask) != 0
+                                            fi = T.reinterpret(T.float32, frag[i])
+                                            fj = T.reinterpret(T.float32, frag[j])
+                                            do_swap = T.if_then_else(ascending, fi > fj, fi < fj)
+                                            if do_swap:
+                                                tmp = frag[i]
+                                                frag[i] = frag[j]
+                                                frag[j] = tmp
+
+                        partner = T.alloc_local([K_padded], T.uint32)
+                        for ms in T.serial(num_merge_stages):
+                            stride = T.int32(WARP_SIZE) >> (ms + 1)
+                            am_low = (lane_id & stride) == 0
+                            for k in T.serial(K_padded):
+                                val_i32 = T.reinterpret(T.int32, frag[k])
+                                p_i32 = T.shfl_xor(val_i32, stride)
+                                partner[k] = T.reinterpret(T.uint32, p_i32)
+                            for k in T.serial(K_padded):
+                                my_f = T.reinterpret(T.float32, frag[k])
+                                p_f = T.reinterpret(T.float32, partner[K_padded - 1 - k])
+                                should_take = T.if_then_else(am_low, p_f > my_f, my_f > p_f)
+                                if should_take:
+                                    frag[k] = partner[K_padded - 1 - k]
+                            if log_kp > 0:
+                                for i1 in T.serial(log_kp):
+                                    for i2 in T.serial(i1 + 1):
+                                        step = T.int32(1) << (i1 - i2)
+                                        dmask = T.int32(1) << (i1 + 1)
+                                        for i in T.serial(K_padded):
+                                            j = i ^ step
+                                            if i < j:
+                                                ascending = (i & dmask) != 0
+                                                fi = T.reinterpret(T.float32, frag[i])
+                                                fj = T.reinterpret(T.float32, frag[j])
+                                                do_swap = T.if_then_else(ascending, fi > fj, fi < fj)
+                                                if do_swap:
+                                                    tmp = frag[i]
+                                                    frag[i] = frag[j]
+                                                    frag[j] = tmp
+
+                        if lane_id == 0:
+                            local_vals = T.alloc_local([top_k], T.float32)
+                            local_idx = T.alloc_local([top_k], T.int32)
+                            for ki in T.serial(top_k):
+                                packed = frag[ki]
+                                cleaned = packed & (~idx_mask)
+                                fval = T.reinterpret(T.float32, cleaned)
+                                enc = packed & idx_mask
+                                col_idx = T.if_then_else(
+                                    fval >= T.float32(0.0),
+                                    (~enc) & idx_mask,
+                                    enc & idx_mask)
+                                local_vals[ki] = fval
+                                local_idx[ki] = T.Cast(T.int32, col_idx)
+                            max_val = T.alloc_var(T.float32)
+                            max_val = NEG_INF
+                            for i in T.serial(top_k):
+                                if local_vals[i] > max_val:
+                                    max_val = local_vals[i]
+                            exp_sum = T.alloc_var(T.float32)
+                            exp_sum = T.float32(0.0)
+                            for i in T.serial(top_k):
+                                local_vals[i] = T.exp(local_vals[i] - max_val)
+                                exp_sum = exp_sum + local_vals[i]
+                            for i in T.serial(top_k):
+                                scores[token_idx, i] = local_vals[i] / exp_sum
+                                indices[token_idx, i] = local_idx[i]
+
+    return kernel
+
+
+# ============================================================================
+# 6. TMA+WS N-Split Variants (Hopper, threads=384)
+#
+# N-split: keep block_M=64, split E_padded between 2 consumer WGs.
+# WG0: GEMM(A, B[:,0:E_half])   → C_shared_0[block_M, E_half]
+# WG1: GEMM(A, B[:,E_half:Ep])  → C_shared_1[block_M, E_half]
+# Grid = ceil(T/block_M) — same as standard TMA (not halved).
+# Epilogue: WG0 rows 0..half_M-1, WG1 rows half_M..block_M-1,
+#           each WG reads both C_shared_0 and C_shared_1 for full E coverage.
+# Shared mem (DS-V2, E_padded=256): 16+32+32+32+32 = 144KB  (tma2: 224KB).
+# ============================================================================
+
+@tilelang.jit(out_idx=[1, 2], pass_configs=_tma_pass_configs)
+def fused_router_tma2n_selection_kernel(
+    num_tokens, H, E, E_padded, top_k,
+    block_M=64, block_K=64, num_stages=2, threads=384,
+    dtype=T.bfloat16,
+):
+    """Fused Router GEMM (TMA+WS, N-split 1prod+2cons, Hopper) + Selection + Softmax."""
+    num_m_blocks = (num_tokens + block_M - 1) // block_M
+    accum_dtype = T.float32
+    WARP_SIZE = 32
+    num_warps_per_wg = 128 // WARP_SIZE  # 4
+    E_half = E_padded // 2
+    half_M = block_M // 2
+    rows_per_round = num_warps_per_wg
+    num_rounds_half = half_M // rows_per_round  # 8
+    elems_per_lane = (E + WARP_SIZE - 1) // WARP_SIZE
+    NEG_INF = -T.infinity(T.float32)
+
+    @T.prim_func
+    def kernel(
+        X: T.Tensor([num_tokens, H], dtype),
+        scores: T.Tensor([num_tokens, top_k], T.float32),
+        indices: T.Tensor([num_tokens, top_k], T.int32),
+        W: T.Tensor([H, E_padded], dtype),
+    ):
+        with T.Kernel(num_m_blocks, threads=threads) as (bx):
+            A_shared   = T.alloc_shared([num_stages, block_M, block_K], dtype)
+            B_shared_0 = T.alloc_shared([num_stages, block_K, E_half], dtype)
+            B_shared_1 = T.alloc_shared([num_stages, block_K, E_half], dtype)
+            C_local_0  = T.alloc_fragment([block_M, E_half], accum_dtype)
+            C_local_1  = T.alloc_fragment([block_M, E_half], accum_dtype)
+            C_shared_0 = T.alloc_shared([block_M, E_half], accum_dtype)
+            C_shared_1 = T.alloc_shared([block_M, E_half], accum_dtype)
+
+            # [0..ns-1]: loaded (prod→both, count=128)
+            # [ns..2ns-1]: consumed (both cons→prod, count=256)
+            # [2ns]: EPI_READY (both cons after C_shared write, count=256)
+            T.create_list_of_mbarrier([128] * num_stages + [256] * num_stages + [256])
+            EPI_READY = 2 * num_stages
+
+            m_start = bx * block_M
+            tx = T.get_thread_binding()
+            warp_id_wg = (tx // WARP_SIZE) % num_warps_per_wg
+            lane_id = tx % WARP_SIZE
+
+            with T.ws(0):
+                T.clear(C_local_0)
+            with T.ws(1):
+                T.clear(C_local_1)
+
+            for ko in range(T.ceildiv(H, block_K)):
+                with T.ws(2):  # producer: load A + both B halves
+                    T.mbarrier_wait_parity(
+                        mbarrier=ko % num_stages + num_stages,
+                        parity=((ko // num_stages) % num_stages) ^ 1)
+                    T.copy(
+                        X[m_start:m_start + block_M, ko * block_K:(ko + 1) * block_K],
+                        A_shared[ko % num_stages, :, :])
+                    T.copy(
+                        W[ko * block_K:(ko + 1) * block_K, 0:E_half],
+                        B_shared_0[ko % num_stages, :, :])
+                    T.copy(
+                        W[ko * block_K:(ko + 1) * block_K, E_half:E_padded],
+                        B_shared_1[ko % num_stages, :, :])
+                    T.mbarrier_arrive(mbarrier=ko % num_stages)
+                with T.ws(0):  # consumer 0: GEMM for left E half
+                    T.mbarrier_wait_parity(
+                        mbarrier=ko % num_stages,
+                        parity=(ko // num_stages) % num_stages)
+                    T.gemm(
+                        A_shared[ko % num_stages, :, :],
+                        B_shared_0[ko % num_stages, :, :],
+                        C_local_0)
+                    T.mbarrier_arrive(mbarrier=ko % num_stages + num_stages)
+                with T.ws(1):  # consumer 1: GEMM for right E half
+                    T.mbarrier_wait_parity(
+                        mbarrier=ko % num_stages,
+                        parity=(ko // num_stages) % num_stages)
+                    T.gemm(
+                        A_shared[ko % num_stages, :, :],
+                        B_shared_1[ko % num_stages, :, :],
+                        C_local_1)
+                    T.mbarrier_arrive(mbarrier=ko % num_stages + num_stages)
+
+            with T.ws(0):
+                T.copy(C_local_0, C_shared_0)
+                T.mbarrier_arrive(mbarrier=EPI_READY)
+            with T.ws(1):
+                T.copy(C_local_1, C_shared_1)
+                T.mbarrier_arrive(mbarrier=EPI_READY)
+
+            # ---- WG0 epilogue: rows 0..half_M-1 ----
+            with T.ws(0):
+                T.mbarrier_wait_parity(mbarrier=EPI_READY, parity=0)
+                for rnd in T.serial(num_rounds_half):
+                    row = rnd * rows_per_round + warp_id_wg
+                    token_idx = m_start + row
+                    if token_idx < num_tokens:
+                        my_vals = T.alloc_local([elems_per_lane], T.float32)
+                        for i in T.serial(elems_per_lane):
+                            col = lane_id * elems_per_lane + i
+                            # Read from correct half; adj_col keeps index non-negative
+                            adj_col = T.if_then_else(col >= E_half, col - E_half, T.int32(0))
+                            val = T.if_then_else(
+                                col < E_half, C_shared_0[row, col], C_shared_1[row, adj_col])
+                            my_vals[i] = T.if_then_else(col < E, val, NEG_INF)
+
+                        local_vals = T.alloc_local([top_k], T.float32)
+                        local_idx = T.alloc_local([top_k], T.int32)
+
+                        for k_iter in T.serial(top_k):
+                            my_max_val = T.alloc_var(T.float32)
+                            my_max_idx = T.alloc_var(T.int32)
+                            my_max_val = NEG_INF
+                            my_max_idx = T.int32(-1)
+                            for i in T.serial(elems_per_lane):
+                                if my_vals[i] > my_max_val:
+                                    my_max_val = my_vals[i]
+                                    my_max_idx = T.int32(lane_id * elems_per_lane + i)
+                            warp_max = T.warp_reduce_max(my_max_val)
+                            cand = T.alloc_var(T.float32)
+                            cand = T.float32(-1.0)
+                            if my_max_val == warp_max:
+                                cand = T.cast(my_max_idx, T.float32)
+                            winner_f = T.warp_reduce_max(cand)
+                            winner_idx = T.cast(winner_f, T.int32)
+                            if lane_id == 0:
+                                local_vals[k_iter] = warp_max
+                                local_idx[k_iter] = winner_idx
+                            for i in T.serial(elems_per_lane):
+                                if lane_id * elems_per_lane + i == winner_idx:
+                                    my_vals[i] = NEG_INF
+
+                        if lane_id == 0:
+                            max_val = T.alloc_var(T.float32)
+                            max_val = NEG_INF
+                            for i in T.serial(top_k):
+                                if local_vals[i] > max_val:
+                                    max_val = local_vals[i]
+                            exp_sum = T.alloc_var(T.float32)
+                            exp_sum = T.float32(0.0)
+                            for i in T.serial(top_k):
+                                local_vals[i] = T.exp(local_vals[i] - max_val)
+                                exp_sum = exp_sum + local_vals[i]
+                            for i in T.serial(top_k):
+                                scores[token_idx, i] = local_vals[i] / exp_sum
+                                indices[token_idx, i] = local_idx[i]
+
+            # ---- WG1 epilogue: rows half_M..block_M-1 ----
+            with T.ws(1):
+                T.mbarrier_wait_parity(mbarrier=EPI_READY, parity=0)
+                for rnd in T.serial(num_rounds_half):
+                    row = half_M + rnd * rows_per_round + warp_id_wg
+                    token_idx = m_start + row
+                    if token_idx < num_tokens:
+                        my_vals = T.alloc_local([elems_per_lane], T.float32)
+                        for i in T.serial(elems_per_lane):
+                            col = lane_id * elems_per_lane + i
+                            adj_col = T.if_then_else(col >= E_half, col - E_half, T.int32(0))
+                            val = T.if_then_else(
+                                col < E_half, C_shared_0[row, col], C_shared_1[row, adj_col])
+                            my_vals[i] = T.if_then_else(col < E, val, NEG_INF)
+
+                        local_vals = T.alloc_local([top_k], T.float32)
+                        local_idx = T.alloc_local([top_k], T.int32)
+
+                        for k_iter in T.serial(top_k):
+                            my_max_val = T.alloc_var(T.float32)
+                            my_max_idx = T.alloc_var(T.int32)
+                            my_max_val = NEG_INF
+                            my_max_idx = T.int32(-1)
+                            for i in T.serial(elems_per_lane):
+                                if my_vals[i] > my_max_val:
+                                    my_max_val = my_vals[i]
+                                    my_max_idx = T.int32(lane_id * elems_per_lane + i)
+                            warp_max = T.warp_reduce_max(my_max_val)
+                            cand = T.alloc_var(T.float32)
+                            cand = T.float32(-1.0)
+                            if my_max_val == warp_max:
+                                cand = T.cast(my_max_idx, T.float32)
+                            winner_f = T.warp_reduce_max(cand)
+                            winner_idx = T.cast(winner_f, T.int32)
+                            if lane_id == 0:
+                                local_vals[k_iter] = warp_max
+                                local_idx[k_iter] = winner_idx
+                            for i in T.serial(elems_per_lane):
+                                if lane_id * elems_per_lane + i == winner_idx:
+                                    my_vals[i] = NEG_INF
+
+                        if lane_id == 0:
+                            max_val = T.alloc_var(T.float32)
+                            max_val = NEG_INF
+                            for i in T.serial(top_k):
+                                if local_vals[i] > max_val:
+                                    max_val = local_vals[i]
+                            exp_sum = T.alloc_var(T.float32)
+                            exp_sum = T.float32(0.0)
+                            for i in T.serial(top_k):
+                                local_vals[i] = T.exp(local_vals[i] - max_val)
+                                exp_sum = exp_sum + local_vals[i]
+                            for i in T.serial(top_k):
+                                scores[token_idx, i] = local_vals[i] / exp_sum
+                                indices[token_idx, i] = local_idx[i]
+
+    return kernel
+
+
+@tilelang.jit(out_idx=[1, 2], pass_configs=_tma_pass_configs)
+def fused_router_tma2n_bitonic_kernel(
+    num_tokens, H, E, E_padded, top_k,
+    block_M=64, block_K=64, num_stages=2, threads=384,
+    dtype=T.bfloat16,
+):
+    """Fused Router GEMM (TMA+WS, N-split 1prod+2cons, Hopper) + Bitonic + Softmax."""
+    num_m_blocks = (num_tokens + block_M - 1) // block_M
+    accum_dtype = T.float32
+    WARP_SIZE = 32
+    num_warps_per_wg = 128 // WARP_SIZE  # 4
+    E_half = E_padded // 2
+    half_M = block_M // 2
+    rows_per_round = num_warps_per_wg
+    num_rounds_half = half_M // rows_per_round  # 8
+
+    elems_per_lane = E_padded // WARP_SIZE if E_padded >= WARP_SIZE else 1
+    elems_per_half_lane = E_half // WARP_SIZE if E_half >= WARP_SIZE else 1
+    K_padded = _next_pow2(top_k)
+    frag_size = max(elems_per_lane, K_padded)
+    log_kp = int(math.log2(K_padded)) if K_padded > 1 else 0
+    idx_bits = int(math.ceil(math.log2(max(E_padded, 2))))
+    idx_mask_val = (1 << idx_bits) - 1
+    num_merge_stages = int(math.log2(WARP_SIZE))
+
+    NEG_INF = -T.infinity(T.float32)
+    NEG_INF_BITS_CLEAN_val = 0xFF800000 & ~idx_mask_val
+
+    @T.prim_func
+    def kernel(
+        X: T.Tensor([num_tokens, H], dtype),
+        scores: T.Tensor([num_tokens, top_k], T.float32),
+        indices: T.Tensor([num_tokens, top_k], T.int32),
+        W: T.Tensor([H, E_padded], dtype),
+    ):
+        with T.Kernel(num_m_blocks, threads=threads) as (bx):
+            A_shared   = T.alloc_shared([num_stages, block_M, block_K], dtype)
+            B_shared_0 = T.alloc_shared([num_stages, block_K, E_half], dtype)
+            B_shared_1 = T.alloc_shared([num_stages, block_K, E_half], dtype)
+            C_local_0  = T.alloc_fragment([block_M, E_half], accum_dtype)
+            C_local_1  = T.alloc_fragment([block_M, E_half], accum_dtype)
+            C_shared_0 = T.alloc_shared([block_M, E_half], accum_dtype)
+            C_shared_1 = T.alloc_shared([block_M, E_half], accum_dtype)
+
+            T.create_list_of_mbarrier([128] * num_stages + [256] * num_stages + [256])
+            EPI_READY = 2 * num_stages
+
+            m_start = bx * block_M
+            tx = T.get_thread_binding()
+            warp_id_wg = (tx // WARP_SIZE) % num_warps_per_wg
+            lane_id = tx % WARP_SIZE
+            idx_mask = T.uint32(idx_mask_val)
+            NEG_INF_BITS_CLEAN = T.uint32(NEG_INF_BITS_CLEAN_val)
+
+            with T.ws(0):
+                T.clear(C_local_0)
+            with T.ws(1):
+                T.clear(C_local_1)
+
+            for ko in range(T.ceildiv(H, block_K)):
+                with T.ws(2):
+                    T.mbarrier_wait_parity(
+                        mbarrier=ko % num_stages + num_stages,
+                        parity=((ko // num_stages) % num_stages) ^ 1)
+                    T.copy(
+                        X[m_start:m_start + block_M, ko * block_K:(ko + 1) * block_K],
+                        A_shared[ko % num_stages, :, :])
+                    T.copy(
+                        W[ko * block_K:(ko + 1) * block_K, 0:E_half],
+                        B_shared_0[ko % num_stages, :, :])
+                    T.copy(
+                        W[ko * block_K:(ko + 1) * block_K, E_half:E_padded],
+                        B_shared_1[ko % num_stages, :, :])
+                    T.mbarrier_arrive(mbarrier=ko % num_stages)
+                with T.ws(0):
+                    T.mbarrier_wait_parity(
+                        mbarrier=ko % num_stages,
+                        parity=(ko // num_stages) % num_stages)
+                    T.gemm(
+                        A_shared[ko % num_stages, :, :],
+                        B_shared_0[ko % num_stages, :, :],
+                        C_local_0)
+                    T.mbarrier_arrive(mbarrier=ko % num_stages + num_stages)
+                with T.ws(1):
+                    T.mbarrier_wait_parity(
+                        mbarrier=ko % num_stages,
+                        parity=(ko // num_stages) % num_stages)
+                    T.gemm(
+                        A_shared[ko % num_stages, :, :],
+                        B_shared_1[ko % num_stages, :, :],
+                        C_local_1)
+                    T.mbarrier_arrive(mbarrier=ko % num_stages + num_stages)
+
+            with T.ws(0):
+                T.copy(C_local_0, C_shared_0)
+                T.mbarrier_arrive(mbarrier=EPI_READY)
+            with T.ws(1):
+                T.copy(C_local_1, C_shared_1)
+                T.mbarrier_arrive(mbarrier=EPI_READY)
+
+            # Bitonic epilogue helper: load full-row bit-packed frag from two half-buffers.
+            # Each lane holds elems_per_lane elements spanning [lane*ept, (lane+1)*ept).
+            # For col in [0, E_half): read C_shared_0[row, col].
+            # For col in [E_half, E_padded): read C_shared_1[row, col-E_half].
+            # adj_col = col - E_half clamped to >=0 so TVM bounds-check passes.
+
+            # ---- WG0 bitonic epilogue: rows 0..half_M-1 ----
+            with T.ws(0):
+                T.mbarrier_wait_parity(mbarrier=EPI_READY, parity=0)
+                for rnd in T.serial(num_rounds_half):
+                    row = rnd * rows_per_round + warp_id_wg
+                    token_idx = m_start + row
+                    if token_idx < num_tokens:
+                        frag = T.alloc_local([frag_size], T.uint32)
+                        for e in T.serial(elems_per_lane):
+                            col = lane_id * elems_per_lane + e
+                            adj_col = T.if_then_else(col >= E_half, col - E_half, T.int32(0))
+                            raw = T.if_then_else(
+                                col < E_half, C_shared_0[row, col], C_shared_1[row, adj_col])
+                            fval = T.if_then_else(col < E, raw, NEG_INF)
+                            bits = T.reinterpret(T.uint32, fval)
+                            col_u32 = T.Cast(T.uint32, col)
+                            encoded_idx = T.if_then_else(
+                                fval >= T.float32(0.0),
+                                (~col_u32) & idx_mask,
+                                col_u32 & idx_mask)
+                            frag[e] = (bits & (~idx_mask)) | encoded_idx
+                        for e in T.serial(frag_size - elems_per_lane):
+                            frag[elems_per_lane + e] = NEG_INF_BITS_CLEAN
+
+                        for ki in T.serial(K_padded):
+                            for e in T.serial(frag_size):
+                                if e > ki:
+                                    fi = T.reinterpret(T.float32, frag[ki])
+                                    fe = T.reinterpret(T.float32, frag[e])
+                                    if fe > fi:
+                                        tmp = frag[ki]
+                                        frag[ki] = frag[e]
+                                        frag[e] = tmp
+
+                        if log_kp > 0:
+                            for i1 in T.serial(log_kp):
+                                for i2 in T.serial(i1 + 1):
+                                    step = T.int32(1) << (i1 - i2)
+                                    dmask = T.int32(1) << (i1 + 1)
+                                    for i in T.serial(K_padded):
+                                        j = i ^ step
+                                        if i < j:
+                                            ascending = (i & dmask) != 0
+                                            fi = T.reinterpret(T.float32, frag[i])
+                                            fj = T.reinterpret(T.float32, frag[j])
+                                            do_swap = T.if_then_else(ascending, fi > fj, fi < fj)
+                                            if do_swap:
+                                                tmp = frag[i]
+                                                frag[i] = frag[j]
+                                                frag[j] = tmp
+
+                        partner = T.alloc_local([K_padded], T.uint32)
+                        for ms in T.serial(num_merge_stages):
+                            stride = T.int32(WARP_SIZE) >> (ms + 1)
+                            am_low = (lane_id & stride) == 0
+                            for k in T.serial(K_padded):
+                                val_i32 = T.reinterpret(T.int32, frag[k])
+                                p_i32 = T.shfl_xor(val_i32, stride)
+                                partner[k] = T.reinterpret(T.uint32, p_i32)
+                            for k in T.serial(K_padded):
+                                my_f = T.reinterpret(T.float32, frag[k])
+                                p_f = T.reinterpret(T.float32, partner[K_padded - 1 - k])
+                                should_take = T.if_then_else(am_low, p_f > my_f, my_f > p_f)
+                                if should_take:
+                                    frag[k] = partner[K_padded - 1 - k]
+                            if log_kp > 0:
+                                for i1 in T.serial(log_kp):
+                                    for i2 in T.serial(i1 + 1):
+                                        step = T.int32(1) << (i1 - i2)
+                                        dmask = T.int32(1) << (i1 + 1)
+                                        for i in T.serial(K_padded):
+                                            j = i ^ step
+                                            if i < j:
+                                                ascending = (i & dmask) != 0
+                                                fi = T.reinterpret(T.float32, frag[i])
+                                                fj = T.reinterpret(T.float32, frag[j])
+                                                do_swap = T.if_then_else(ascending, fi > fj, fi < fj)
+                                                if do_swap:
+                                                    tmp = frag[i]
+                                                    frag[i] = frag[j]
+                                                    frag[j] = tmp
+
+                        if lane_id == 0:
+                            local_vals = T.alloc_local([top_k], T.float32)
+                            local_idx = T.alloc_local([top_k], T.int32)
+                            for ki in T.serial(top_k):
+                                packed = frag[ki]
+                                cleaned = packed & (~idx_mask)
+                                fval = T.reinterpret(T.float32, cleaned)
+                                enc = packed & idx_mask
+                                col_idx = T.if_then_else(
+                                    fval >= T.float32(0.0),
+                                    (~enc) & idx_mask,
+                                    enc & idx_mask)
+                                local_vals[ki] = fval
+                                local_idx[ki] = T.Cast(T.int32, col_idx)
+                            max_val = T.alloc_var(T.float32)
+                            max_val = NEG_INF
+                            for i in T.serial(top_k):
+                                if local_vals[i] > max_val:
+                                    max_val = local_vals[i]
+                            exp_sum = T.alloc_var(T.float32)
+                            exp_sum = T.float32(0.0)
+                            for i in T.serial(top_k):
+                                local_vals[i] = T.exp(local_vals[i] - max_val)
+                                exp_sum = exp_sum + local_vals[i]
+                            for i in T.serial(top_k):
+                                scores[token_idx, i] = local_vals[i] / exp_sum
+                                indices[token_idx, i] = local_idx[i]
+
+            # ---- WG1 bitonic epilogue: rows half_M..block_M-1 ----
+            with T.ws(1):
+                T.mbarrier_wait_parity(mbarrier=EPI_READY, parity=0)
+                for rnd in T.serial(num_rounds_half):
+                    row = half_M + rnd * rows_per_round + warp_id_wg
+                    token_idx = m_start + row
+                    if token_idx < num_tokens:
+                        frag = T.alloc_local([frag_size], T.uint32)
+                        for e in T.serial(elems_per_lane):
+                            col = lane_id * elems_per_lane + e
+                            adj_col = T.if_then_else(col >= E_half, col - E_half, T.int32(0))
+                            raw = T.if_then_else(
+                                col < E_half, C_shared_0[row, col], C_shared_1[row, adj_col])
+                            fval = T.if_then_else(col < E, raw, NEG_INF)
+                            bits = T.reinterpret(T.uint32, fval)
+                            col_u32 = T.Cast(T.uint32, col)
+                            encoded_idx = T.if_then_else(
+                                fval >= T.float32(0.0),
+                                (~col_u32) & idx_mask,
+                                col_u32 & idx_mask)
+                            frag[e] = (bits & (~idx_mask)) | encoded_idx
+                        for e in T.serial(frag_size - elems_per_lane):
+                            frag[elems_per_lane + e] = NEG_INF_BITS_CLEAN
+
+                        for ki in T.serial(K_padded):
+                            for e in T.serial(frag_size):
+                                if e > ki:
+                                    fi = T.reinterpret(T.float32, frag[ki])
+                                    fe = T.reinterpret(T.float32, frag[e])
+                                    if fe > fi:
+                                        tmp = frag[ki]
+                                        frag[ki] = frag[e]
+                                        frag[e] = tmp
+
+                        if log_kp > 0:
+                            for i1 in T.serial(log_kp):
+                                for i2 in T.serial(i1 + 1):
+                                    step = T.int32(1) << (i1 - i2)
+                                    dmask = T.int32(1) << (i1 + 1)
+                                    for i in T.serial(K_padded):
+                                        j = i ^ step
+                                        if i < j:
+                                            ascending = (i & dmask) != 0
+                                            fi = T.reinterpret(T.float32, frag[i])
+                                            fj = T.reinterpret(T.float32, frag[j])
+                                            do_swap = T.if_then_else(ascending, fi > fj, fi < fj)
+                                            if do_swap:
+                                                tmp = frag[i]
+                                                frag[i] = frag[j]
+                                                frag[j] = tmp
+
+                        partner = T.alloc_local([K_padded], T.uint32)
+                        for ms in T.serial(num_merge_stages):
+                            stride = T.int32(WARP_SIZE) >> (ms + 1)
+                            am_low = (lane_id & stride) == 0
+                            for k in T.serial(K_padded):
+                                val_i32 = T.reinterpret(T.int32, frag[k])
+                                p_i32 = T.shfl_xor(val_i32, stride)
+                                partner[k] = T.reinterpret(T.uint32, p_i32)
+                            for k in T.serial(K_padded):
+                                my_f = T.reinterpret(T.float32, frag[k])
+                                p_f = T.reinterpret(T.float32, partner[K_padded - 1 - k])
+                                should_take = T.if_then_else(am_low, p_f > my_f, my_f > p_f)
+                                if should_take:
+                                    frag[k] = partner[K_padded - 1 - k]
+                            if log_kp > 0:
+                                for i1 in T.serial(log_kp):
+                                    for i2 in T.serial(i1 + 1):
+                                        step = T.int32(1) << (i1 - i2)
+                                        dmask = T.int32(1) << (i1 + 1)
+                                        for i in T.serial(K_padded):
+                                            j = i ^ step
+                                            if i < j:
+                                                ascending = (i & dmask) != 0
+                                                fi = T.reinterpret(T.float32, frag[i])
+                                                fj = T.reinterpret(T.float32, frag[j])
+                                                do_swap = T.if_then_else(ascending, fi > fj, fi < fj)
+                                                if do_swap:
+                                                    tmp = frag[i]
+                                                    frag[i] = frag[j]
+                                                    frag[j] = tmp
+
+                        if lane_id == 0:
+                            local_vals = T.alloc_local([top_k], T.float32)
+                            local_idx = T.alloc_local([top_k], T.int32)
+                            for ki in T.serial(top_k):
+                                packed = frag[ki]
+                                cleaned = packed & (~idx_mask)
+                                fval = T.reinterpret(T.float32, cleaned)
+                                enc = packed & idx_mask
+                                col_idx = T.if_then_else(
+                                    fval >= T.float32(0.0),
+                                    (~enc) & idx_mask,
+                                    enc & idx_mask)
+                                local_vals[ki] = fval
+                                local_idx[ki] = T.Cast(T.int32, col_idx)
+                            max_val = T.alloc_var(T.float32)
+                            max_val = NEG_INF
+                            for i in T.serial(top_k):
+                                if local_vals[i] > max_val:
+                                    max_val = local_vals[i]
+                            exp_sum = T.alloc_var(T.float32)
+                            exp_sum = T.float32(0.0)
+                            for i in T.serial(top_k):
+                                local_vals[i] = T.exp(local_vals[i] - max_val)
+                                exp_sum = exp_sum + local_vals[i]
+                            for i in T.serial(top_k):
+                                scores[token_idx, i] = local_vals[i] / exp_sum
+                                indices[token_idx, i] = local_idx[i]
+
+    return kernel
+
+
+# ============================================================================
 # Kernel Cache + Wrapper (handles W padding for non-power-of-2 E)
 # ============================================================================
 
 _fused_cache: Dict[str, any] = {}
 
 _ALGO_FACTORIES = {
-    "cpasync_selection": fused_router_cpasync_selection_kernel,
-    "cpasync_bitonic":   fused_router_cpasync_bitonic_kernel,
-    "tma_selection":     fused_router_tma_selection_kernel,
-    "tma_bitonic":       fused_router_tma_bitonic_kernel,
-    "tma2_selection":    fused_router_tma2_selection_kernel,
+    "cpasync_selection":  fused_router_cpasync_selection_kernel,
+    "cpasync_bitonic":    fused_router_cpasync_bitonic_kernel,
+    "tma_selection":      fused_router_tma_selection_kernel,
+    "tma_bitonic":        fused_router_tma_bitonic_kernel,
+    "tma2_selection":     fused_router_tma2_selection_kernel,
+    "tma2_bitonic":       fused_router_tma2_bitonic_kernel,
+    "tma2n_selection":    fused_router_tma2n_selection_kernel,
+    "tma2n_bitonic":      fused_router_tma2n_bitonic_kernel,
 }
 
 
