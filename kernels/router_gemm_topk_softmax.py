@@ -467,10 +467,10 @@ def fused_router_tma_selection_kernel(
             C_local = T.alloc_fragment([block_M, E_padded], accum_dtype)
             C_shared = T.alloc_shared([block_M, E_padded], accum_dtype)
 
-            # mbars[0..num_stages-1]           : loaded   (producer arrives, consumer waits)
-            # mbars[num_stages..2*num_stages-1]: consumed (consumer arrives, producer waits)
-            mbars = T.alloc_barrier([128, 128] * num_stages)
-            epi_ready = T.alloc_barrier([128])  # consumer→everyone: C_shared is written
+            # mbarrier IDs: [0..num_stages-1]=loaded, [num_stages..2*num_stages-1]=consumed,
+            # [2*num_stages]=epi_ready (consumer→all: C_shared is written).
+            T.create_list_of_mbarrier([128, 128] * num_stages + [128])
+            EPI_READY = 2 * num_stages
 
             m_start = bx * block_M
             tx = T.get_thread_binding()
@@ -484,28 +484,28 @@ def fused_router_tma_selection_kernel(
             for ko in range(T.ceildiv(H, block_K)):
                 with T.ws(1):  # producer: TMA copy
                     T.mbarrier_wait_parity(
-                        mbars[ko % num_stages + num_stages],
-                        ((ko // num_stages) % num_stages) ^ 1)
+                        mbarrier=ko % num_stages + num_stages,
+                        parity=((ko // num_stages) % num_stages) ^ 1)
                     T.copy(X[m_start, ko * block_K], A_shared[ko % num_stages, :, :])
                     T.copy(W[ko * block_K, 0], B_shared[ko % num_stages, :, :])
-                    T.mbarrier_arrive(mbars[ko % num_stages])
+                    T.mbarrier_arrive(mbarrier=ko % num_stages)
                 with T.ws(0):  # consumer: WGMMA compute
                     T.mbarrier_wait_parity(
-                        mbars[ko % num_stages],
-                        (ko // num_stages) % num_stages)
+                        mbarrier=ko % num_stages,
+                        parity=(ko // num_stages) % num_stages)
                     T.gemm(
                         A_shared[ko % num_stages, :, :],
                         B_shared[ko % num_stages, :, :],
                         C_local)
-                    T.mbarrier_arrive(mbars[ko % num_stages + num_stages])
+                    T.mbarrier_arrive(mbarrier=ko % num_stages + num_stages)
 
             # Consumer stages output and signals readiness
             with T.ws(0):
                 T.copy(C_local, C_shared)
-                T.mbarrier_arrive(epi_ready)
+                T.mbarrier_arrive(mbarrier=EPI_READY)
 
             # Both warp groups wait for C_shared
-            T.mbarrier_wait_parity(epi_ready, 0)
+            T.mbarrier_wait_parity(mbarrier=EPI_READY, parity=0)
             T.sync_threads()  # explicit because TL_DISABLE_THREAD_STORAGE_SYNC
 
             # ---- Epilogue: 8-warp-parallel selection ----
@@ -605,8 +605,8 @@ def fused_router_tma_bitonic_kernel(
             C_local = T.alloc_fragment([block_M, E_padded], accum_dtype)
             C_shared = T.alloc_shared([block_M, E_padded], accum_dtype)
 
-            mbars = T.alloc_barrier([128, 128] * num_stages)
-            epi_ready = T.alloc_barrier([128])
+            T.create_list_of_mbarrier([128, 128] * num_stages + [128])
+            EPI_READY = 2 * num_stages
 
             m_start = bx * block_M
             tx = T.get_thread_binding()
@@ -620,26 +620,26 @@ def fused_router_tma_bitonic_kernel(
             for ko in range(T.ceildiv(H, block_K)):
                 with T.ws(1):
                     T.mbarrier_wait_parity(
-                        mbars[ko % num_stages + num_stages],
-                        ((ko // num_stages) % num_stages) ^ 1)
+                        mbarrier=ko % num_stages + num_stages,
+                        parity=((ko // num_stages) % num_stages) ^ 1)
                     T.copy(X[m_start, ko * block_K], A_shared[ko % num_stages, :, :])
                     T.copy(W[ko * block_K, 0], B_shared[ko % num_stages, :, :])
-                    T.mbarrier_arrive(mbars[ko % num_stages])
+                    T.mbarrier_arrive(mbarrier=ko % num_stages)
                 with T.ws(0):
                     T.mbarrier_wait_parity(
-                        mbars[ko % num_stages],
-                        (ko // num_stages) % num_stages)
+                        mbarrier=ko % num_stages,
+                        parity=(ko // num_stages) % num_stages)
                     T.gemm(
                         A_shared[ko % num_stages, :, :],
                         B_shared[ko % num_stages, :, :],
                         C_local)
-                    T.mbarrier_arrive(mbars[ko % num_stages + num_stages])
+                    T.mbarrier_arrive(mbarrier=ko % num_stages + num_stages)
 
             with T.ws(0):
                 T.copy(C_local, C_shared)
-                T.mbarrier_arrive(epi_ready)
+                T.mbarrier_arrive(mbarrier=EPI_READY)
 
-            T.mbarrier_wait_parity(epi_ready, 0)
+            T.mbarrier_wait_parity(mbarrier=EPI_READY, parity=0)
             T.sync_threads()
 
             # ---- Epilogue: 8-warp-parallel bitonic ----
