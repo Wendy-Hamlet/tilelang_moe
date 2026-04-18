@@ -5,6 +5,12 @@ Measures: X(T,H) @ W(H,E) -> topk_softmax -> (scores, indices)(T,K)
 
 All versions measured with do_bench (per-iteration CUDA events + L2 flush).
 Data preparation (padding, allocation) is done ONCE outside the timing loop.
+
+Kernel variants:
+  cpasync_selection : cp.async GEMM + selection-sort epilogue
+  cpasync_bitonic   : cp.async GEMM + bitonic-sort epilogue
+  tma_selection     : TMA+WS GEMM  + selection-sort epilogue  (Hopper+)
+  tma_bitonic       : TMA+WS GEMM  + bitonic-sort epilogue    (Hopper+)
 """
 
 import sys
@@ -33,9 +39,10 @@ except ImportError:
 try:
     from kernels.router_gemm_topk_softmax import (
         _next_pow2, router_gemm_kernel,
-        fused_router_selection_kernel, fused_router_bitonic_kernel,
-        fused_router_ws_selection_kernel, fused_router_warp_selection_kernel,
-        fused_router_warp_selection_v2_kernel,
+        fused_router_cpasync_selection_kernel,
+        fused_router_cpasync_bitonic_kernel,
+        fused_router_tma_selection_kernel,
+        fused_router_tma_bitonic_kernel,
     )
     import tilelang.language as T
     HAS_FUSED = True
@@ -70,41 +77,27 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
     else:
         W_padded = W_bf16
 
-    # Pre-allocate output buffers for PyTorch baseline (avoid alloc in timing)
-    logits_buf = torch.empty(num_tokens, E, device=device, dtype=torch.float32)
-    topk_vals_buf = torch.empty(num_tokens, K, device=device, dtype=torch.float32)
-    topk_idx_buf = torch.empty(num_tokens, K, device=device, dtype=torch.int64)
-
-    # Pre-allocate padded logits buffer for TL-sep
-    logits_padded_buf = torch.empty(num_tokens, E_padded, device=device, dtype=torch.float32)
-    logits_slice_buf = torch.empty(num_tokens, E, device=device, dtype=torch.float32)
-
     # Pre-compile raw kernels
     raw_fused = {}
     raw_gemm = None
     if HAS_FUSED:
-        for algo in ["selection", "warp_selection", "warp_selection_v2", "ws_selection", "bitonic"]:
+        factory_map = {
+            "cpasync_selection": fused_router_cpasync_selection_kernel,
+            "cpasync_bitonic":   fused_router_cpasync_bitonic_kernel,
+            "tma_selection":     fused_router_tma_selection_kernel,
+            "tma_bitonic":       fused_router_tma_bitonic_kernel,
+        }
+        for algo, factory in factory_map.items():
             try:
-                print(f"    Compiling fused-{algo} T={num_tokens} E={E}...", end=" ", flush=True)
-                if algo in ("selection", "ws_selection", "warp_selection", "warp_selection_v2"):
-                    fn = {
-                        "selection": fused_router_selection_kernel,
-                        "warp_selection": fused_router_warp_selection_kernel,
-                        "warp_selection_v2": fused_router_warp_selection_v2_kernel,
-                        "ws_selection": fused_router_ws_selection_kernel,
-                    }[algo]
-                    raw_fused[algo] = fn(
-                        num_tokens, H, E, E_padded, K,
-                        block_M=64, block_K=64, num_stages=2, threads=256,
-                        dtype=T.bfloat16)
-                else:
-                    raw_fused[algo] = fused_router_bitonic_kernel(
-                        num_tokens, H, E, K,
-                        block_M=64, block_K=64, num_stages=2, threads=256,
-                        dtype=T.bfloat16)
+                print(f"    Compiling {algo} T={num_tokens} E={E}...", end=" ", flush=True)
+                raw_fused[algo] = factory(
+                    num_tokens, H, E, E_padded, K,
+                    block_M=64, block_K=64, num_stages=2, threads=256,
+                    dtype=T.bfloat16)
                 print("OK", flush=True)
             except Exception as e:
                 print(f"FAIL: {e}", flush=True)
+
         try:
             print(f"    Compiling TL-GEMM T={num_tokens} E={E}...", end=" ", flush=True)
             raw_gemm = router_gemm_kernel(
@@ -129,7 +122,6 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
 
     # ==========================================
     # All versions use do_bench (per-iteration events + L2 flush).
-    # No profiler.do_bench — ensures uniform measurement method.
     # ==========================================
 
     # --- BL-PyTorch: torch.mm + torch.topk + torch.softmax ---
@@ -150,7 +142,7 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
             return topk_softmax_best(logits_p[:, :E].contiguous(), K)
 
         try:
-            tilelang_sep()  # verify
+            tilelang_sep()
             torch.cuda.synchronize()
             print(f"    [TL-sep] timing...", end=" ", flush=True)
             results['TL-sep'] = do_bench(tilelang_sep, warmup=warmup, rep=rep)
@@ -159,19 +151,18 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
             print(f"    [TL-sep] FAIL: {e}", flush=True)
             results['TL-sep'] = float('inf')
 
-    # --- Fused variants: same do_bench, same measurement ---
-    algo_names = {
-        "selection": "Fused-Sel",
-        "warp_selection": "Fused-Warp",
-        "warp_selection_v2": "Fused-WarpV2",
-        "ws_selection": "Fused-WS",
-        "bitonic": "Fused-Bit",
+    # --- Fused variants ---
+    algo_display = {
+        "cpasync_selection": "CpAsync-Sel",
+        "cpasync_bitonic":   "CpAsync-Bit",
+        "tma_selection":     "TMA-Sel",
+        "tma_bitonic":       "TMA-Bit",
     }
-    for algo, label in algo_names.items():
+    for algo, label in algo_display.items():
         if algo in raw_fused:
             kern = raw_fused[algo]
             try:
-                kern(X_bf16, W_padded)  # verify
+                kern(X_bf16, W_padded)
                 torch.cuda.synchronize()
                 print(f"    [{label}] timing...", end=" ", flush=True)
                 results[label] = do_bench(
@@ -243,7 +234,8 @@ def main():
     print("SUMMARY: Latency (ms) and Speedup vs PyTorch separate")
     print("=" * 100)
 
-    version_keys = ['PyTorch', 'TL-sep', 'Fused-Sel', 'Fused-Warp', 'Fused-WarpV2', 'Fused-WS', 'Fused-Bit']
+    version_keys = ['PyTorch', 'TL-sep',
+                    'CpAsync-Sel', 'CpAsync-Bit', 'TMA-Sel', 'TMA-Bit']
     version_keys = [v for v in version_keys if any(v in r for r in all_rows)]
 
     headers = ["Model", "T"] + \
