@@ -196,8 +196,10 @@ def fused_router_cpasync_selection_kernel(
                     local_idx = T.alloc_local([top_k], T.int32)
 
                     for k_iter in T.serial(top_k):
-                        my_max_val = T.alloc_var(T.float32, init=NEG_INF)
-                        my_max_idx = T.alloc_var(T.int32, init=-1)
+                        my_max_val = T.alloc_var(T.float32)
+                        my_max_idx = T.alloc_var(T.int32)
+                        my_max_val = NEG_INF
+                        my_max_idx = T.int32(-1)
 
                         for i in T.serial(elems_per_lane):
                             if my_vals[i] > my_max_val:
@@ -205,7 +207,8 @@ def fused_router_cpasync_selection_kernel(
                                 my_max_idx = T.int32(lane_id * elems_per_lane + i)
 
                         warp_max = T.warp_reduce_max(my_max_val)
-                        cand = T.alloc_var(T.float32, init=T.float32(-1.0))
+                        cand = T.alloc_var(T.float32)
+                        cand = T.float32(-1.0)
                         if my_max_val == warp_max:
                             cand = T.cast(my_max_idx, T.float32)
                         winner_f = T.warp_reduce_max(cand)
@@ -220,12 +223,14 @@ def fused_router_cpasync_selection_kernel(
                                 my_vals[i] = NEG_INF
 
                     if lane_id == 0:
-                        max_val = T.alloc_var(T.float32, init=NEG_INF)
+                        max_val = T.alloc_var(T.float32)
+                        max_val = NEG_INF
                         for i in T.serial(top_k):
                             if local_vals[i] > max_val:
                                 max_val = local_vals[i]
 
-                        exp_sum = T.alloc_var(T.float32, init=T.float32(0.0))
+                        exp_sum = T.alloc_var(T.float32)
+                        exp_sum = T.float32(0.0)
                         for i in T.serial(top_k):
                             local_vals[i] = T.exp(local_vals[i] - max_val)
                             exp_sum = exp_sum + local_vals[i]
@@ -410,12 +415,14 @@ def fused_router_cpasync_bitonic_kernel(
                             local_vals[ki] = fval
                             local_idx[ki] = T.Cast(T.int32, col_idx)
 
-                        max_val = T.alloc_var(T.float32, init=NEG_INF)
+                        max_val = T.alloc_var(T.float32)
+                        max_val = NEG_INF
                         for i in T.serial(top_k):
                             if local_vals[i] > max_val:
                                 max_val = local_vals[i]
 
-                        exp_sum = T.alloc_var(T.float32, init=T.float32(0.0))
+                        exp_sum = T.alloc_var(T.float32)
+                        exp_sum = T.float32(0.0)
                         for i in T.serial(top_k):
                             local_vals[i] = T.exp(local_vals[i] - max_val)
                             exp_sum = exp_sum + local_vals[i]
@@ -526,8 +533,10 @@ def fused_router_tma_selection_kernel(
                     local_idx = T.alloc_local([top_k], T.int32)
 
                     for k_iter in T.serial(top_k):
-                        my_max_val = T.alloc_var(T.float32, init=NEG_INF)
-                        my_max_idx = T.alloc_var(T.int32, init=-1)
+                        my_max_val = T.alloc_var(T.float32)
+                        my_max_idx = T.alloc_var(T.int32)
+                        my_max_val = NEG_INF
+                        my_max_idx = T.int32(-1)
 
                         for i in T.serial(elems_per_lane):
                             if my_vals[i] > my_max_val:
@@ -535,7 +544,8 @@ def fused_router_tma_selection_kernel(
                                 my_max_idx = T.int32(lane_id * elems_per_lane + i)
 
                         warp_max = T.warp_reduce_max(my_max_val)
-                        cand = T.alloc_var(T.float32, init=T.float32(-1.0))
+                        cand = T.alloc_var(T.float32)
+                        cand = T.float32(-1.0)
                         if my_max_val == warp_max:
                             cand = T.cast(my_max_idx, T.float32)
                         winner_f = T.warp_reduce_max(cand)
@@ -550,12 +560,14 @@ def fused_router_tma_selection_kernel(
                                 my_vals[i] = NEG_INF
 
                     if lane_id == 0:
-                        max_val = T.alloc_var(T.float32, init=NEG_INF)
+                        max_val = T.alloc_var(T.float32)
+                        max_val = NEG_INF
                         for i in T.serial(top_k):
                             if local_vals[i] > max_val:
                                 max_val = local_vals[i]
 
-                        exp_sum = T.alloc_var(T.float32, init=T.float32(0.0))
+                        exp_sum = T.alloc_var(T.float32)
+                        exp_sum = T.float32(0.0)
                         for i in T.serial(top_k):
                             local_vals[i] = T.exp(local_vals[i] - max_val)
                             exp_sum = exp_sum + local_vals[i]
@@ -743,12 +755,14 @@ def fused_router_tma_bitonic_kernel(
                             local_vals[ki] = fval
                             local_idx[ki] = T.Cast(T.int32, col_idx)
 
-                        max_val = T.alloc_var(T.float32, init=NEG_INF)
+                        max_val = T.alloc_var(T.float32)
+                        max_val = NEG_INF
                         for i in T.serial(top_k):
                             if local_vals[i] > max_val:
                                 max_val = local_vals[i]
 
-                        exp_sum = T.alloc_var(T.float32, init=T.float32(0.0))
+                        exp_sum = T.alloc_var(T.float32)
+                        exp_sum = T.float32(0.0)
                         for i in T.serial(top_k):
                             local_vals[i] = T.exp(local_vals[i] - max_val)
                             exp_sum = exp_sum + local_vals[i]
@@ -882,8 +896,10 @@ def fused_router_tma2_selection_kernel(
                         local_idx = T.alloc_local([top_k], T.int32)
 
                         for k_iter in T.serial(top_k):
-                            my_max_val = T.alloc_var(T.float32, init=NEG_INF)
-                            my_max_idx = T.alloc_var(T.int32, init=-1)
+                            my_max_val = T.alloc_var(T.float32)
+                            my_max_idx = T.alloc_var(T.int32)
+                            my_max_val = NEG_INF
+                            my_max_idx = T.int32(-1)
 
                             for i in T.serial(elems_per_lane):
                                 if my_vals[i] > my_max_val:
@@ -891,7 +907,8 @@ def fused_router_tma2_selection_kernel(
                                     my_max_idx = T.int32(lane_id * elems_per_lane + i)
 
                             warp_max = T.warp_reduce_max(my_max_val)
-                            cand = T.alloc_var(T.float32, init=T.float32(-1.0))
+                            cand = T.alloc_var(T.float32)
+                            cand = T.float32(-1.0)
                             if my_max_val == warp_max:
                                 cand = T.cast(my_max_idx, T.float32)
                             winner_f = T.warp_reduce_max(cand)
@@ -906,12 +923,14 @@ def fused_router_tma2_selection_kernel(
                                     my_vals[i] = NEG_INF
 
                         if lane_id == 0:
-                            max_val = T.alloc_var(T.float32, init=NEG_INF)
+                            max_val = T.alloc_var(T.float32)
+                            max_val = NEG_INF
                             for i in T.serial(top_k):
                                 if local_vals[i] > max_val:
                                     max_val = local_vals[i]
 
-                            exp_sum = T.alloc_var(T.float32, init=T.float32(0.0))
+                            exp_sum = T.alloc_var(T.float32)
+                            exp_sum = T.float32(0.0)
                             for i in T.serial(top_k):
                                 local_vals[i] = T.exp(local_vals[i] - max_val)
                                 exp_sum = exp_sum + local_vals[i]
@@ -936,8 +955,10 @@ def fused_router_tma2_selection_kernel(
                         local_idx = T.alloc_local([top_k], T.int32)
 
                         for k_iter in T.serial(top_k):
-                            my_max_val = T.alloc_var(T.float32, init=NEG_INF)
-                            my_max_idx = T.alloc_var(T.int32, init=-1)
+                            my_max_val = T.alloc_var(T.float32)
+                            my_max_idx = T.alloc_var(T.int32)
+                            my_max_val = NEG_INF
+                            my_max_idx = T.int32(-1)
 
                             for i in T.serial(elems_per_lane):
                                 if my_vals[i] > my_max_val:
@@ -945,7 +966,8 @@ def fused_router_tma2_selection_kernel(
                                     my_max_idx = T.int32(lane_id * elems_per_lane + i)
 
                             warp_max = T.warp_reduce_max(my_max_val)
-                            cand = T.alloc_var(T.float32, init=T.float32(-1.0))
+                            cand = T.alloc_var(T.float32)
+                            cand = T.float32(-1.0)
                             if my_max_val == warp_max:
                                 cand = T.cast(my_max_idx, T.float32)
                             winner_f = T.warp_reduce_max(cand)
@@ -960,12 +982,14 @@ def fused_router_tma2_selection_kernel(
                                     my_vals[i] = NEG_INF
 
                         if lane_id == 0:
-                            max_val = T.alloc_var(T.float32, init=NEG_INF)
+                            max_val = T.alloc_var(T.float32)
+                            max_val = NEG_INF
                             for i in T.serial(top_k):
                                 if local_vals[i] > max_val:
                                     max_val = local_vals[i]
 
-                            exp_sum = T.alloc_var(T.float32, init=T.float32(0.0))
+                            exp_sum = T.alloc_var(T.float32)
+                            exp_sum = T.float32(0.0)
                             for i in T.serial(top_k):
                                 local_vals[i] = T.exp(local_vals[i] - max_val)
                                 exp_sum = exp_sum + local_vals[i]
