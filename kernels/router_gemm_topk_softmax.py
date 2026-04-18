@@ -761,6 +761,223 @@ def fused_router_tma_bitonic_kernel(
 
 
 # ============================================================================
+# 5. TMA+WS 2-Consumer Variants (Hopper, threads=384)
+#
+# 1 producer WG (WG2) + 2 consumer WGs (WG0, WG1). Each consumer processes a
+# full block_M=64 tile (same WGMMA shape as single-consumer TMA variants), so
+# per-block total output rows = 2*block_M. Grid halves; total compute threads
+# = 256 (same as cp.async) but now driven by TMA with warp specialization.
+# ============================================================================
+
+@tilelang.jit(out_idx=[1, 2], pass_configs=_tma_pass_configs)
+def fused_router_tma2_selection_kernel(
+    num_tokens, H, E, E_padded, top_k,
+    block_M=64, block_K=64, num_stages=2, threads=384,
+    dtype=T.bfloat16,
+):
+    """Fused Router GEMM (TMA+WS, 1prod+2cons, Hopper) + Selection + Softmax."""
+    block_M_total = 2 * block_M
+    num_m_blocks = (num_tokens + block_M_total - 1) // block_M_total
+    accum_dtype = T.float32
+    WARP_SIZE = 32
+    num_warps_per_wg = 128 // WARP_SIZE  # 4 warps/WG → rows_per_round=4
+    rows_per_round = num_warps_per_wg
+    num_rounds = (block_M + rows_per_round - 1) // rows_per_round  # 16
+    elems_per_lane = (E + WARP_SIZE - 1) // WARP_SIZE
+    NEG_INF = -T.infinity(T.float32)
+
+    @T.prim_func
+    def kernel(
+        X: T.Tensor([num_tokens, H], dtype),
+        scores: T.Tensor([num_tokens, top_k], T.float32),
+        indices: T.Tensor([num_tokens, top_k], T.int32),
+        W: T.Tensor([H, E_padded], dtype),
+    ):
+        with T.Kernel(num_m_blocks, threads=threads) as (bx):
+            A_shared_0 = T.alloc_shared([num_stages, block_M, block_K], dtype)
+            A_shared_1 = T.alloc_shared([num_stages, block_M, block_K], dtype)
+            B_shared   = T.alloc_shared([num_stages, block_K, E_padded], dtype)
+            C_local_0  = T.alloc_fragment([block_M, E_padded], accum_dtype)
+            C_local_1  = T.alloc_fragment([block_M, E_padded], accum_dtype)
+            C_shared_0 = T.alloc_shared([block_M, E_padded], accum_dtype)
+            C_shared_1 = T.alloc_shared([block_M, E_padded], accum_dtype)
+
+            # Barriers: [0..ns-1]=loaded (producer→both cons, 128 arrives),
+            #           [ns..2*ns-1]=consumed (both cons→producer, 256 arrives),
+            #           [2*ns]=epi_ready_0, [2*ns+1]=epi_ready_1 (128 each)
+            T.create_list_of_mbarrier(
+                [128] * num_stages + [256] * num_stages + [128, 128])
+            EPI0 = 2 * num_stages
+            EPI1 = 2 * num_stages + 1
+
+            m_start_0 = bx * block_M_total
+            m_start_1 = bx * block_M_total + block_M
+            tx = T.get_thread_binding()
+            warp_id_wg = (tx // WARP_SIZE) % num_warps_per_wg
+            lane_id = tx % WARP_SIZE
+
+            with T.ws(0):
+                T.clear(C_local_0)
+            with T.ws(1):
+                T.clear(C_local_1)
+
+            for ko in range(T.ceildiv(H, block_K)):
+                with T.ws(2):  # producer: TMA copy A_0, A_1, B
+                    T.mbarrier_wait_parity(
+                        mbarrier=ko % num_stages + num_stages,
+                        parity=((ko // num_stages) % num_stages) ^ 1)
+                    T.copy(
+                        X[m_start_0:m_start_0 + block_M,
+                          ko * block_K:(ko + 1) * block_K],
+                        A_shared_0[ko % num_stages, :, :])
+                    T.copy(
+                        X[m_start_1:m_start_1 + block_M,
+                          ko * block_K:(ko + 1) * block_K],
+                        A_shared_1[ko % num_stages, :, :])
+                    T.copy(
+                        W[ko * block_K:(ko + 1) * block_K, 0:E_padded],
+                        B_shared[ko % num_stages, :, :])
+                    T.mbarrier_arrive(mbarrier=ko % num_stages)
+                with T.ws(0):  # consumer 0: WGMMA on A_0 × B
+                    T.mbarrier_wait_parity(
+                        mbarrier=ko % num_stages,
+                        parity=(ko // num_stages) % num_stages)
+                    T.gemm(
+                        A_shared_0[ko % num_stages, :, :],
+                        B_shared[ko % num_stages, :, :],
+                        C_local_0)
+                    T.mbarrier_arrive(mbarrier=ko % num_stages + num_stages)
+                with T.ws(1):  # consumer 1: WGMMA on A_1 × B
+                    T.mbarrier_wait_parity(
+                        mbarrier=ko % num_stages,
+                        parity=(ko // num_stages) % num_stages)
+                    T.gemm(
+                        A_shared_1[ko % num_stages, :, :],
+                        B_shared[ko % num_stages, :, :],
+                        C_local_1)
+                    T.mbarrier_arrive(mbarrier=ko % num_stages + num_stages)
+
+            # Stage per-WG C_local → C_shared; signal epi_ready per WG
+            with T.ws(0):
+                T.copy(C_local_0, C_shared_0)
+                T.mbarrier_arrive(mbarrier=EPI0)
+            with T.ws(1):
+                T.copy(C_local_1, C_shared_1)
+                T.mbarrier_arrive(mbarrier=EPI1)
+
+            # ---- Epilogue: each consumer handles its own M slice ----
+            with T.ws(0):
+                T.mbarrier_wait_parity(mbarrier=EPI0, parity=0)
+                for rnd in T.serial(num_rounds):
+                    row = rnd * rows_per_round + warp_id_wg
+                    token_idx = m_start_0 + row
+                    if token_idx < num_tokens:
+                        my_vals = T.alloc_local([elems_per_lane], T.float32)
+                        for i in T.serial(elems_per_lane):
+                            col = lane_id * elems_per_lane + i
+                            my_vals[i] = T.if_then_else(
+                                col < E, C_shared_0[row, col], NEG_INF)
+
+                        local_vals = T.alloc_local([top_k], T.float32)
+                        local_idx = T.alloc_local([top_k], T.int32)
+
+                        for k_iter in T.serial(top_k):
+                            my_max_val = T.alloc_var(T.float32, init=NEG_INF)
+                            my_max_idx = T.alloc_var(T.int32, init=-1)
+
+                            for i in T.serial(elems_per_lane):
+                                if my_vals[i] > my_max_val:
+                                    my_max_val = my_vals[i]
+                                    my_max_idx = T.int32(lane_id * elems_per_lane + i)
+
+                            warp_max = T.warp_reduce_max(my_max_val)
+                            cand = T.alloc_var(T.float32, init=T.float32(-1.0))
+                            if my_max_val == warp_max:
+                                cand = T.cast(my_max_idx, T.float32)
+                            winner_f = T.warp_reduce_max(cand)
+                            winner_idx = T.cast(winner_f, T.int32)
+
+                            if lane_id == 0:
+                                local_vals[k_iter] = warp_max
+                                local_idx[k_iter] = winner_idx
+
+                            for i in T.serial(elems_per_lane):
+                                if lane_id * elems_per_lane + i == winner_idx:
+                                    my_vals[i] = NEG_INF
+
+                        if lane_id == 0:
+                            max_val = T.alloc_var(T.float32, init=NEG_INF)
+                            for i in T.serial(top_k):
+                                if local_vals[i] > max_val:
+                                    max_val = local_vals[i]
+
+                            exp_sum = T.alloc_var(T.float32, init=T.float32(0.0))
+                            for i in T.serial(top_k):
+                                local_vals[i] = T.exp(local_vals[i] - max_val)
+                                exp_sum = exp_sum + local_vals[i]
+
+                            for i in T.serial(top_k):
+                                scores[token_idx, i] = local_vals[i] / exp_sum
+                                indices[token_idx, i] = local_idx[i]
+
+            with T.ws(1):
+                T.mbarrier_wait_parity(mbarrier=EPI1, parity=0)
+                for rnd in T.serial(num_rounds):
+                    row = rnd * rows_per_round + warp_id_wg
+                    token_idx = m_start_1 + row
+                    if token_idx < num_tokens:
+                        my_vals = T.alloc_local([elems_per_lane], T.float32)
+                        for i in T.serial(elems_per_lane):
+                            col = lane_id * elems_per_lane + i
+                            my_vals[i] = T.if_then_else(
+                                col < E, C_shared_1[row, col], NEG_INF)
+
+                        local_vals = T.alloc_local([top_k], T.float32)
+                        local_idx = T.alloc_local([top_k], T.int32)
+
+                        for k_iter in T.serial(top_k):
+                            my_max_val = T.alloc_var(T.float32, init=NEG_INF)
+                            my_max_idx = T.alloc_var(T.int32, init=-1)
+
+                            for i in T.serial(elems_per_lane):
+                                if my_vals[i] > my_max_val:
+                                    my_max_val = my_vals[i]
+                                    my_max_idx = T.int32(lane_id * elems_per_lane + i)
+
+                            warp_max = T.warp_reduce_max(my_max_val)
+                            cand = T.alloc_var(T.float32, init=T.float32(-1.0))
+                            if my_max_val == warp_max:
+                                cand = T.cast(my_max_idx, T.float32)
+                            winner_f = T.warp_reduce_max(cand)
+                            winner_idx = T.cast(winner_f, T.int32)
+
+                            if lane_id == 0:
+                                local_vals[k_iter] = warp_max
+                                local_idx[k_iter] = winner_idx
+
+                            for i in T.serial(elems_per_lane):
+                                if lane_id * elems_per_lane + i == winner_idx:
+                                    my_vals[i] = NEG_INF
+
+                        if lane_id == 0:
+                            max_val = T.alloc_var(T.float32, init=NEG_INF)
+                            for i in T.serial(top_k):
+                                if local_vals[i] > max_val:
+                                    max_val = local_vals[i]
+
+                            exp_sum = T.alloc_var(T.float32, init=T.float32(0.0))
+                            for i in T.serial(top_k):
+                                local_vals[i] = T.exp(local_vals[i] - max_val)
+                                exp_sum = exp_sum + local_vals[i]
+
+                            for i in T.serial(top_k):
+                                scores[token_idx, i] = local_vals[i] / exp_sum
+                                indices[token_idx, i] = local_idx[i]
+
+    return kernel
+
+
+# ============================================================================
 # Kernel Cache + Wrapper (handles W padding for non-power-of-2 E)
 # ============================================================================
 
@@ -771,6 +988,7 @@ _ALGO_FACTORIES = {
     "cpasync_bitonic":   fused_router_cpasync_bitonic_kernel,
     "tma_selection":     fused_router_tma_selection_kernel,
     "tma_bitonic":       fused_router_tma_bitonic_kernel,
+    "tma2_selection":    fused_router_tma2_selection_kernel,
 }
 
 
