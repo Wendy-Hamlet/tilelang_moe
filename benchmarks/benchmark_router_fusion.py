@@ -51,6 +51,8 @@ try:
         fused_router_tma2_bitonic_kernel,
         fused_router_tma2n_selection_kernel,
         fused_router_tma2n_bitonic_kernel,
+        fused_router_tma3_selection_kernel,
+        fused_router_tma3_bitonic_kernel,
     )
     import tilelang.language as T
     HAS_FUSED = True
@@ -94,6 +96,8 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
             "tma2_bitonic":      (fused_router_tma2_bitonic_kernel,       384),
             "tma2n_selection":   (fused_router_tma2n_selection_kernel,    384),
             "tma2n_bitonic":     (fused_router_tma2n_bitonic_kernel,      384),
+            "tma3_selection":    (fused_router_tma3_selection_kernel,     384),
+            "tma3_bitonic":      (fused_router_tma3_bitonic_kernel,       384),
         }
         for algo, (factory, th) in factory_map.items():
             try:
@@ -161,6 +165,8 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
         "tma2_bitonic":      "TMA2-Bit",
         "tma2n_selection":   "TMA2N-Sel",
         "tma2n_bitonic":     "TMA2N-Bit",
+        "tma3_selection":    "TMA3-Sel",
+        "tma3_bitonic":      "TMA3-Bit",
     }
     for algo, label in algo_display.items():
         if algo in raw_fused:
