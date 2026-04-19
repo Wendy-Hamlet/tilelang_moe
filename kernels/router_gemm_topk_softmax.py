@@ -502,7 +502,10 @@ def fused_router_tma_selection_kernel(
 
             # ---- GEMM: warp-specialized with TMA producer ----
             with T.ws(0):
+                T.annotate_consumer_reg_alloc(240)
                 T.clear(C_local)
+            with T.ws(1):
+                T.annotate_producer_reg_dealloc(24)
 
             for ko in range(T.ceildiv(H, block_K)):
                 with T.ws(1):  # producer: TMA copy
@@ -649,7 +652,10 @@ def fused_router_tma_bitonic_kernel(
             NEG_INF_BITS_CLEAN = T.uint32(0xFF800000 & ~idx_mask_val)
 
             with T.ws(0):
+                T.annotate_consumer_reg_alloc(240)
                 T.clear(C_local)
+            with T.ws(1):
+                T.annotate_producer_reg_dealloc(24)
 
             for ko in range(T.ceildiv(H, block_K)):
                 with T.ws(1):
@@ -851,9 +857,13 @@ def fused_router_tma2_selection_kernel(
             lane_id = tx % WARP_SIZE
 
             with T.ws(0):
+                T.annotate_consumer_reg_alloc(240)
                 T.clear(C_local_0)
             with T.ws(1):
+                T.annotate_consumer_reg_alloc(240)
                 T.clear(C_local_1)
+            with T.ws(2):
+                T.annotate_producer_reg_dealloc(24)
 
             for ko in range(T.ceildiv(H, block_K)):
                 with T.ws(2):  # producer: TMA copy A_0, A_1, B
@@ -1083,9 +1093,13 @@ def fused_router_tma2_bitonic_kernel(
             NEG_INF_BITS_CLEAN = T.uint32(NEG_INF_BITS_CLEAN_val)
 
             with T.ws(0):
+                T.annotate_consumer_reg_alloc(240)
                 T.clear(C_local_0)
             with T.ws(1):
+                T.annotate_consumer_reg_alloc(240)
                 T.clear(C_local_1)
+            with T.ws(2):
+                T.annotate_producer_reg_dealloc(24)
 
             for ko in range(T.ceildiv(H, block_K)):
                 with T.ws(2):  # producer
@@ -1405,9 +1419,13 @@ def fused_router_tma2n_selection_kernel(
             lane_id = tx % WARP_SIZE
 
             with T.ws(0):
+                T.annotate_consumer_reg_alloc(240)
                 T.clear(C_local_0)
             with T.ws(1):
+                T.annotate_consumer_reg_alloc(240)
                 T.clear(C_local_1)
+            with T.ws(2):
+                T.annotate_producer_reg_dealloc(24)
 
             for ko in range(T.ceildiv(H, block_K)):
                 with T.ws(2):  # producer: load A + both B halves
@@ -1621,9 +1639,13 @@ def fused_router_tma2n_bitonic_kernel(
             NEG_INF_BITS_CLEAN = T.uint32(NEG_INF_BITS_CLEAN_val)
 
             with T.ws(0):
+                T.annotate_consumer_reg_alloc(240)
                 T.clear(C_local_0)
             with T.ws(1):
+                T.annotate_consumer_reg_alloc(240)
                 T.clear(C_local_1)
+            with T.ws(2):
+                T.annotate_producer_reg_dealloc(24)
 
             for ko in range(T.ceildiv(H, block_K)):
                 with T.ws(2):
