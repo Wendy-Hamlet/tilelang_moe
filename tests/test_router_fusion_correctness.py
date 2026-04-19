@@ -29,7 +29,7 @@ def ref_topk_softmax(X, W, K):
     return scores, idx
 
 
-def test_variant(name, factory, T_tokens, H, E, K, threads=256):
+def test_variant(name, factory, T_tokens, H, E, K, threads=256, block_M=64):
     E_padded = _next_pow2(E)
     torch.manual_seed(0)
     X = torch.randn(T_tokens, H, device="cuda", dtype=torch.bfloat16)
@@ -40,7 +40,7 @@ def test_variant(name, factory, T_tokens, H, E, K, threads=256):
 
     try:
         kern = factory(T_tokens, H, E, E_padded, K,
-                       block_M=64, block_K=64, num_stages=2, threads=threads,
+                       block_M=block_M, block_K=64, num_stages=2, threads=threads,
                        dtype=T.bfloat16)
     except Exception as e:
         print(f"  [{name}] COMPILE FAIL: {e}")
@@ -76,21 +76,21 @@ def main():
         ("DeepSeek-V2", 256, 5120, 160, 6),
     ]
     variants = [
-        ("cpasync_sel",  fused_router_cpasync_selection_kernel,  256),
-        ("cpasync_bit",  fused_router_cpasync_bitonic_kernel,    256),
-        ("tma_sel",      fused_router_tma_selection_kernel,      256),
-        ("tma_bit",      fused_router_tma_bitonic_kernel,        256),
-        ("tma2_sel",     fused_router_tma2_selection_kernel,     384),
-        ("tma2_bit",     fused_router_tma2_bitonic_kernel,       384),
-        ("tma2n_sel",    fused_router_tma2n_selection_kernel,    384),
-        ("tma2n_bit",    fused_router_tma2n_bitonic_kernel,      384),
-        ("tma3_sel",     fused_router_tma3_selection_kernel,     384),
-        ("tma3_bit",     fused_router_tma3_bitonic_kernel,       384),
+        ("cpasync_sel",  fused_router_cpasync_selection_kernel,  256,  64),
+        ("cpasync_bit",  fused_router_cpasync_bitonic_kernel,    256,  64),
+        ("tma_sel",      fused_router_tma_selection_kernel,      256,  64),
+        ("tma_bit",      fused_router_tma_bitonic_kernel,        256,  64),
+        ("tma2_sel",     fused_router_tma2_selection_kernel,     384,  64),
+        ("tma2_bit",     fused_router_tma2_bitonic_kernel,       384,  64),
+        ("tma2n_sel",    fused_router_tma2n_selection_kernel,    384,  64),
+        ("tma2n_bit",    fused_router_tma2n_bitonic_kernel,      384,  64),
+        ("tma3_sel",     fused_router_tma3_selection_kernel,     384, 128),
+        ("tma3_bit",     fused_router_tma3_bitonic_kernel,       384, 128),
     ]
     for cfg_name, T_tokens, H, E, K in configs:
         print(f"\n=== {cfg_name}  T={T_tokens} H={H} E={E} K={K} ===")
-        for vname, factory, threads in variants:
-            test_variant(vname, factory, T_tokens, H, E, K, threads=threads)
+        for vname, factory, threads, block_M in variants:
+            test_variant(vname, factory, T_tokens, H, E, K, threads=threads, block_M=block_M)
 
 
 if __name__ == "__main__":

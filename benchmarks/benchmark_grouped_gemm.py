@@ -221,12 +221,11 @@ def run_single_config(name, H, I, E_local, top_k, E_total, input_tokens,
     results = {}
 
     # ==========================================
-    # Pure kernel benchmark — all use do_bench(backend="cupti") for fair
-    # comparison: CUPTI measures pure CUDA kernel time via PyTorch profiler,
-    # automatically excluding host overhead (Python calls, tensor allocation).
+    # Pure kernel benchmark:
+    # - PyTorch / grouped_mm / Triton: do_bench (per-iteration events + L2 flush)
+    # - TileLang single kernels: profiler.do_bench (adapter-level, no JIT wrapper overhead)
+    # Note: CUPTI backend tested but rejected — profiling overhead is non-uniform.
     # ==========================================
-
-    BACKEND = "cupti"
 
     # --- PyTorch for-loop (bf16, cuBLAS) ---
     def loop_fn():
@@ -239,57 +238,61 @@ def run_single_config(name, H, I, E_local, top_k, E_total, input_tokens,
                      out=Y_bf16[start:start+sz])
             start += sz
 
-    results['PyTorch'] = do_bench(loop_fn, warmup=warmup, rep=rep, backend=BACKEND)
+    results['PyTorch'] = do_bench(loop_fn, warmup=warmup, rep=rep)
 
     # --- torch._grouped_mm (CUTLASS, bf16) ---
     if HAS_TORCH_GROUPED_MM:
         try:
-            torch._grouped_mm(X_sorted_bf16, W_bf16_HI, offs)  # verify/warmup
+            torch._grouped_mm(X_sorted_bf16, W_bf16_HI, offs)
             results['grouped_mm'] = do_bench(
                 lambda: torch._grouped_mm(X_sorted_bf16, W_bf16_HI, offs),
-                warmup=warmup, rep=rep, backend=BACKEND)
+                warmup=warmup, rep=rep)
         except Exception:
             results['grouped_mm'] = float('inf')
 
-    # --- TileLang v1 (bf16) ---
+    # --- TileLang v1 (bf16) — profiler.do_bench via adapter ---
     try:
         kernel_v1(X_sorted_bf16, W_bf16_HI, batch_sizes_t_v1, batch_offsets_t_v1, batch_padded_offsets_t_v1)
-        results['TL-v1'] = do_bench(
-            lambda: kernel_v1(X_sorted_bf16, W_bf16_HI, batch_sizes_t_v1, batch_offsets_t_v1, batch_padded_offsets_t_v1),
-            warmup=warmup, rep=rep, backend=BACKEND)
+        profiler_v1 = kernel_v1.get_profiler()
+        results['TL-v1'] = profiler_v1.do_bench(
+            input_tensors=[X_sorted_bf16, W_bf16_HI, batch_sizes_t_v1, batch_offsets_t_v1, batch_padded_offsets_t_v1],
+            warmup=warmup, rep=rep)
     except Exception as e:
         print("\n[TL-v1 Error] {}".format(e))
         results['TL-v1'] = float('inf')
 
-    # --- TileLang v2 (bf16) ---
+    # --- TileLang v2 (bf16) — profiler.do_bench via adapter ---
     if HAS_V2:
         try:
             kernel_v2(X_sorted_bf16, W_bf16_HI, batch_offsets_t_v2, batch_padded_offsets_t_v2, tile_expert_ids_t_v2)
-            results['TL-v2'] = do_bench(
-                lambda: kernel_v2(X_sorted_bf16, W_bf16_HI, batch_offsets_t_v2, batch_padded_offsets_t_v2, tile_expert_ids_t_v2),
-                warmup=warmup, rep=rep, backend=BACKEND)
+            profiler_v2 = kernel_v2.get_profiler()
+            results['TL-v2'] = profiler_v2.do_bench(
+                input_tensors=[X_sorted_bf16, W_bf16_HI, batch_offsets_t_v2, batch_padded_offsets_t_v2, tile_expert_ids_t_v2],
+                warmup=warmup, rep=rep)
         except Exception as e:
             print("\n[TL-v2 Error] {}".format(e))
             results['TL-v2'] = float('inf')
 
-    # --- TileLang v4 (bf16) ---
+    # --- TileLang v4 (bf16) — profiler.do_bench via adapter ---
     if HAS_V4:
         try:
             kernel_v4(X_sorted_bf16, W_bf16_HI, batch_offsets_t_v4, batch_padded_offsets_t_v4, tile_expert_ids_t_v4)
-            results['TL-v4'] = do_bench(
-                lambda: kernel_v4(X_sorted_bf16, W_bf16_HI, batch_offsets_t_v4, batch_padded_offsets_t_v4, tile_expert_ids_t_v4),
-                warmup=warmup, rep=rep, backend=BACKEND)
+            profiler_v4 = kernel_v4.get_profiler()
+            results['TL-v4'] = profiler_v4.do_bench(
+                input_tensors=[X_sorted_bf16, W_bf16_HI, batch_offsets_t_v4, batch_padded_offsets_t_v4, tile_expert_ids_t_v4],
+                warmup=warmup, rep=rep)
         except Exception as e:
             print("\n[TL-v4 Error] {}".format(e))
             results['TL-v4'] = float('inf')
 
-    # --- TileLang v5 (persistent v4, bf16) ---
+    # --- TileLang v5 (persistent v4, bf16) — profiler.do_bench via adapter ---
     if HAS_V5 and HAS_V4:
         try:
             kernel_v5(X_sorted_bf16, W_bf16_HI, batch_offsets_t_v4, batch_padded_offsets_t_v4, tile_expert_ids_t_v4)
-            results['TL-v5'] = do_bench(
-                lambda: kernel_v5(X_sorted_bf16, W_bf16_HI, batch_offsets_t_v4, batch_padded_offsets_t_v4, tile_expert_ids_t_v4),
-                warmup=warmup, rep=rep, backend=BACKEND)
+            profiler_v5 = kernel_v5.get_profiler()
+            results['TL-v5'] = profiler_v5.do_bench(
+                input_tensors=[X_sorted_bf16, W_bf16_HI, batch_offsets_t_v4, batch_padded_offsets_t_v4, tile_expert_ids_t_v4],
+                warmup=warmup, rep=rep)
         except Exception as e:
             print("\n[TL-v5 Error] {}".format(e))
             results['TL-v5'] = float('inf')
@@ -303,7 +306,7 @@ def run_single_config(name, H, I, E_local, top_k, E_total, input_tokens,
             triton_grouped_gemm(tri_a, tri_b, tri_c, tri_sizes, tri_lds, group_size)
             results['Triton'] = do_bench(
                 lambda: triton_grouped_gemm(tri_a, tri_b, tri_c, tri_sizes, tri_lds, group_size),
-                warmup=warmup, rep=rep, backend=BACKEND)
+                warmup=warmup, rep=rep)
         except Exception as e:
             print("\n[Triton Error] {}".format(e))
             results['Triton'] = float('inf')
@@ -316,7 +319,7 @@ def run_single_config(name, H, I, E_local, top_k, E_total, input_tokens,
                 triton_grouped_gemm_tma(tma_a, tma_b, tma_c, tma_sizes, tma_lds, group_size)
                 results['Triton-TMA'] = do_bench(
                     lambda: triton_grouped_gemm_tma(tma_a, tma_b, tma_c, tma_sizes, tma_lds, group_size),
-                    warmup=warmup, rep=rep, backend=BACKEND)
+                    warmup=warmup, rep=rep)
             except Exception as e:
                 print("\n[Triton-TMA Error] {}".format(e))
                 results['Triton-TMA'] = float('inf')

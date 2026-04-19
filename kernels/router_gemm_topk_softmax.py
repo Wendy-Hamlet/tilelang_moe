@@ -1933,17 +1933,22 @@ def fused_router_tma2n_bitonic_kernel(
 @tilelang.jit(out_idx=[1, 2], pass_configs=_tma_pass_configs)
 def fused_router_tma3_selection_kernel(
     num_tokens, H, E, E_padded, top_k,
-    block_M=64, block_K=64, num_stages=2, threads=384,
+    block_M=128, block_K=64, num_stages=2, threads=384,
     dtype=T.bfloat16,
 ):
-    """Fused Router GEMM (TMA, 2-WG consumer + 1-WG TMA producer) + Selection + Softmax."""
+    """Fused Router GEMM (TMA, 2-WG M-split cooperative + 1-WG TMA producer) + Selection + Softmax.
+
+    M-split cooperative design: block_M=128, WG0 handles rows [0:64], WG1 handles rows [64:128].
+    Each WG issues wgmma<64, E_padded, 16> (full N-width) independently on its M-half.
+    This avoids the N-split wgmma<64, E_padded/2, 16> used by cpasync/tma3-old.
+    """
     num_m_blocks = (num_tokens + block_M - 1) // block_M
     accum_dtype = T.float32
     WARP_SIZE = 32
     consumer_threads = 256
     num_warps = consumer_threads // WARP_SIZE   # 8 consumer warps
     rows_per_round = num_warps                  # 8
-    num_rounds = (block_M + rows_per_round - 1) // rows_per_round  # 8
+    num_rounds = (block_M + rows_per_round - 1) // rows_per_round  # 16 for block_M=128
     elems_per_lane = (E + WARP_SIZE - 1) // WARP_SIZE
     NEG_INF = -T.infinity(T.float32)
 
@@ -1993,7 +1998,7 @@ def fused_router_tma3_selection_kernel(
                         W[ko * block_K:(ko + 1) * block_K, 0:E_padded],
                         B_shared[ko % num_stages, :, :])
                     T.mbarrier_arrive(mbarrier=ko % num_stages)
-                if tx < 256:             # consumers: N-split WGMMA across WG0+WG1
+                if tx < 256:             # consumers: M-split cooperative WGMMA (WG0: rows 0-63, WG1: rows 64-127)
                     T.mbarrier_wait_parity(
                         mbarrier=ko % num_stages,
                         parity=(ko // num_stages) % num_stages)
@@ -2003,7 +2008,7 @@ def fused_router_tma3_selection_kernel(
                         C_local)
                     T.mbarrier_arrive(mbarrier=ko % num_stages + num_stages)
 
-            # Both consumers copy their N-half of C_local → C_shared
+            # Both consumers copy their M-half of C_local → C_shared
             if tx < 256:
                 T.copy(C_local, C_shared)
                 T.mbarrier_arrive(mbarrier=EPI_READY)
@@ -2080,17 +2085,21 @@ def fused_router_tma3_selection_kernel(
 @tilelang.jit(out_idx=[1, 2], pass_configs=_tma_pass_configs)
 def fused_router_tma3_bitonic_kernel(
     num_tokens, H, E, E_padded, top_k,
-    block_M=64, block_K=64, num_stages=2, threads=384,
+    block_M=128, block_K=64, num_stages=2, threads=384,
     dtype=T.bfloat16,
 ):
-    """Fused Router GEMM (TMA, 2-WG consumer + 1-WG TMA producer) + Bitonic + Softmax."""
+    """Fused Router GEMM (TMA, 2-WG M-split cooperative + 1-WG TMA producer) + Bitonic + Softmax.
+
+    M-split cooperative design: block_M=128, WG0 handles rows [0:64], WG1 handles rows [64:128].
+    Each WG issues wgmma<64, E_padded, 16> (full N-width) independently on its M-half.
+    """
     num_m_blocks = (num_tokens + block_M - 1) // block_M
     accum_dtype = T.float32
     WARP_SIZE = 32
     consumer_threads = 256
     num_warps = consumer_threads // WARP_SIZE   # 8 consumer warps
     rows_per_round = num_warps
-    num_rounds = (block_M + rows_per_round - 1) // rows_per_round
+    num_rounds = (block_M + rows_per_round - 1) // rows_per_round  # 16 for block_M=128
 
     elems_per_lane = E_padded // WARP_SIZE if E_padded >= WARP_SIZE else 1
     if elems_per_lane < 1:

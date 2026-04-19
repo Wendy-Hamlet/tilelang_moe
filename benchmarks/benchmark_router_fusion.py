@@ -88,23 +88,23 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
     raw_gemm = None
     if HAS_FUSED:
         factory_map = {
-            "cpasync_selection": (fused_router_cpasync_selection_kernel,  256),
-            "cpasync_bitonic":   (fused_router_cpasync_bitonic_kernel,    256),
-            "tma_selection":     (fused_router_tma_selection_kernel,      256),
-            "tma_bitonic":       (fused_router_tma_bitonic_kernel,        256),
-            "tma2_selection":    (fused_router_tma2_selection_kernel,     384),
-            "tma2_bitonic":      (fused_router_tma2_bitonic_kernel,       384),
-            "tma2n_selection":   (fused_router_tma2n_selection_kernel,    384),
-            "tma2n_bitonic":     (fused_router_tma2n_bitonic_kernel,      384),
-            "tma3_selection":    (fused_router_tma3_selection_kernel,     384),
-            "tma3_bitonic":      (fused_router_tma3_bitonic_kernel,       384),
+            "cpasync_selection": (fused_router_cpasync_selection_kernel,  256,  64),
+            "cpasync_bitonic":   (fused_router_cpasync_bitonic_kernel,    256,  64),
+            "tma_selection":     (fused_router_tma_selection_kernel,      256,  64),
+            "tma_bitonic":       (fused_router_tma_bitonic_kernel,        256,  64),
+            "tma2_selection":    (fused_router_tma2_selection_kernel,     384,  64),
+            "tma2_bitonic":      (fused_router_tma2_bitonic_kernel,       384,  64),
+            "tma2n_selection":   (fused_router_tma2n_selection_kernel,    384,  64),
+            "tma2n_bitonic":     (fused_router_tma2n_bitonic_kernel,      384,  64),
+            "tma3_selection":    (fused_router_tma3_selection_kernel,     384, 128),
+            "tma3_bitonic":      (fused_router_tma3_bitonic_kernel,       384, 128),
         }
-        for algo, (factory, th) in factory_map.items():
+        for algo, (factory, th, bm) in factory_map.items():
             try:
                 print(f"    Compiling {algo} T={num_tokens} E={E}...", end=" ", flush=True)
                 raw_fused[algo] = factory(
                     num_tokens, H, E, E_padded, K,
-                    block_M=64, block_K=64, num_stages=2, threads=th,
+                    block_M=bm, block_K=64, num_stages=2, threads=th,
                     dtype=T.bfloat16)
                 print("OK", flush=True)
             except Exception as e:
