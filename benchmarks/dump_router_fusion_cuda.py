@@ -67,7 +67,7 @@ for name, factory, threads, block_M in VARIANTS:
             dtype=T.bfloat16)
 
         cuda_src = kern.get_kernel_source()
-        tir_src  = kern.prim_func.script()
+        tir_src  = kern.prim_func.script(show_meta=True)
         n_cu  = len(cuda_src.splitlines())
         n_tir = len(tir_src.splitlines())
         print(f"  OK  CUDA={n_cu} lines, TIR={n_tir} lines", flush=True)
