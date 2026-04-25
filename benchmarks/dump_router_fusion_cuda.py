@@ -1,4 +1,4 @@
-"""Dump CUDA source of all router_fusion kernel variants for inspection."""
+"""Dump CUDA source AND TileLang IR of all router_fusion kernel variants."""
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -40,14 +40,23 @@ VARIANTS = [
 
 SEPARATOR = "=" * 100
 
-out_path = Path(__file__).resolve().parent.parent / "docs" / "router_fusion_cuda_dump.cu"
-out_path.parent.mkdir(exist_ok=True)
+docs_dir = Path(__file__).resolve().parent.parent / "docs"
+docs_dir.mkdir(exist_ok=True)
+cuda_path = docs_dir / "router_fusion_cuda_dump.cu"
+tir_path  = docs_dir / "router_fusion_tir_dump.py"
 
-lines = []
-lines.append(f"// Router Fusion CUDA Dump")
-lines.append(f"// Shape: T={T_TOKENS} H={H} E={E} E_padded={E_padded} K={K}")
-lines.append(f"// Model: DeepSeek-V2")
-lines.append("")
+cuda_lines = [
+    "// Router Fusion CUDA Dump",
+    f"// Shape: T={T_TOKENS} H={H} E={E} E_padded={E_padded} K={K}",
+    "// Model: DeepSeek-V2",
+    "",
+]
+tir_lines = [
+    "# Router Fusion TileLang IR Dump",
+    f"# Shape: T={T_TOKENS} H={H} E={E} E_padded={E_padded} K={K}",
+    "# Model: DeepSeek-V2",
+    "",
+]
 
 for name, factory, threads, block_M in VARIANTS:
     print(f"Compiling {name} (threads={threads}, block_M={block_M})...", flush=True)
@@ -56,23 +65,38 @@ for name, factory, threads, block_M in VARIANTS:
             T_TOKENS, H, E, E_padded, K,
             block_M=block_M, block_K=64, num_stages=2, threads=threads,
             dtype=T.bfloat16)
-        src = kern.get_kernel_source()
-        n_lines = len(src.splitlines())
-        print(f"  OK  ({n_lines} lines)", flush=True)
 
-        lines.append(SEPARATOR)
-        lines.append(f"// VARIANT: {name}  threads={threads}")
-        lines.append(f"// Lines: {n_lines}")
-        lines.append(SEPARATOR)
-        lines.append(src)
-        lines.append("")
+        cuda_src = kern.get_kernel_source()
+        tir_src  = kern.prim_func.script()
+        n_cu  = len(cuda_src.splitlines())
+        n_tir = len(tir_src.splitlines())
+        print(f"  OK  CUDA={n_cu} lines, TIR={n_tir} lines", flush=True)
+
+        cuda_lines += [
+            SEPARATOR,
+            f"// VARIANT: {name}  threads={threads}  block_M={block_M}",
+            f"// Lines: {n_cu}",
+            SEPARATOR,
+            cuda_src,
+            "",
+        ]
+        tir_lines += [
+            "# " + "=" * 96,
+            f"# VARIANT: {name}  threads={threads}  block_M={block_M}",
+            f"# Lines: {n_tir}",
+            "# " + "=" * 96,
+            tir_src,
+            "",
+        ]
     except Exception as ex:
         print(f"  FAIL: {ex}", flush=True)
-        lines.append(SEPARATOR)
-        lines.append(f"// VARIANT: {name}  FAILED: {ex}")
-        lines.append(SEPARATOR)
-        lines.append("")
+        cuda_lines += [SEPARATOR, f"// VARIANT: {name}  FAILED: {ex}", SEPARATOR, ""]
+        tir_lines  += ["# " + "=" * 96, f"# VARIANT: {name}  FAILED: {ex}",
+                       "# " + "=" * 96, ""]
 
-output = "\n".join(lines)
-out_path.write_text(output, encoding="utf-8")
-print(f"\nWritten {len(output)} chars to {out_path}")
+cuda_out = "\n".join(cuda_lines)
+tir_out  = "\n".join(tir_lines)
+cuda_path.write_text(cuda_out, encoding="utf-8")
+tir_path.write_text(tir_out,  encoding="utf-8")
+print(f"\nWritten CUDA: {len(cuda_out)} chars → {cuda_path}")
+print(f"Written TIR : {len(tir_out)} chars → {tir_path}")
