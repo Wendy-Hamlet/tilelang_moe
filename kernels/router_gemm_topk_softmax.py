@@ -1918,16 +1918,21 @@ def fused_router_tma2n_bitonic_kernel(
 
 
 # ============================================================================
-# 9. TMA 3-WG (2 consumer + 1 producer) + Selection Top-K  (Hopper+)
+# 9. TMA 3-WG (1 producer + 2 consumer) + Selection Top-K  (Hopper+)
 #
-# Unlike tma_selection (ws(0)=consumer 128t, ws(1)=producer 128t), this variant
-# uses threads=384 and plain if-tx branching (no T.ws):
-#   tx < 256  → WG0+WG1 cooperative consumer: N-split WGMMA on same block_M rows
-#   tx >= 256 → WG2 TMA producer
+# Standard 1:2 warp specialization with M-split cooperative consumers:
+#   ws(0): consumer WG0 — wgmma<64, E_padded, 16> on A_shared[:, 0:64,  :]
+#   ws(1): consumer WG1 — wgmma<64, E_padded, 16> on A_shared[:, 64:128,:]
+#   ws(2): producer    — single TMA load of full A[m_start:m_start+128] + B
 #
-# Consumer register budget: 256 × 240 + 128 × 24 = 64512 < 65536 → 1 block/SM.
-# Grid = same as tma_selection (ceil(T/block_M)), each block processes block_M rows.
-# Expected benefit: 2-WG N-split GEMM (same throughput as cpasync) + TMA async load.
+# Compared to tma2/tma2n: A is one contiguous [block_M=128, block_K] buffer
+# (one TMA descriptor + one barrier arrive for A) instead of two halves.
+# Each consumer slices A_shared along axis 1 to feed its own gemm; B_shared is
+# shared so both WGs cover full E_padded.
+#
+# Compute density: 2 × wgmma<64, E_padded, 16> per K-step (vs cpasync's
+# 2 × wgmma<64, E_padded/2, 16> N-split). Throughput should match cpasync but
+# now driven by TMA + WS overlap of producer load with consumer math.
 # ============================================================================
 
 @tilelang.jit(out_idx=[1, 2], pass_configs=_tma_pass_configs)
@@ -1936,19 +1941,20 @@ def fused_router_tma3_selection_kernel(
     block_M=128, block_K=64, num_stages=2, threads=384,
     dtype=T.bfloat16,
 ):
-    """Fused Router GEMM (TMA, 2-WG M-split cooperative + 1-WG TMA producer) + Selection + Softmax.
+    """Fused Router GEMM (TMA, 1 producer + 2 M-split cooperative consumer WGs)
+    + Selection-Sort TopK + Softmax.
 
-    M-split cooperative design: block_M=128, WG0 handles rows [0:64], WG1 handles rows [64:128].
-    Each WG issues wgmma<64, E_padded, 16> (full N-width) independently on its M-half.
-    This avoids the N-split wgmma<64, E_padded/2, 16> used by cpasync/tma3-old.
+    block_M = 128 covers two cooperating consumer WGs at 64 rows each.
+    Single A_shared buffer; consumers slice along M axis. B_shared is shared.
     """
+    assert block_M % 2 == 0, "block_M must be divisible by 2 for M-split"
+    block_M_half = block_M // 2  # 64
     num_m_blocks = (num_tokens + block_M - 1) // block_M
     accum_dtype = T.float32
     WARP_SIZE = 32
-    consumer_threads = 256
-    num_warps = consumer_threads // WARP_SIZE   # 8 consumer warps
-    rows_per_round = num_warps                  # 8
-    num_rounds = (block_M + rows_per_round - 1) // rows_per_round  # 16 for block_M=128
+    num_warps_per_wg = 128 // WARP_SIZE  # 4 warps/WG → 4 rows/round
+    rows_per_round = num_warps_per_wg
+    num_rounds = block_M_half // rows_per_round  # 16 (64/4)
     elems_per_lane = (E + WARP_SIZE - 1) // WARP_SIZE
     NEG_INF = -T.infinity(T.float32)
 
@@ -1960,33 +1966,40 @@ def fused_router_tma3_selection_kernel(
         W: T.Tensor([H, E_padded], dtype),
     ):
         with T.Kernel(num_m_blocks, threads=threads) as (bx):
-            A_shared = T.alloc_shared([num_stages, block_M, block_K], dtype)
-            B_shared = T.alloc_shared([num_stages, block_K, E_padded], dtype)
-            C_local  = T.alloc_fragment([block_M, E_padded], accum_dtype)
-            C_shared = T.alloc_shared([block_M, E_padded], accum_dtype)
+            # Single contiguous A buffer covering both consumer M-halves.
+            A_shared   = T.alloc_shared([num_stages, block_M, block_K], dtype)
+            B_shared   = T.alloc_shared([num_stages, block_K, E_padded], dtype)
+            C_local_0  = T.alloc_fragment([block_M_half, E_padded], accum_dtype)
+            C_local_1  = T.alloc_fragment([block_M_half, E_padded], accum_dtype)
+            C_shared_0 = T.alloc_shared([block_M_half, E_padded], accum_dtype)
+            C_shared_1 = T.alloc_shared([block_M_half, E_padded], accum_dtype)
 
             # Barriers:
-            # [0..ns-1]    load_done:    producer(128t) signals → consumers wait
-            # [ns..2ns-1]  consume_done: both consumers(256t) signal → producer waits
-            # [2ns]        epi_ready:    both consumers(256t) signal → all wait
+            # [0..ns-1]    load_done    : producer(128t) → both consumers
+            # [ns..2ns-1]  consume_done : both consumers(256t total) → producer
+            # [2ns]        epi_ready_0  : consumer 0(128t) signals own C_shared
+            # [2ns+1]      epi_ready_1  : consumer 1(128t) signals own C_shared
             T.create_list_of_mbarrier(
-                [128] * num_stages + [256] * num_stages + [256])
-            EPI_READY = 2 * num_stages
+                [128] * num_stages + [256] * num_stages + [128, 128])
+            EPI0 = 2 * num_stages
+            EPI1 = 2 * num_stages + 1
 
             m_start = bx * block_M
             tx = T.get_thread_binding()
-            warp_id = tx // WARP_SIZE   # 0-7 for consumers, 8-11 for producer
+            warp_id_wg = (tx // WARP_SIZE) % num_warps_per_wg
             lane_id = tx % WARP_SIZE
 
-            # Register reallocation
-            if tx < 256:
-                T.set_max_nreg(240, 1)   # consumers: allocate max registers
-                T.clear(C_local)
-            elif tx >= 256:
-                T.set_max_nreg(24, 0)    # producer: give away registers
+            with T.ws(0):
+                T.annotate_consumer_reg_alloc(240)
+                T.clear(C_local_0)
+            with T.ws(1):
+                T.annotate_consumer_reg_alloc(240)
+                T.clear(C_local_1)
+            with T.ws(2):
+                T.annotate_producer_reg_dealloc(24)
 
             for ko in range(T.ceildiv(H, block_K)):
-                if tx >= 256:            # producer: TMA async load
+                with T.ws(2):  # producer: single TMA load of full A + B
                     T.mbarrier_wait_parity(
                         mbarrier=ko % num_stages + num_stages,
                         parity=((ko // num_stages) % num_stages) ^ 1)
@@ -1998,35 +2011,43 @@ def fused_router_tma3_selection_kernel(
                         W[ko * block_K:(ko + 1) * block_K, 0:E_padded],
                         B_shared[ko % num_stages, :, :])
                     T.mbarrier_arrive(mbarrier=ko % num_stages)
-                if tx < 256:             # consumers: M-split cooperative WGMMA (WG0: rows 0-63, WG1: rows 64-127)
+                with T.ws(0):  # consumer 0: WGMMA on rows [0:64]
                     T.mbarrier_wait_parity(
                         mbarrier=ko % num_stages,
                         parity=(ko // num_stages) % num_stages)
                     T.gemm(
-                        A_shared[ko % num_stages, :, :],
+                        A_shared[ko % num_stages, 0:block_M_half, :],
                         B_shared[ko % num_stages, :, :],
-                        C_local)
+                        C_local_0)
+                    T.mbarrier_arrive(mbarrier=ko % num_stages + num_stages)
+                with T.ws(1):  # consumer 1: WGMMA on rows [64:128]
+                    T.mbarrier_wait_parity(
+                        mbarrier=ko % num_stages,
+                        parity=(ko // num_stages) % num_stages)
+                    T.gemm(
+                        A_shared[ko % num_stages, block_M_half:block_M, :],
+                        B_shared[ko % num_stages, :, :],
+                        C_local_1)
                     T.mbarrier_arrive(mbarrier=ko % num_stages + num_stages)
 
-            # Both consumers copy their M-half of C_local → C_shared
-            if tx < 256:
-                T.copy(C_local, C_shared)
-                T.mbarrier_arrive(mbarrier=EPI_READY)
+            with T.ws(0):
+                T.copy(C_local_0, C_shared_0)
+                T.mbarrier_arrive(mbarrier=EPI0)
+            with T.ws(1):
+                T.copy(C_local_1, C_shared_1)
+                T.mbarrier_arrive(mbarrier=EPI1)
 
-            # All threads (incl. producer) wait for C_shared to be fully written
-            T.mbarrier_wait_parity(mbarrier=EPI_READY, parity=0)
-            T.sync_threads()
-
-            # ---- Epilogue: 8-warp-parallel selection (consumer threads only) ----
-            if tx < 256:
+            # ---- WG0 epilogue: rows 0..block_M_half-1 ----
+            with T.ws(0):
+                T.mbarrier_wait_parity(mbarrier=EPI0, parity=0)
                 for rnd in T.serial(num_rounds):
-                    row = rnd * rows_per_round + warp_id
+                    row = rnd * rows_per_round + warp_id_wg
                     token_idx = m_start + row
                     if token_idx < num_tokens:
                         my_vals = T.alloc_local([elems_per_lane], T.float32)
                         for i in T.serial(elems_per_lane):
                             col = lane_id * elems_per_lane + i
-                            my_vals[i] = T.if_then_else(col < E, C_shared[row, col], NEG_INF)
+                            my_vals[i] = T.if_then_else(col < E, C_shared_0[row, col], NEG_INF)
 
                         local_vals = T.alloc_local([top_k], T.float32)
                         local_idx  = T.alloc_local([top_k], T.int32)
@@ -2036,12 +2057,10 @@ def fused_router_tma3_selection_kernel(
                             my_max_idx = T.alloc_var(T.int32)
                             my_max_val = NEG_INF
                             my_max_idx = T.int32(-1)
-
                             for i in T.serial(elems_per_lane):
                                 if my_vals[i] > my_max_val:
                                     my_max_val = my_vals[i]
                                     my_max_idx = T.int32(lane_id * elems_per_lane + i)
-
                             warp_max = T.warp_reduce_max(my_max_val)
                             cand = T.alloc_var(T.float32)
                             cand = T.float32(-1.0)
@@ -2049,11 +2068,9 @@ def fused_router_tma3_selection_kernel(
                                 cand = T.cast(my_max_idx, T.float32)
                             winner_f   = T.warp_reduce_max(cand)
                             winner_idx = T.cast(winner_f, T.int32)
-
                             if lane_id == 0:
                                 local_vals[k_iter] = warp_max
                                 local_idx[k_iter]  = winner_idx
-
                             for i in T.serial(elems_per_lane):
                                 if lane_id * elems_per_lane + i == winner_idx:
                                     my_vals[i] = NEG_INF
@@ -2064,13 +2081,64 @@ def fused_router_tma3_selection_kernel(
                             for i in T.serial(top_k):
                                 if local_vals[i] > max_val:
                                     max_val = local_vals[i]
-
                             exp_sum = T.alloc_var(T.float32)
                             exp_sum = T.float32(0.0)
                             for i in T.serial(top_k):
                                 local_vals[i] = T.exp(local_vals[i] - max_val)
                                 exp_sum = exp_sum + local_vals[i]
+                            for i in T.serial(top_k):
+                                scores[token_idx, i]  = local_vals[i] / exp_sum
+                                indices[token_idx, i] = local_idx[i]
 
+            # ---- WG1 epilogue: rows block_M_half..block_M-1 ----
+            with T.ws(1):
+                T.mbarrier_wait_parity(mbarrier=EPI1, parity=0)
+                for rnd in T.serial(num_rounds):
+                    row = rnd * rows_per_round + warp_id_wg
+                    token_idx = m_start + block_M_half + row
+                    if token_idx < num_tokens:
+                        my_vals = T.alloc_local([elems_per_lane], T.float32)
+                        for i in T.serial(elems_per_lane):
+                            col = lane_id * elems_per_lane + i
+                            my_vals[i] = T.if_then_else(col < E, C_shared_1[row, col], NEG_INF)
+
+                        local_vals = T.alloc_local([top_k], T.float32)
+                        local_idx  = T.alloc_local([top_k], T.int32)
+
+                        for k_iter in T.serial(top_k):
+                            my_max_val = T.alloc_var(T.float32)
+                            my_max_idx = T.alloc_var(T.int32)
+                            my_max_val = NEG_INF
+                            my_max_idx = T.int32(-1)
+                            for i in T.serial(elems_per_lane):
+                                if my_vals[i] > my_max_val:
+                                    my_max_val = my_vals[i]
+                                    my_max_idx = T.int32(lane_id * elems_per_lane + i)
+                            warp_max = T.warp_reduce_max(my_max_val)
+                            cand = T.alloc_var(T.float32)
+                            cand = T.float32(-1.0)
+                            if my_max_val == warp_max:
+                                cand = T.cast(my_max_idx, T.float32)
+                            winner_f   = T.warp_reduce_max(cand)
+                            winner_idx = T.cast(winner_f, T.int32)
+                            if lane_id == 0:
+                                local_vals[k_iter] = warp_max
+                                local_idx[k_iter]  = winner_idx
+                            for i in T.serial(elems_per_lane):
+                                if lane_id * elems_per_lane + i == winner_idx:
+                                    my_vals[i] = NEG_INF
+
+                        if lane_id == 0:
+                            max_val = T.alloc_var(T.float32)
+                            max_val = NEG_INF
+                            for i in T.serial(top_k):
+                                if local_vals[i] > max_val:
+                                    max_val = local_vals[i]
+                            exp_sum = T.alloc_var(T.float32)
+                            exp_sum = T.float32(0.0)
+                            for i in T.serial(top_k):
+                                local_vals[i] = T.exp(local_vals[i] - max_val)
+                                exp_sum = exp_sum + local_vals[i]
                             for i in T.serial(top_k):
                                 scores[token_idx, i]  = local_vals[i] / exp_sum
                                 indices[token_idx, i] = local_idx[i]
@@ -2079,7 +2147,10 @@ def fused_router_tma3_selection_kernel(
 
 
 # ============================================================================
-# 10. TMA 3-WG (2 consumer + 1 producer) + Bitonic Top-K  (Hopper+)
+# 10. TMA 3-WG (1 producer + 2 consumer) + Bitonic Top-K  (Hopper+)
+#
+# Same M-split cooperative GEMM design as tma3_selection above; epilogue
+# replaced with bit-packed bitonic top-K + softmax.
 # ============================================================================
 
 @tilelang.jit(out_idx=[1, 2], pass_configs=_tma_pass_configs)
@@ -2088,18 +2159,16 @@ def fused_router_tma3_bitonic_kernel(
     block_M=128, block_K=64, num_stages=2, threads=384,
     dtype=T.bfloat16,
 ):
-    """Fused Router GEMM (TMA, 2-WG M-split cooperative + 1-WG TMA producer) + Bitonic + Softmax.
-
-    M-split cooperative design: block_M=128, WG0 handles rows [0:64], WG1 handles rows [64:128].
-    Each WG issues wgmma<64, E_padded, 16> (full N-width) independently on its M-half.
-    """
+    """Fused Router GEMM (TMA, 1 producer + 2 M-split cooperative consumer WGs)
+    + Bitonic-Sort TopK + Softmax."""
+    assert block_M % 2 == 0, "block_M must be divisible by 2 for M-split"
+    block_M_half = block_M // 2  # 64
     num_m_blocks = (num_tokens + block_M - 1) // block_M
     accum_dtype = T.float32
     WARP_SIZE = 32
-    consumer_threads = 256
-    num_warps = consumer_threads // WARP_SIZE   # 8 consumer warps
-    rows_per_round = num_warps
-    num_rounds = (block_M + rows_per_round - 1) // rows_per_round  # 16 for block_M=128
+    num_warps_per_wg = 128 // WARP_SIZE  # 4 warps/WG
+    rows_per_round = num_warps_per_wg
+    num_rounds = block_M_half // rows_per_round  # 16
 
     elems_per_lane = E_padded // WARP_SIZE if E_padded >= WARP_SIZE else 1
     if elems_per_lane < 1:
@@ -2111,6 +2180,7 @@ def fused_router_tma3_bitonic_kernel(
     idx_mask_val = (1 << idx_bits) - 1
     num_merge_stages = int(math.log2(WARP_SIZE))
     NEG_INF = -T.infinity(T.float32)
+    NEG_INF_BITS_CLEAN_val = 0xFF800000 & ~idx_mask_val
 
     @T.prim_func
     def kernel(
@@ -2120,30 +2190,36 @@ def fused_router_tma3_bitonic_kernel(
         W: T.Tensor([H, E_padded], dtype),
     ):
         with T.Kernel(num_m_blocks, threads=threads) as (bx):
-            A_shared = T.alloc_shared([num_stages, block_M, block_K], dtype)
-            B_shared = T.alloc_shared([num_stages, block_K, E_padded], dtype)
-            C_local  = T.alloc_fragment([block_M, E_padded], accum_dtype)
-            C_shared = T.alloc_shared([block_M, E_padded], accum_dtype)
+            A_shared   = T.alloc_shared([num_stages, block_M, block_K], dtype)
+            B_shared   = T.alloc_shared([num_stages, block_K, E_padded], dtype)
+            C_local_0  = T.alloc_fragment([block_M_half, E_padded], accum_dtype)
+            C_local_1  = T.alloc_fragment([block_M_half, E_padded], accum_dtype)
+            C_shared_0 = T.alloc_shared([block_M_half, E_padded], accum_dtype)
+            C_shared_1 = T.alloc_shared([block_M_half, E_padded], accum_dtype)
 
             T.create_list_of_mbarrier(
-                [128] * num_stages + [256] * num_stages + [256])
-            EPI_READY = 2 * num_stages
+                [128] * num_stages + [256] * num_stages + [128, 128])
+            EPI0 = 2 * num_stages
+            EPI1 = 2 * num_stages + 1
 
             m_start = bx * block_M
             tx = T.get_thread_binding()
-            warp_id = tx // WARP_SIZE
+            warp_id_wg = (tx // WARP_SIZE) % num_warps_per_wg
             lane_id = tx % WARP_SIZE
             idx_mask = T.uint32(idx_mask_val)
-            NEG_INF_BITS_CLEAN = T.uint32(0xFF800000 & ~idx_mask_val)
+            NEG_INF_BITS_CLEAN = T.uint32(NEG_INF_BITS_CLEAN_val)
 
-            if tx < 256:
-                T.set_max_nreg(240, 1)
-                T.clear(C_local)
-            elif tx >= 256:
-                T.set_max_nreg(24, 0)
+            with T.ws(0):
+                T.annotate_consumer_reg_alloc(240)
+                T.clear(C_local_0)
+            with T.ws(1):
+                T.annotate_consumer_reg_alloc(240)
+                T.clear(C_local_1)
+            with T.ws(2):
+                T.annotate_producer_reg_dealloc(24)
 
             for ko in range(T.ceildiv(H, block_K)):
-                if tx >= 256:
+                with T.ws(2):  # producer
                     T.mbarrier_wait_parity(
                         mbarrier=ko % num_stages + num_stages,
                         parity=((ko // num_stages) % num_stages) ^ 1)
@@ -2155,33 +2231,43 @@ def fused_router_tma3_bitonic_kernel(
                         W[ko * block_K:(ko + 1) * block_K, 0:E_padded],
                         B_shared[ko % num_stages, :, :])
                     T.mbarrier_arrive(mbarrier=ko % num_stages)
-                if tx < 256:
+                with T.ws(0):  # consumer 0
                     T.mbarrier_wait_parity(
                         mbarrier=ko % num_stages,
                         parity=(ko // num_stages) % num_stages)
                     T.gemm(
-                        A_shared[ko % num_stages, :, :],
+                        A_shared[ko % num_stages, 0:block_M_half, :],
                         B_shared[ko % num_stages, :, :],
-                        C_local)
+                        C_local_0)
+                    T.mbarrier_arrive(mbarrier=ko % num_stages + num_stages)
+                with T.ws(1):  # consumer 1
+                    T.mbarrier_wait_parity(
+                        mbarrier=ko % num_stages,
+                        parity=(ko // num_stages) % num_stages)
+                    T.gemm(
+                        A_shared[ko % num_stages, block_M_half:block_M, :],
+                        B_shared[ko % num_stages, :, :],
+                        C_local_1)
                     T.mbarrier_arrive(mbarrier=ko % num_stages + num_stages)
 
-            if tx < 256:
-                T.copy(C_local, C_shared)
-                T.mbarrier_arrive(mbarrier=EPI_READY)
+            with T.ws(0):
+                T.copy(C_local_0, C_shared_0)
+                T.mbarrier_arrive(mbarrier=EPI0)
+            with T.ws(1):
+                T.copy(C_local_1, C_shared_1)
+                T.mbarrier_arrive(mbarrier=EPI1)
 
-            T.mbarrier_wait_parity(mbarrier=EPI_READY, parity=0)
-            T.sync_threads()
-
-            # ---- Epilogue: 8-warp-parallel bitonic (consumer threads only) ----
-            if tx < 256:
+            # ---- WG0 bitonic epilogue: rows 0..block_M_half-1 ----
+            with T.ws(0):
+                T.mbarrier_wait_parity(mbarrier=EPI0, parity=0)
                 for rnd in T.serial(num_rounds):
-                    row = rnd * rows_per_round + warp_id
+                    row = rnd * rows_per_round + warp_id_wg
                     token_idx = m_start + row
                     if token_idx < num_tokens:
                         frag = T.alloc_local([frag_size], T.uint32)
                         for e in T.serial(elems_per_lane):
                             col = lane_id * elems_per_lane + e
-                            fval = T.if_then_else(col < E, C_shared[row, col], NEG_INF)
+                            fval = T.if_then_else(col < E, C_shared_0[row, col], NEG_INF)
                             bits = T.reinterpret(T.uint32, fval)
                             col_u32 = T.Cast(T.uint32, col)
                             encoded_idx = T.if_then_else(
@@ -2223,19 +2309,16 @@ def fused_router_tma3_bitonic_kernel(
                         for ms in T.serial(num_merge_stages):
                             stride = T.int32(WARP_SIZE) >> (ms + 1)
                             am_low = (lane_id & stride) == 0
-
                             for k in T.serial(K_padded):
                                 val_i32 = T.reinterpret(T.int32, frag[k])
                                 p_i32 = T.shfl_xor(val_i32, stride)
                                 partner[k] = T.reinterpret(T.uint32, p_i32)
-
                             for k in T.serial(K_padded):
                                 my_f = T.reinterpret(T.float32, frag[k])
                                 p_f = T.reinterpret(T.float32, partner[K_padded - 1 - k])
                                 should_take = T.if_then_else(am_low, p_f > my_f, my_f > p_f)
                                 if should_take:
                                     frag[k] = partner[K_padded - 1 - k]
-
                             if log_kp > 0:
                                 for i1 in T.serial(log_kp):
                                     for i2 in T.serial(i1 + 1):
@@ -2267,19 +2350,123 @@ def fused_router_tma3_bitonic_kernel(
                                     enc & idx_mask)
                                 local_vals[ki] = fval
                                 local_idx[ki]  = T.Cast(T.int32, col_idx)
-
                             max_val = T.alloc_var(T.float32)
                             max_val = NEG_INF
                             for i in T.serial(top_k):
                                 if local_vals[i] > max_val:
                                     max_val = local_vals[i]
-
                             exp_sum = T.alloc_var(T.float32)
                             exp_sum = T.float32(0.0)
                             for i in T.serial(top_k):
                                 local_vals[i] = T.exp(local_vals[i] - max_val)
                                 exp_sum = exp_sum + local_vals[i]
+                            for i in T.serial(top_k):
+                                scores[token_idx, i]  = local_vals[i] / exp_sum
+                                indices[token_idx, i] = local_idx[i]
 
+            # ---- WG1 bitonic epilogue: rows block_M_half..block_M-1 ----
+            with T.ws(1):
+                T.mbarrier_wait_parity(mbarrier=EPI1, parity=0)
+                for rnd in T.serial(num_rounds):
+                    row = rnd * rows_per_round + warp_id_wg
+                    token_idx = m_start + block_M_half + row
+                    if token_idx < num_tokens:
+                        frag = T.alloc_local([frag_size], T.uint32)
+                        for e in T.serial(elems_per_lane):
+                            col = lane_id * elems_per_lane + e
+                            fval = T.if_then_else(col < E, C_shared_1[row, col], NEG_INF)
+                            bits = T.reinterpret(T.uint32, fval)
+                            col_u32 = T.Cast(T.uint32, col)
+                            encoded_idx = T.if_then_else(
+                                fval >= T.float32(0.0),
+                                (~col_u32) & idx_mask,
+                                col_u32 & idx_mask)
+                            frag[e] = (bits & (~idx_mask)) | encoded_idx
+                        for e in T.serial(frag_size - elems_per_lane):
+                            frag[elems_per_lane + e] = NEG_INF_BITS_CLEAN
+
+                        for ki in T.serial(K_padded):
+                            for e in T.serial(frag_size):
+                                if e > ki:
+                                    fi = T.reinterpret(T.float32, frag[ki])
+                                    fe = T.reinterpret(T.float32, frag[e])
+                                    if fe > fi:
+                                        tmp = frag[ki]
+                                        frag[ki] = frag[e]
+                                        frag[e] = tmp
+
+                        if log_kp > 0:
+                            for i1 in T.serial(log_kp):
+                                for i2 in T.serial(i1 + 1):
+                                    step = T.int32(1) << (i1 - i2)
+                                    dmask = T.int32(1) << (i1 + 1)
+                                    for i in T.serial(K_padded):
+                                        j = i ^ step
+                                        if i < j:
+                                            ascending = (i & dmask) != 0
+                                            fi = T.reinterpret(T.float32, frag[i])
+                                            fj = T.reinterpret(T.float32, frag[j])
+                                            do_swap = T.if_then_else(ascending, fi > fj, fi < fj)
+                                            if do_swap:
+                                                tmp = frag[i]
+                                                frag[i] = frag[j]
+                                                frag[j] = tmp
+
+                        partner = T.alloc_local([K_padded], T.uint32)
+                        for ms in T.serial(num_merge_stages):
+                            stride = T.int32(WARP_SIZE) >> (ms + 1)
+                            am_low = (lane_id & stride) == 0
+                            for k in T.serial(K_padded):
+                                val_i32 = T.reinterpret(T.int32, frag[k])
+                                p_i32 = T.shfl_xor(val_i32, stride)
+                                partner[k] = T.reinterpret(T.uint32, p_i32)
+                            for k in T.serial(K_padded):
+                                my_f = T.reinterpret(T.float32, frag[k])
+                                p_f = T.reinterpret(T.float32, partner[K_padded - 1 - k])
+                                should_take = T.if_then_else(am_low, p_f > my_f, my_f > p_f)
+                                if should_take:
+                                    frag[k] = partner[K_padded - 1 - k]
+                            if log_kp > 0:
+                                for i1 in T.serial(log_kp):
+                                    for i2 in T.serial(i1 + 1):
+                                        step = T.int32(1) << (i1 - i2)
+                                        dmask = T.int32(1) << (i1 + 1)
+                                        for i in T.serial(K_padded):
+                                            j = i ^ step
+                                            if i < j:
+                                                ascending = (i & dmask) != 0
+                                                fi = T.reinterpret(T.float32, frag[i])
+                                                fj = T.reinterpret(T.float32, frag[j])
+                                                do_swap = T.if_then_else(ascending, fi > fj, fi < fj)
+                                                if do_swap:
+                                                    tmp = frag[i]
+                                                    frag[i] = frag[j]
+                                                    frag[j] = tmp
+
+                        if lane_id == 0:
+                            local_vals = T.alloc_local([top_k], T.float32)
+                            local_idx  = T.alloc_local([top_k], T.int32)
+                            for ki in T.serial(top_k):
+                                packed = frag[ki]
+                                cleaned = packed & (~idx_mask)
+                                fval = T.reinterpret(T.float32, cleaned)
+                                enc = packed & idx_mask
+                                col_idx = T.if_then_else(
+                                    fval >= T.float32(0.0),
+                                    (~enc) & idx_mask,
+                                    enc & idx_mask)
+                                local_vals[ki] = fval
+                                local_idx[ki]  = T.Cast(T.int32, col_idx)
+                            max_val = T.alloc_var(T.float32)
+                            max_val = NEG_INF
+                            for i in T.serial(top_k):
+                                if local_vals[i] > max_val:
+                                    max_val = local_vals[i]
+                            exp_sum = T.alloc_var(T.float32)
+                            exp_sum = T.float32(0.0)
+                            for i in T.serial(top_k):
+                                local_vals[i] = T.exp(local_vals[i] - max_val)
+                                exp_sum = exp_sum + local_vals[i]
                             for i in T.serial(top_k):
                                 scores[token_idx, i]  = local_vals[i] / exp_sum
                                 indices[token_idx, i] = local_idx[i]
