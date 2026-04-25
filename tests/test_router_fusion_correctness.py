@@ -15,6 +15,8 @@ from kernels.router_gemm_topk_softmax import (
     fused_router_tma_bitonic_kernel,
     fused_router_tma_v2_selection_kernel,
     fused_router_tma_v2_bitonic_kernel,
+    fused_router_tma_nows_selection_kernel,
+    fused_router_tma_nows_bitonic_kernel,
 )
 
 
@@ -78,6 +80,8 @@ def main():
         ("tma_bit",      fused_router_tma_bitonic_kernel,        384, 128),
         ("tma_v2_sel",   fused_router_tma_v2_selection_kernel,   384, 128),
         ("tma_v2_bit",   fused_router_tma_v2_bitonic_kernel,     384, 128),
+        ("tma_nows_sel", fused_router_tma_nows_selection_kernel, 256,  64),
+        ("tma_nows_bit", fused_router_tma_nows_bitonic_kernel,   256,  64),
     ]
     for cfg_name, T_tokens, H, E, K in configs:
         print(f"\n=== {cfg_name}  T={T_tokens} H={H} E={E} K={K} ===")

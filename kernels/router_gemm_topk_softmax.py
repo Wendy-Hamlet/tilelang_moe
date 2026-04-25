@@ -55,6 +55,16 @@ _tma_pass_configs = {
     tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
 }
 
+# Note on "TMA without explicit WS":
+# TileLang couples TMA lowering with the WS auto-pass via
+# allow_tma_and_warp_specialized = (!disable_tma) AND (!disable_ws). Setting
+# TL_DISABLE_WARP_SPECIALIZED=True automatically also disables TMA. So to
+# keep TMA we must leave WS enabled. The auto-WS pass only splits into
+# producer/consumer when it sees explicit T.ws() blocks or pipelined K-loop
+# patterns; without those, code stays single-thread-group with leader-elected
+# TMA + auto mbarrier injection. The tma_nows variants below test this path,
+# reusing _tma_pass_configs.
+
 
 # ============================================================================
 # Standalone Router GEMM (TL-sep baseline GEMM half)
@@ -1181,18 +1191,321 @@ def fused_router_tma_v2_bitonic_kernel(
 
 
 # ============================================================================
+# 7. TMA without explicit WS-split + Selection Top-K  (Hopper+, threads=256)
+#
+# Shape matches cpasync (block_M=64, threads=256, num_stages=2). No `if tx >=/<`
+# producer/consumer branching, no T.ws blocks. Default pass_configs keep both
+# TMA and WS auto-passes enabled — the WS pass should leave the kernel alone
+# (no explicit split markers) while InjectTmaBarrier still wraps each TMA
+# load with mbarrier_expect_tx. T.copy auto-elects a leader thread to issue
+# the TMA, all 256 threads wait on the implicit mbarrier, then all 256
+# threads do wgmma cooperatively (default Square policy → wgmma<64, E_padded/2,
+# 16> N-split, mirroring cpasync). T.Pipelined with num_stages=2 generates the
+# auto double-buffer.
+# ============================================================================
+
+@tilelang.jit(out_idx=[1, 2], pass_configs=_tma_pass_configs)
+def fused_router_tma_nows_selection_kernel(
+    num_tokens, H, E, E_padded, top_k,
+    block_M=64, block_K=64, num_stages=2, threads=256,
+    dtype=T.bfloat16,
+):
+    """Fused Router GEMM (TMA, no explicit WS-split, threads=256 to align with
+    cpasync) + Selection-Sort TopK + Softmax."""
+    num_m_blocks = (num_tokens + block_M - 1) // block_M
+    accum_dtype = T.float32
+    WARP_SIZE = 32
+    num_warps = threads // WARP_SIZE  # 8
+    rows_per_round = num_warps
+    num_rounds = (block_M + rows_per_round - 1) // rows_per_round
+    elems_per_lane = (E + WARP_SIZE - 1) // WARP_SIZE
+    NEG_INF = -T.infinity(T.float32)
+
+    @T.prim_func
+    def kernel(
+        X: T.Tensor([num_tokens, H], dtype),
+        scores: T.Tensor([num_tokens, top_k], T.float32),
+        indices: T.Tensor([num_tokens, top_k], T.int32),
+        W: T.Tensor([H, E_padded], dtype),
+    ):
+        with T.Kernel(num_m_blocks, threads=threads) as (bx):
+            A_shared = T.alloc_shared([block_M, block_K], dtype)
+            B_shared = T.alloc_shared([block_K, E_padded], dtype)
+            C_local = T.alloc_fragment([block_M, E_padded], accum_dtype)
+            C_shared = T.alloc_shared([block_M, E_padded], accum_dtype)
+
+            T.annotate_layout({
+                A_shared: tilelang.layout.make_swizzled_layout(A_shared),
+                B_shared: tilelang.layout.make_swizzled_layout(B_shared),
+            })
+
+            m_start = bx * block_M
+            tx = T.get_thread_binding()
+            warp_id = tx // WARP_SIZE
+            lane_id = tx % WARP_SIZE
+
+            T.clear(C_local)
+            for k in T.Pipelined(T.ceildiv(H, block_K), num_stages=num_stages):
+                T.copy(X[m_start, k * block_K], A_shared)
+                T.copy(W[k * block_K, 0], B_shared)
+                T.gemm(A_shared, B_shared, C_local)
+
+            T.copy(C_local, C_shared)
+            T.sync_threads()
+
+            # ---- Epilogue: 8-warp-parallel selection (same as cpasync) ----
+            for rnd in T.serial(num_rounds):
+                row = rnd * rows_per_round + warp_id
+                token_idx = m_start + row
+                if token_idx < num_tokens:
+                    my_vals = T.alloc_local([elems_per_lane], T.float32)
+                    for i in T.serial(elems_per_lane):
+                        col = lane_id * elems_per_lane + i
+                        my_vals[i] = T.if_then_else(col < E, C_shared[row, col], NEG_INF)
+
+                    local_vals = T.alloc_local([top_k], T.float32)
+                    local_idx = T.alloc_local([top_k], T.int32)
+
+                    for k_iter in T.serial(top_k):
+                        my_max_val = T.alloc_var(T.float32)
+                        my_max_idx = T.alloc_var(T.int32)
+                        my_max_val = NEG_INF
+                        my_max_idx = T.int32(-1)
+
+                        for i in T.serial(elems_per_lane):
+                            if my_vals[i] > my_max_val:
+                                my_max_val = my_vals[i]
+                                my_max_idx = T.int32(lane_id * elems_per_lane + i)
+
+                        warp_max = T.warp_reduce_max(my_max_val)
+                        cand = T.alloc_var(T.float32)
+                        cand = T.float32(-1.0)
+                        if my_max_val == warp_max:
+                            cand = T.cast(my_max_idx, T.float32)
+                        winner_f = T.warp_reduce_max(cand)
+                        winner_idx = T.cast(winner_f, T.int32)
+
+                        if lane_id == 0:
+                            local_vals[k_iter] = warp_max
+                            local_idx[k_iter] = winner_idx
+
+                        for i in T.serial(elems_per_lane):
+                            if lane_id * elems_per_lane + i == winner_idx:
+                                my_vals[i] = NEG_INF
+
+                    if lane_id == 0:
+                        max_val = T.alloc_var(T.float32)
+                        max_val = NEG_INF
+                        for i in T.serial(top_k):
+                            if local_vals[i] > max_val:
+                                max_val = local_vals[i]
+
+                        exp_sum = T.alloc_var(T.float32)
+                        exp_sum = T.float32(0.0)
+                        for i in T.serial(top_k):
+                            local_vals[i] = T.exp(local_vals[i] - max_val)
+                            exp_sum = exp_sum + local_vals[i]
+
+                        for i in T.serial(top_k):
+                            scores[token_idx, i] = local_vals[i] / exp_sum
+                            indices[token_idx, i] = local_idx[i]
+
+    return kernel
+
+
+# ============================================================================
+# 8. TMA without explicit WS-split + Bitonic Top-K  (Hopper+, threads=256)
+# ============================================================================
+
+@tilelang.jit(out_idx=[1, 2], pass_configs=_tma_pass_configs)
+def fused_router_tma_nows_bitonic_kernel(
+    num_tokens, H, E, E_padded, top_k,
+    block_M=64, block_K=64, num_stages=2, threads=256,
+    dtype=T.bfloat16,
+):
+    """Fused Router GEMM (TMA, no explicit WS-split, threads=256 to align with
+    cpasync) + Bitonic-Sort TopK + Softmax."""
+    num_m_blocks = (num_tokens + block_M - 1) // block_M
+    accum_dtype = T.float32
+    WARP_SIZE = 32
+    num_warps = threads // WARP_SIZE
+    rows_per_round = num_warps
+    num_rounds = (block_M + rows_per_round - 1) // rows_per_round
+
+    elems_per_lane = E_padded // WARP_SIZE if E_padded >= WARP_SIZE else 1
+    if elems_per_lane < 1:
+        elems_per_lane = 1
+    K_padded = _next_pow2(top_k)
+    frag_size = max(elems_per_lane, K_padded)
+    log_kp = int(math.log2(K_padded)) if K_padded > 1 else 0
+    idx_bits = int(math.ceil(math.log2(max(E_padded, 2))))
+    idx_mask_val = (1 << idx_bits) - 1
+    num_merge_stages = int(math.log2(WARP_SIZE))
+    NEG_INF = -T.infinity(T.float32)
+
+    @T.prim_func
+    def kernel(
+        X: T.Tensor([num_tokens, H], dtype),
+        scores: T.Tensor([num_tokens, top_k], T.float32),
+        indices: T.Tensor([num_tokens, top_k], T.int32),
+        W: T.Tensor([H, E_padded], dtype),
+    ):
+        with T.Kernel(num_m_blocks, threads=threads) as (bx):
+            A_shared = T.alloc_shared([block_M, block_K], dtype)
+            B_shared = T.alloc_shared([block_K, E_padded], dtype)
+            C_local = T.alloc_fragment([block_M, E_padded], accum_dtype)
+            C_shared = T.alloc_shared([block_M, E_padded], accum_dtype)
+
+            T.annotate_layout({
+                A_shared: tilelang.layout.make_swizzled_layout(A_shared),
+                B_shared: tilelang.layout.make_swizzled_layout(B_shared),
+            })
+
+            m_start = bx * block_M
+            tx = T.get_thread_binding()
+            warp_id = tx // WARP_SIZE
+            lane_id = tx % WARP_SIZE
+            idx_mask = T.uint32(idx_mask_val)
+
+            T.clear(C_local)
+            for k in T.Pipelined(T.ceildiv(H, block_K), num_stages=num_stages):
+                T.copy(X[m_start, k * block_K], A_shared)
+                T.copy(W[k * block_K, 0], B_shared)
+                T.gemm(A_shared, B_shared, C_local)
+
+            T.copy(C_local, C_shared)
+            T.sync_threads()
+
+            # ---- Epilogue: 8-warp-parallel bitonic (same as cpasync) ----
+            for rnd in T.serial(num_rounds):
+                row = rnd * rows_per_round + warp_id
+                token_idx = m_start + row
+                if token_idx < num_tokens:
+                    NEG_INF_BITS_CLEAN = T.uint32(0xFF800000 & ~idx_mask_val)
+                    frag = T.alloc_local([frag_size], T.uint32)
+                    for e in T.serial(elems_per_lane):
+                        col = lane_id * elems_per_lane + e
+                        fval = T.if_then_else(col < E, C_shared[row, col], NEG_INF)
+                        bits = T.reinterpret(T.uint32, fval)
+                        col_u32 = T.Cast(T.uint32, col)
+                        encoded_idx = T.if_then_else(
+                            fval >= T.float32(0.0),
+                            (~col_u32) & idx_mask,
+                            col_u32 & idx_mask)
+                        frag[e] = (bits & (~idx_mask)) | encoded_idx
+                    for e in T.serial(frag_size - elems_per_lane):
+                        frag[elems_per_lane + e] = NEG_INF_BITS_CLEAN
+
+                    for ki in T.serial(K_padded):
+                        for e in T.serial(frag_size):
+                            if e > ki:
+                                fi = T.reinterpret(T.float32, frag[ki])
+                                fe = T.reinterpret(T.float32, frag[e])
+                                if fe > fi:
+                                    tmp = frag[ki]
+                                    frag[ki] = frag[e]
+                                    frag[e] = tmp
+
+                    if log_kp > 0:
+                        for i1 in T.serial(log_kp):
+                            for i2 in T.serial(i1 + 1):
+                                step = T.int32(1) << (i1 - i2)
+                                dmask = T.int32(1) << (i1 + 1)
+                                for i in T.serial(K_padded):
+                                    j = i ^ step
+                                    if i < j:
+                                        ascending = (i & dmask) != 0
+                                        fi = T.reinterpret(T.float32, frag[i])
+                                        fj = T.reinterpret(T.float32, frag[j])
+                                        do_swap = T.if_then_else(ascending, fi > fj, fi < fj)
+                                        if do_swap:
+                                            tmp = frag[i]
+                                            frag[i] = frag[j]
+                                            frag[j] = tmp
+
+                    partner = T.alloc_local([K_padded], T.uint32)
+                    for ms in T.serial(num_merge_stages):
+                        stride = T.int32(WARP_SIZE) >> (ms + 1)
+                        am_low = (lane_id & stride) == 0
+
+                        for k in T.serial(K_padded):
+                            val_i32 = T.reinterpret(T.int32, frag[k])
+                            p_i32 = T.shfl_xor(val_i32, stride)
+                            partner[k] = T.reinterpret(T.uint32, p_i32)
+
+                        for k in T.serial(K_padded):
+                            my_f = T.reinterpret(T.float32, frag[k])
+                            p_f = T.reinterpret(T.float32, partner[K_padded - 1 - k])
+                            should_take = T.if_then_else(am_low, p_f > my_f, my_f > p_f)
+                            if should_take:
+                                frag[k] = partner[K_padded - 1 - k]
+
+                        if log_kp > 0:
+                            for i1 in T.serial(log_kp):
+                                for i2 in T.serial(i1 + 1):
+                                    step = T.int32(1) << (i1 - i2)
+                                    dmask = T.int32(1) << (i1 + 1)
+                                    for i in T.serial(K_padded):
+                                        j = i ^ step
+                                        if i < j:
+                                            ascending = (i & dmask) != 0
+                                            fi = T.reinterpret(T.float32, frag[i])
+                                            fj = T.reinterpret(T.float32, frag[j])
+                                            do_swap = T.if_then_else(ascending, fi > fj, fi < fj)
+                                            if do_swap:
+                                                tmp = frag[i]
+                                                frag[i] = frag[j]
+                                                frag[j] = tmp
+
+                    if lane_id == 0:
+                        local_vals = T.alloc_local([top_k], T.float32)
+                        local_idx = T.alloc_local([top_k], T.int32)
+                        for ki in T.serial(top_k):
+                            packed = frag[ki]
+                            cleaned = packed & (~idx_mask)
+                            fval = T.reinterpret(T.float32, cleaned)
+                            enc = packed & idx_mask
+                            col_idx = T.if_then_else(
+                                fval >= T.float32(0.0),
+                                (~enc) & idx_mask,
+                                enc & idx_mask)
+                            local_vals[ki] = fval
+                            local_idx[ki] = T.Cast(T.int32, col_idx)
+
+                        max_val = T.alloc_var(T.float32)
+                        max_val = NEG_INF
+                        for i in T.serial(top_k):
+                            if local_vals[i] > max_val:
+                                max_val = local_vals[i]
+
+                        exp_sum = T.alloc_var(T.float32)
+                        exp_sum = T.float32(0.0)
+                        for i in T.serial(top_k):
+                            local_vals[i] = T.exp(local_vals[i] - max_val)
+                            exp_sum = exp_sum + local_vals[i]
+
+                        for i in T.serial(top_k):
+                            scores[token_idx, i] = local_vals[i] / exp_sum
+                            indices[token_idx, i] = local_idx[i]
+
+    return kernel
+
+
+# ============================================================================
 # Kernel Cache + Wrapper (handles W padding for non-power-of-2 E)
 # ============================================================================
 
 _fused_cache: Dict[str, any] = {}
 
 _ALGO_FACTORIES = {
-    "cpasync_selection":  fused_router_cpasync_selection_kernel,
-    "cpasync_bitonic":    fused_router_cpasync_bitonic_kernel,
-    "tma_selection":      fused_router_tma_selection_kernel,
-    "tma_bitonic":        fused_router_tma_bitonic_kernel,
-    "tma_v2_selection":   fused_router_tma_v2_selection_kernel,
-    "tma_v2_bitonic":     fused_router_tma_v2_bitonic_kernel,
+    "cpasync_selection":   fused_router_cpasync_selection_kernel,
+    "cpasync_bitonic":     fused_router_cpasync_bitonic_kernel,
+    "tma_selection":       fused_router_tma_selection_kernel,
+    "tma_bitonic":         fused_router_tma_bitonic_kernel,
+    "tma_v2_selection":    fused_router_tma_v2_selection_kernel,
+    "tma_v2_bitonic":      fused_router_tma_v2_bitonic_kernel,
+    "tma_nows_selection":  fused_router_tma_nows_selection_kernel,
+    "tma_nows_bitonic":    fused_router_tma_nows_bitonic_kernel,
 }
 
 
