@@ -13,12 +13,8 @@ from kernels.router_gemm_topk_softmax import (
     fused_router_cpasync_bitonic_kernel,
     fused_router_tma_selection_kernel,
     fused_router_tma_bitonic_kernel,
-    fused_router_tma2_selection_kernel,
-    fused_router_tma2_bitonic_kernel,
-    fused_router_tma2n_selection_kernel,
-    fused_router_tma2n_bitonic_kernel,
-    fused_router_tma3_selection_kernel,
-    fused_router_tma3_bitonic_kernel,
+    fused_router_tma_v2_selection_kernel,
+    fused_router_tma_v2_bitonic_kernel,
 )
 
 
@@ -78,14 +74,10 @@ def main():
     variants = [
         ("cpasync_sel",  fused_router_cpasync_selection_kernel,  256,  64),
         ("cpasync_bit",  fused_router_cpasync_bitonic_kernel,    256,  64),
-        ("tma_sel",      fused_router_tma_selection_kernel,      256,  64),
-        ("tma_bit",      fused_router_tma_bitonic_kernel,        256,  64),
-        ("tma2_sel",     fused_router_tma2_selection_kernel,     384,  64),
-        ("tma2_bit",     fused_router_tma2_bitonic_kernel,       384,  64),
-        ("tma2n_sel",    fused_router_tma2n_selection_kernel,    384,  64),
-        ("tma2n_bit",    fused_router_tma2n_bitonic_kernel,      384,  64),
-        ("tma3_sel",     fused_router_tma3_selection_kernel,     384, 128),
-        ("tma3_bit",     fused_router_tma3_bitonic_kernel,       384, 128),
+        ("tma_sel",      fused_router_tma_selection_kernel,      384, 128),
+        ("tma_bit",      fused_router_tma_bitonic_kernel,        384, 128),
+        ("tma_v2_sel",   fused_router_tma_v2_selection_kernel,   384, 128),
+        ("tma_v2_bit",   fused_router_tma_v2_bitonic_kernel,     384, 128),
     ]
     for cfg_name, T_tokens, H, E, K in configs:
         print(f"\n=== {cfg_name}  T={T_tokens} H={H} E={E} K={K} ===")

@@ -10,12 +10,8 @@ from kernels.router_gemm_topk_softmax import (
     fused_router_cpasync_bitonic_kernel,
     fused_router_tma_selection_kernel,
     fused_router_tma_bitonic_kernel,
-    fused_router_tma2_selection_kernel,
-    fused_router_tma2_bitonic_kernel,
-    fused_router_tma2n_selection_kernel,
-    fused_router_tma2n_bitonic_kernel,
-    fused_router_tma3_selection_kernel,
-    fused_router_tma3_bitonic_kernel,
+    fused_router_tma_v2_selection_kernel,
+    fused_router_tma_v2_bitonic_kernel,
 )
 
 # Use DeepSeek-V2 shape: most complex (non-pow2 E, largest H)
@@ -28,14 +24,10 @@ E_padded = _next_pow2(E)  # 256
 VARIANTS = [
     ("cpasync_selection", fused_router_cpasync_selection_kernel, 256,  64),
     ("cpasync_bitonic",   fused_router_cpasync_bitonic_kernel,   256,  64),
-    ("tma_selection",     fused_router_tma_selection_kernel,     256,  64),
-    ("tma_bitonic",       fused_router_tma_bitonic_kernel,       256,  64),
-    ("tma2_selection",    fused_router_tma2_selection_kernel,    384,  64),
-    ("tma2_bitonic",      fused_router_tma2_bitonic_kernel,      384,  64),
-    ("tma2n_selection",   fused_router_tma2n_selection_kernel,   384,  64),
-    ("tma2n_bitonic",     fused_router_tma2n_bitonic_kernel,     384,  64),
-    ("tma3_selection",    fused_router_tma3_selection_kernel,    384, 128),
-    ("tma3_bitonic",      fused_router_tma3_bitonic_kernel,      384, 128),
+    ("tma_selection",     fused_router_tma_selection_kernel,     384, 128),
+    ("tma_bitonic",       fused_router_tma_bitonic_kernel,       384, 128),
+    ("tma_v2_selection",  fused_router_tma_v2_selection_kernel,  384, 128),
+    ("tma_v2_bitonic",    fused_router_tma_v2_bitonic_kernel,    384, 128),
 ]
 
 SEPARATOR = "=" * 100

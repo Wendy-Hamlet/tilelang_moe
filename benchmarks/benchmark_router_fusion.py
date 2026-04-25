@@ -47,12 +47,8 @@ try:
         fused_router_cpasync_bitonic_kernel,
         fused_router_tma_selection_kernel,
         fused_router_tma_bitonic_kernel,
-        fused_router_tma2_selection_kernel,
-        fused_router_tma2_bitonic_kernel,
-        fused_router_tma2n_selection_kernel,
-        fused_router_tma2n_bitonic_kernel,
-        fused_router_tma3_selection_kernel,
-        fused_router_tma3_bitonic_kernel,
+        fused_router_tma_v2_selection_kernel,
+        fused_router_tma_v2_bitonic_kernel,
     )
     import tilelang.language as T
     HAS_FUSED = True
@@ -90,14 +86,10 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
         factory_map = {
             "cpasync_selection": (fused_router_cpasync_selection_kernel,  256,  64),
             "cpasync_bitonic":   (fused_router_cpasync_bitonic_kernel,    256,  64),
-            "tma_selection":     (fused_router_tma_selection_kernel,      256,  64),
-            "tma_bitonic":       (fused_router_tma_bitonic_kernel,        256,  64),
-            "tma2_selection":    (fused_router_tma2_selection_kernel,     384,  64),
-            "tma2_bitonic":      (fused_router_tma2_bitonic_kernel,       384,  64),
-            "tma2n_selection":   (fused_router_tma2n_selection_kernel,    384,  64),
-            "tma2n_bitonic":     (fused_router_tma2n_bitonic_kernel,      384,  64),
-            "tma3_selection":    (fused_router_tma3_selection_kernel,     384, 128),
-            "tma3_bitonic":      (fused_router_tma3_bitonic_kernel,       384, 128),
+            "tma_selection":     (fused_router_tma_selection_kernel,      384, 128),
+            "tma_bitonic":       (fused_router_tma_bitonic_kernel,        384, 128),
+            "tma_v2_selection":  (fused_router_tma_v2_selection_kernel,   384, 128),
+            "tma_v2_bitonic":    (fused_router_tma_v2_bitonic_kernel,     384, 128),
         }
         for algo, (factory, th, bm) in factory_map.items():
             try:
@@ -161,12 +153,8 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
         "cpasync_bitonic":   "CpAsync-Bit",
         "tma_selection":     "TMA-Sel",
         "tma_bitonic":       "TMA-Bit",
-        "tma2_selection":    "TMA2-Sel",
-        "tma2_bitonic":      "TMA2-Bit",
-        "tma2n_selection":   "TMA2N-Sel",
-        "tma2n_bitonic":     "TMA2N-Bit",
-        "tma3_selection":    "TMA3-Sel",
-        "tma3_bitonic":      "TMA3-Bit",
+        "tma_v2_selection":  "TMA-V2-Sel",
+        "tma_v2_bitonic":    "TMA-V2-Bit",
     }
     for algo, label in algo_display.items():
         if algo in raw_fused:
@@ -247,7 +235,7 @@ def main():
 
     version_keys = ['PyTorch', 'TL-sep',
                     'CpAsync-Sel', 'CpAsync-Bit', 'TMA-Sel', 'TMA-Bit',
-                    'TMA2-Sel', 'TMA2-Bit', 'TMA2N-Sel', 'TMA2N-Bit']
+                    'TMA-V2-Sel', 'TMA-V2-Bit']
     version_keys = [v for v in version_keys if any(v in r for r in all_rows)]
 
     headers = ["Model", "T"] + \
