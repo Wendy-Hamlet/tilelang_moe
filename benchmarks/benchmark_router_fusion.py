@@ -84,14 +84,6 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
     else:
         W_padded = W_bf16
 
-    # Pre-transpose W ONCE for tma3 variants (outside any timing loop).
-    # tma3 takes W_t[E_padded, H] so its TMA load can be a single descriptor
-    # with inner-most dim = block_K = 64 (matches 128B-swizzle stripe).
-    W_padded_t = W_padded.t().contiguous()
-    torch.cuda.synchronize()
-
-    TMA3_ALGOS = {"tma3_selection", "tma3_bitonic"}
-
     raw_fused = {}
     raw_gemm = None
     if HAS_FUSED:
@@ -179,13 +171,12 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
     for algo, label in algo_display.items():
         if algo in raw_fused:
             kern = raw_fused[algo]
-            W_input = W_padded_t if algo in TMA3_ALGOS else W_padded
             try:
-                kern(X_bf16, W_input)
+                kern(X_bf16, W_padded)
                 torch.cuda.synchronize()
                 print(f"    [{label}] timing...", end=" ", flush=True)
                 results[label] = do_bench(
-                    lambda k=kern, w=W_input: k(X_bf16, w),
+                    lambda k=kern: k(X_bf16, W_padded),
                     warmup=warmup, rep=rep)
                 print(f"{results[label]:.4f}ms", flush=True)
             except Exception as e:

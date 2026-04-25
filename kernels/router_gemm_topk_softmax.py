@@ -1924,17 +1924,14 @@ def fused_router_tma2n_bitonic_kernel(
 # plain `if tx < 256` / `if tx >= 256` branches:
 #   tx <  256 → consumer 0+1: T.gemm with FullRow policy → 2 × wgmma<64,
 #               E_padded, 16> M-split across the 2 consumer WGs.
-#   tx >= 256 → producer (1 WG): TMA loads of A[block_M=128] + W_t[E_padded].
+#   tx >= 256 → producer (1 WG): TMA loads of A[block_M=128] + W per K-step.
 #
-# IMPORTANT: this kernel takes W TRANSPOSED to W_t[E_padded, H]. Reason: with
-# B_shared = [block_K, E_padded] the inner-most dim N=E_padded > 64 forces 4
-# TMA loads per K-step (128B-swizzle × bf16 caps inner stripe at 64 elements).
-# Storing W_t means B_shared_t = [E_padded, block_K] inner = block_K = 64 fits
-# the swizzle stripe, so a single TMA load covers the full block per K-step.
-# T.gemm uses transpose_B=True so the math A @ B_t.T = X @ W remains correct.
-#
-# Caller must transpose W externally (W is a static MoE router weight, the
-# transpose is a one-time cost amortized over all forward passes).
+# Note: W TMA is split into 4 loads per K-step when E_padded > 64 (128B-swizzle
+# × bf16 caps inner stripe at 64 elements). Tried W-transpose to fold these
+# into 1 TMA, but the resulting strided global access pattern (stride = H*2
+# bytes vs E_padded*2 bytes original) hurt TMA bandwidth more than the issue-
+# count reduction helped — net regression on H100. So we keep the natural
+# W[H, E_padded] layout. Optimization B (drop redundant sync) is preserved.
 # ============================================================================
 
 @tilelang.jit(out_idx=[1, 2], pass_configs=_tma_pass_configs)
@@ -1943,8 +1940,11 @@ def fused_router_tma3_selection_kernel(
     block_M=128, block_K=64, num_stages=2, threads=384,
     dtype=T.bfloat16,
 ):
-    """Fused Router GEMM (TMA, 1 producer + 2 M-split cooperative consumer WGs,
-    transposed-W layout for 1-TMA-per-K-step) + Selection-Sort TopK + Softmax.
+    """Fused Router GEMM (TMA, 1 producer + 2 M-split cooperative consumer WGs)
+    + Selection-Sort TopK + Softmax.
+
+    Single A_shared/B_shared/C_local; FullRow policy → wgmma<64, E_padded, 16>
+    per consumer WG (M-split). 8 consumer warps × 16 rounds covers 128 rows.
     """
     num_m_blocks = (num_tokens + block_M - 1) // block_M
     accum_dtype = T.float32
@@ -1961,14 +1961,13 @@ def fused_router_tma3_selection_kernel(
         X: T.Tensor([num_tokens, H], dtype),
         scores: T.Tensor([num_tokens, top_k], T.float32),
         indices: T.Tensor([num_tokens, top_k], T.int32),
-        W_t: T.Tensor([E_padded, H], dtype),
+        W: T.Tensor([H, E_padded], dtype),
     ):
         with T.Kernel(num_m_blocks, threads=threads) as (bx):
-            A_shared   = T.alloc_shared([num_stages, block_M, block_K], dtype)
-            # B_shared TRANSPOSED layout: inner-most = block_K = 64 ≤ 128B-swizzle stripe → 1 TMA per K-step.
-            B_shared_t = T.alloc_shared([num_stages, E_padded, block_K], dtype)
-            C_local    = T.alloc_fragment([block_M, E_padded], accum_dtype)
-            C_shared   = T.alloc_shared([block_M, E_padded], accum_dtype)
+            A_shared = T.alloc_shared([num_stages, block_M, block_K], dtype)
+            B_shared = T.alloc_shared([num_stages, block_K, E_padded], dtype)
+            C_local  = T.alloc_fragment([block_M, E_padded], accum_dtype)
+            C_shared = T.alloc_shared([block_M, E_padded], accum_dtype)
 
             # Barriers:
             # [0..ns-1]    load_done    : producer(128t) → consumers
@@ -1991,7 +1990,7 @@ def fused_router_tma3_selection_kernel(
                 T.set_max_nreg(24, 0)
 
             for ko in range(T.ceildiv(H, block_K)):
-                if tx >= 256:           # producer: TMA async load (1 X + 1 W_t)
+                if tx >= 256:           # producer: TMA async load
                     T.mbarrier_wait_parity(
                         mbarrier=ko % num_stages + num_stages,
                         parity=((ko // num_stages) % num_stages) ^ 1)
@@ -1999,21 +1998,18 @@ def fused_router_tma3_selection_kernel(
                         X[m_start:m_start + block_M,
                           ko * block_K:(ko + 1) * block_K],
                         A_shared[ko % num_stages, :, :])
-                    # Single TMA: W_t[E_padded, K-slice], inner=block_K=64 ≤ 128B swizzle stripe.
                     T.copy(
-                        W_t[0:E_padded, ko * block_K:(ko + 1) * block_K],
-                        B_shared_t[ko % num_stages, :, :])
+                        W[ko * block_K:(ko + 1) * block_K, 0:E_padded],
+                        B_shared[ko % num_stages, :, :])
                     T.mbarrier_arrive(mbarrier=ko % num_stages)
                 if tx < 256:            # consumers (cooperative M-split WGMMA)
                     T.mbarrier_wait_parity(
                         mbarrier=ko % num_stages,
                         parity=(ko // num_stages) % num_stages)
-                    # transpose_B=True: gemm computes A @ B_t.T = X @ W (same math).
                     T.gemm(
                         A_shared[ko % num_stages, :, :],
-                        B_shared_t[ko % num_stages, :, :],
+                        B_shared[ko % num_stages, :, :],
                         C_local,
-                        transpose_B=True,
                         policy=T.GemmWarpPolicy.FullRow)
                     T.mbarrier_arrive(mbarrier=ko % num_stages + num_stages)
 
@@ -2100,11 +2096,8 @@ def fused_router_tma3_bitonic_kernel(
     block_M=128, block_K=64, num_stages=2, threads=384,
     dtype=T.bfloat16,
 ):
-    """Fused Router GEMM (TMA, 1 producer + 2 M-split cooperative consumer WGs,
-    transposed-W layout for 1-TMA-per-K-step) + Bitonic-Sort TopK + Softmax.
-
-    See tma3_selection docstring for transposed-W layout rationale.
-    """
+    """Fused Router GEMM (TMA, 1 producer + 2 M-split cooperative consumer WGs)
+    + Bitonic-Sort TopK + Softmax."""
     num_m_blocks = (num_tokens + block_M - 1) // block_M
     accum_dtype = T.float32
     WARP_SIZE = 32
@@ -2130,13 +2123,13 @@ def fused_router_tma3_bitonic_kernel(
         X: T.Tensor([num_tokens, H], dtype),
         scores: T.Tensor([num_tokens, top_k], T.float32),
         indices: T.Tensor([num_tokens, top_k], T.int32),
-        W_t: T.Tensor([E_padded, H], dtype),
+        W: T.Tensor([H, E_padded], dtype),
     ):
         with T.Kernel(num_m_blocks, threads=threads) as (bx):
-            A_shared   = T.alloc_shared([num_stages, block_M, block_K], dtype)
-            B_shared_t = T.alloc_shared([num_stages, E_padded, block_K], dtype)
-            C_local    = T.alloc_fragment([block_M, E_padded], accum_dtype)
-            C_shared   = T.alloc_shared([block_M, E_padded], accum_dtype)
+            A_shared = T.alloc_shared([num_stages, block_M, block_K], dtype)
+            B_shared = T.alloc_shared([num_stages, block_K, E_padded], dtype)
+            C_local  = T.alloc_fragment([block_M, E_padded], accum_dtype)
+            C_shared = T.alloc_shared([block_M, E_padded], accum_dtype)
 
             T.create_list_of_mbarrier(
                 [128] * num_stages + [256] * num_stages + [256])
@@ -2164,10 +2157,9 @@ def fused_router_tma3_bitonic_kernel(
                         X[m_start:m_start + block_M,
                           ko * block_K:(ko + 1) * block_K],
                         A_shared[ko % num_stages, :, :])
-                    # Single TMA: W_t[E_padded, K-slice], inner=block_K=64 ≤ 128B swizzle stripe.
                     T.copy(
-                        W_t[0:E_padded, ko * block_K:(ko + 1) * block_K],
-                        B_shared_t[ko % num_stages, :, :])
+                        W[ko * block_K:(ko + 1) * block_K, 0:E_padded],
+                        B_shared[ko % num_stages, :, :])
                     T.mbarrier_arrive(mbarrier=ko % num_stages)
                 if tx < 256:
                     T.mbarrier_wait_parity(
@@ -2175,9 +2167,8 @@ def fused_router_tma3_bitonic_kernel(
                         parity=(ko // num_stages) % num_stages)
                     T.gemm(
                         A_shared[ko % num_stages, :, :],
-                        B_shared_t[ko % num_stages, :, :],
+                        B_shared[ko % num_stages, :, :],
                         C_local,
-                        transpose_B=True,
                         policy=T.GemmWarpPolicy.FullRow)
                     T.mbarrier_arrive(mbarrier=ko % num_stages + num_stages)
 

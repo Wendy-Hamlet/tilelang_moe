@@ -29,9 +29,6 @@ def ref_topk_softmax(X, W, K):
     return scores, idx
 
 
-TMA3_ALGOS = {"tma3_sel", "tma3_bit"}
-
-
 def test_variant(name, factory, T_tokens, H, E, K, threads=256, block_M=64):
     E_padded = _next_pow2(E)
     torch.manual_seed(0)
@@ -49,11 +46,8 @@ def test_variant(name, factory, T_tokens, H, E, K, threads=256, block_M=64):
         print(f"  [{name}] COMPILE FAIL: {e}")
         return
 
-    # tma3 variants take W transposed [E_padded, H]
-    W_input = W_p.t().contiguous() if name in TMA3_ALGOS else W_p
-
     try:
-        scores, idx = kern(X, W_input)
+        scores, idx = kern(X, W_p)
     except Exception as e:
         print(f"  [{name}] RUN FAIL: {e}")
         return
