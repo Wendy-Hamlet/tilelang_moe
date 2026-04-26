@@ -6,15 +6,12 @@ Measures: X(T,H) @ W(H,E) -> topk_softmax -> (scores, indices)(T,K)
 All versions measured with do_bench (per-iteration CUDA events + L2 flush).
 Data preparation (padding, allocation) is done ONCE outside the timing loop.
 
-Kernel variants:
-  cpasync_selection : cp.async GEMM + selection-sort epilogue
-  cpasync_bitonic   : cp.async GEMM + bitonic-sort epilogue
-  tma_selection     : TMA+WS GEMM  + selection-sort epilogue  (Hopper+)
-  tma_bitonic       : TMA+WS GEMM  + bitonic-sort epilogue    (Hopper+)
-  tma2_selection    : TMA+WS GEMM  + selection (1prod+2cons M-split, Hopper+)
-  tma2_bitonic      : TMA+WS GEMM  + bitonic   (1prod+2cons M-split, Hopper+)
-  tma2n_selection   : TMA+WS GEMM  + selection (1prod+2cons N-split, Hopper+)
-  tma2n_bitonic     : TMA+WS GEMM  + bitonic   (1prod+2cons N-split, Hopper+)
+Kernel variants (3 GEMM strategies × 2 top-K algorithms = 6 kernels):
+  cpasync_selection / cpasync_bitonic   cp.async GEMM, threads=256, block_M=64
+  tma_selection     / tma_bitonic       Manual 1:2 WS (1 prod + 2 M-split cons),
+                                        threads=384, block_M=128            (Hopper+)
+  tma_auto_selection/ tma_auto_bitonic  TMA + auto-WS, threads=256, block_M=64,
+                                        N-split via default Square policy   (Hopper+)
 """
 
 import sys
@@ -47,10 +44,8 @@ try:
         fused_router_cpasync_bitonic_kernel,
         fused_router_tma_selection_kernel,
         fused_router_tma_bitonic_kernel,
-        fused_router_tma_v2_selection_kernel,
-        fused_router_tma_v2_bitonic_kernel,
-        fused_router_tma_nows_selection_kernel,
-        fused_router_tma_nows_bitonic_kernel,
+        fused_router_tma_auto_selection_kernel,
+        fused_router_tma_auto_bitonic_kernel,
     )
     import tilelang.language as T
     HAS_FUSED = True
@@ -90,10 +85,8 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
             "cpasync_bitonic":    (fused_router_cpasync_bitonic_kernel,    256,  64),
             "tma_selection":      (fused_router_tma_selection_kernel,      384, 128),
             "tma_bitonic":        (fused_router_tma_bitonic_kernel,        384, 128),
-            "tma_v2_selection":   (fused_router_tma_v2_selection_kernel,   384, 128),
-            "tma_v2_bitonic":     (fused_router_tma_v2_bitonic_kernel,     384, 128),
-            "tma_nows_selection": (fused_router_tma_nows_selection_kernel, 256,  64),
-            "tma_nows_bitonic":   (fused_router_tma_nows_bitonic_kernel,   256,  64),
+            "tma_auto_selection": (fused_router_tma_auto_selection_kernel, 256,  64),
+            "tma_auto_bitonic":   (fused_router_tma_auto_bitonic_kernel,   256,  64),
         }
         for algo, (factory, th, bm) in factory_map.items():
             try:
@@ -157,10 +150,8 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
         "cpasync_bitonic":    "CpAsync-Bit",
         "tma_selection":      "TMA-Sel",
         "tma_bitonic":        "TMA-Bit",
-        "tma_v2_selection":   "TMA-V2-Sel",
-        "tma_v2_bitonic":     "TMA-V2-Bit",
-        "tma_nows_selection": "TMA-NoWS-Sel",
-        "tma_nows_bitonic":   "TMA-NoWS-Bit",
+        "tma_auto_selection": "TMA-Auto-Sel",
+        "tma_auto_bitonic":   "TMA-Auto-Bit",
     }
     for algo, label in algo_display.items():
         if algo in raw_fused:
@@ -241,7 +232,7 @@ def main():
 
     version_keys = ['PyTorch', 'TL-sep',
                     'CpAsync-Sel', 'CpAsync-Bit', 'TMA-Sel', 'TMA-Bit',
-                    'TMA-V2-Sel', 'TMA-V2-Bit', 'TMA-NoWS-Sel', 'TMA-NoWS-Bit']
+                    'TMA-Auto-Sel', 'TMA-Auto-Bit']
     version_keys = [v for v in version_keys if any(v in r for r in all_rows)]
 
     headers = ["Model", "T"] + \

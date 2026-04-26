@@ -10,10 +10,8 @@ from kernels.router_gemm_topk_softmax import (
     fused_router_cpasync_bitonic_kernel,
     fused_router_tma_selection_kernel,
     fused_router_tma_bitonic_kernel,
-    fused_router_tma_v2_selection_kernel,
-    fused_router_tma_v2_bitonic_kernel,
-    fused_router_tma_nows_selection_kernel,
-    fused_router_tma_nows_bitonic_kernel,
+    fused_router_tma_auto_selection_kernel,
+    fused_router_tma_auto_bitonic_kernel,
 )
 
 # Use DeepSeek-V2 shape: most complex (non-pow2 E, largest H)
@@ -28,10 +26,8 @@ VARIANTS = [
     ("cpasync_bitonic",    fused_router_cpasync_bitonic_kernel,    256,  64),
     ("tma_selection",      fused_router_tma_selection_kernel,      384, 128),
     ("tma_bitonic",        fused_router_tma_bitonic_kernel,        384, 128),
-    ("tma_v2_selection",   fused_router_tma_v2_selection_kernel,   384, 128),
-    ("tma_v2_bitonic",     fused_router_tma_v2_bitonic_kernel,     384, 128),
-    ("tma_nows_selection", fused_router_tma_nows_selection_kernel, 256,  64),
-    ("tma_nows_bitonic",   fused_router_tma_nows_bitonic_kernel,   256,  64),
+    ("tma_auto_selection", fused_router_tma_auto_selection_kernel, 256,  64),
+    ("tma_auto_bitonic",   fused_router_tma_auto_bitonic_kernel,   256,  64),
 ]
 
 SEPARATOR = "=" * 100
