@@ -10,7 +10,8 @@ do_bench enters its timing loop.
 Five comparison points reported in the summary:
   PyTorch    eager torch.mm + torch.topk + torch.softmax
   Inductor   torch.compile(pytorch_sep) (first compile NOT timed)
-  Triton     official triton_kernels.matmul + triton_kernels.topk(apply_softmax=True)
+  Triton     Triton-tutorial-03 matmul (inline, autotuned) + torch.topk + torch.softmax
+             (vanilla `triton`/`triton.language`, NO `triton_kernels` package needed)
   TL-sep     TileLang separate GEMM + topk_softmax_best
   Ours       best of six fused variants (cpasync/tma/tma_auto x sel/bit)
 """
@@ -55,13 +56,88 @@ except ImportError:
     HAS_FUSED = False
 
 
-# ============ Import official triton_kernels (matmul + topk) ============
+# ============ Inline Triton matmul (tutorial 03, autotuned) ============
+# NOTE: deliberately uses only `triton` / `triton.language` so the benchmark
+# runs on any environment with vanilla Triton — no `triton_kernels` package.
 try:
-    from triton_kernels.matmul import matmul as triton_matmul, PrecisionConfig as TritonPrecisionConfig
-    from triton_kernels.topk import topk as triton_topk
-    HAS_TRITON_KERNELS = True
+    import triton
+    import triton.language as tl
+
+    @triton.autotune(
+        configs=[
+            triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+            triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=3, num_warps=8),
+            triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_M': 64,  'BLOCK_N': 32,  'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=5, num_warps=2),
+            triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32,  'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=4, num_warps=4),
+        ],
+        key=['M', 'N', 'K'],
+    )
+    @triton.jit
+    def _triton_matmul_kernel(
+        a_ptr, b_ptr, c_ptr,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cm, stride_cn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        GROUP_M: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        num_pid_m = tl.cdiv(M, BLOCK_M)
+        num_pid_n = tl.cdiv(N, BLOCK_N)
+        num_pid_in_group = GROUP_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+        pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
+
+        offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+        offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+        offs_k = tl.arange(0, BLOCK_K)
+        a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+        accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k in range(0, tl.cdiv(K, BLOCK_K)):
+            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_K, other=0.0)
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_K, other=0.0)
+            accumulator = tl.dot(a, b, accumulator)
+            a_ptrs += BLOCK_K * stride_ak
+            b_ptrs += BLOCK_K * stride_bk
+
+        c = accumulator.to(tl.bfloat16)
+        offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        tl.store(c_ptrs, c, mask=c_mask)
+
+    def triton_matmul(a, b):
+        M, K = a.shape
+        K2, N = b.shape
+        assert K == K2
+        c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+        grid = lambda META: (
+            triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),
+        )
+        _triton_matmul_kernel[grid](
+            a, b, c,
+            M, N, K,
+            a.stride(0), a.stride(1),
+            b.stride(0), b.stride(1),
+            c.stride(0), c.stride(1),
+        )
+        return c
+
+    HAS_TRITON = True
 except ImportError:
-    HAS_TRITON_KERNELS = False
+    HAS_TRITON = False
 
 
 # ============ Model configs (from HuggingFace) ============
@@ -82,11 +158,6 @@ FUSED_VARIANTS = [
     "tma_auto_selection",
     "tma_auto_bitonic",
 ]
-
-
-def _make_colmajor(t):
-    """Force column-major layout (required by triton_kernels.matmul)."""
-    return t.transpose(-1, -2).contiguous().transpose(-1, -2)
 
 
 def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
@@ -175,18 +246,19 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
         print(f"    [Inductor] FAIL: {e}", flush=True)
         results['Inductor'] = float('inf')
 
-    # ---------- 3) Triton (triton_kernels matmul + topk) ----------
-    if HAS_TRITON_KERNELS:
+    # ---------- 3) Triton (inline tutorial-03 matmul + torch topk/softmax) ----------
+    if HAS_TRITON:
         try:
-            W_triton = _make_colmajor(W_bf16)
-            pc = TritonPrecisionConfig()
-
             def triton_glue():
-                l = triton_matmul(X_bf16, W_triton, None, precision_config=pc)
-                return triton_topk(l, K, apply_softmax=True,
-                                   all_gather=False, symm_mem_pool=None)
+                logits = triton_matmul(X_bf16, W_bf16).float()
+                topk_vals, topk_idx = torch.topk(logits, K, dim=-1)
+                scores = torch.softmax(topk_vals, dim=-1)
+                return scores, topk_idx
 
-            triton_glue()
+            # Burn autotune passes outside do_bench so picking-the-best-config
+            # is not part of the timed loop.
+            for _ in range(3):
+                triton_glue()
             torch.cuda.synchronize()
             print(f"    [Triton] timing...", end=" ", flush=True)
             results['Triton'] = do_bench(triton_glue, warmup=warmup, rep=rep)
@@ -273,7 +345,7 @@ def main():
     print("PyTorch:", torch.__version__)
     print("TL topk_softmax:", "available" if HAS_TL_TOPK else "NOT available")
     print("Fused kernels:", "available" if HAS_FUSED else "NOT available")
-    print("triton_kernels:", "available" if HAS_TRITON_KERNELS else "NOT available")
+    print("Triton (vanilla):", "available" if HAS_TRITON else "NOT available")
     print("Timing: do_bench (per-iteration events + L2 flush) for ALL versions")
     print("Inductor: first-compile time excluded (3 warm passes before do_bench)")
     print()
