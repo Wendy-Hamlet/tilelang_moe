@@ -231,14 +231,26 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
     print(f"{results['PyTorch']:.4f}ms", flush=True)
 
     # ---------- 2) torch.compile / Inductor ----------
+    # mode="reduce-overhead" -> Inductor + CUDA graphs. The first few calls are
+    # special: pass 1 = Dynamo trace + eager run, pass 2 = Inductor compile
+    # (Triton codegen, mostly CPU), pass 3 = CUDA-graph capture,
+    # pass 4+ = steady-state graph replay.
+    # We run 5 warm passes OUTSIDE do_bench and print the per-pass wall time
+    # (CPU+GPU, via time.perf_counter + cuda.synchronize) so it's auditable
+    # from the log that compile/capture cost is excluded — expected pattern:
+    # first pass O(seconds), last 1-2 passes converge to ~ms (= steady state).
+    import time
     try:
         compiled_fn = torch.compile(pytorch_sep, mode="reduce-overhead", fullgraph=False)
-        # warm the JIT cache once OUTSIDE do_bench so first-compile time is not counted
-        print(f"    [Inductor] warming compile cache...", end=" ", flush=True)
-        for _ in range(3):
+        print(f"    [Inductor] warmup (per-pass ms, wall): ", end="", flush=True)
+        warm_times = []
+        for i in range(5):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
             compiled_fn()
-        torch.cuda.synchronize()
-        print("OK", flush=True)
+            torch.cuda.synchronize()
+            warm_times.append((time.perf_counter() - t0) * 1e3)
+        print(", ".join(f"#{i+1}={t:.1f}" for i, t in enumerate(warm_times)), flush=True)
         print(f"    [Inductor] timing...", end=" ", flush=True)
         results['Inductor'] = do_bench(compiled_fn, warmup=warmup, rep=rep)
         print(f"{results['Inductor']:.4f}ms", flush=True)
