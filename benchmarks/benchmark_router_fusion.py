@@ -3,7 +3,11 @@ Router Fusion Benchmark — Fused GEMM + TopK + Softmax vs Baselines
 
 Measures: X(T,H) @ W(H,E) -> topk_softmax -> (scores, indices)(T,K)
 
-All versions measured with do_bench (per-iteration CUDA events + L2 flush).
+All versions measured with do_bench (per-iteration CUDA events + L2 flush),
+wrapped in stable_bench (outer median over N repeats; default 3) to defend
+against autotune flakiness and GPU clock drift. min/max also reported per
+config to expose run-to-run spread.
+
 First-time compilation/JIT cost is excluded by an explicit dry-run pass before
 do_bench enters its timing loop.
 
@@ -31,6 +35,27 @@ sys.path.insert(0, str(project_root))
 import torch
 from tabulate import tabulate
 from tilelang.profiler import do_bench
+
+
+def stable_bench(fn, warmup, rep, n_repeats=3):
+    """Run do_bench n_repeats times, return (median, min, max).
+
+    do_bench already averages many in-loop iterations, but cross-call variance
+    (autotune flakiness, GPU clock drift, L2/SM placement state) can still be
+    large. Outer N-run median + reported spread defends against that.
+    """
+    times = []
+    for _ in range(n_repeats):
+        torch.cuda.synchronize()
+        times.append(do_bench(fn, warmup=warmup, rep=rep))
+    times.sort()
+    median = times[len(times) // 2]
+    return median, times[0], times[-1]
+
+
+def _fmt_bench(median, lo, hi):
+    spread_pct = (hi - lo) / median * 100.0 if median > 0 else 0.0
+    return f"{median:.4f}ms (min {lo:.4f} / max {hi:.4f}, spread {spread_pct:.1f}%)"
 
 
 # ============ Import TileLang kernels ============
@@ -160,7 +185,7 @@ FUSED_VARIANTS = [
 ]
 
 
-def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
+def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100, n_repeats=3):
     """Run benchmark for one (model, num_tokens) config."""
     device = "cuda"
 
@@ -227,8 +252,10 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
         return scores, topk_idx
 
     print(f"    [PyTorch] timing...", end=" ", flush=True)
-    results['PyTorch'] = do_bench(pytorch_sep, warmup=warmup, rep=rep)
-    print(f"{results['PyTorch']:.4f}ms", flush=True)
+    med, lo, hi = stable_bench(pytorch_sep, warmup, rep, n_repeats)
+    results['PyTorch'] = med
+    results['_PyTorch_minmax'] = (lo, hi)
+    print(_fmt_bench(med, lo, hi), flush=True)
 
     # ---------- 2) torch.compile / Inductor ----------
     # mode="reduce-overhead" -> Inductor + CUDA graphs. The first few calls are
@@ -252,8 +279,10 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
             warm_times.append((time.perf_counter() - t0) * 1e3)
         print(", ".join(f"#{i+1}={t:.1f}" for i, t in enumerate(warm_times)), flush=True)
         print(f"    [Inductor] timing...", end=" ", flush=True)
-        results['Inductor'] = do_bench(compiled_fn, warmup=warmup, rep=rep)
-        print(f"{results['Inductor']:.4f}ms", flush=True)
+        med, lo, hi = stable_bench(compiled_fn, warmup, rep, n_repeats)
+        results['Inductor'] = med
+        results['_Inductor_minmax'] = (lo, hi)
+        print(_fmt_bench(med, lo, hi), flush=True)
     except Exception as e:
         print(f"    [Inductor] FAIL: {e}", flush=True)
         results['Inductor'] = float('inf')
@@ -273,8 +302,10 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
                 triton_glue()
             torch.cuda.synchronize()
             print(f"    [Triton] timing...", end=" ", flush=True)
-            results['Triton'] = do_bench(triton_glue, warmup=warmup, rep=rep)
-            print(f"{results['Triton']:.4f}ms", flush=True)
+            med, lo, hi = stable_bench(triton_glue, warmup, rep, n_repeats)
+            results['Triton'] = med
+            results['_Triton_minmax'] = (lo, hi)
+            print(_fmt_bench(med, lo, hi), flush=True)
         except Exception as e:
             print(f"    [Triton] FAIL: {e}", flush=True)
             results['Triton'] = float('inf')
@@ -291,8 +322,10 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
             tilelang_sep()
             torch.cuda.synchronize()
             print(f"    [TL-sep] timing...", end=" ", flush=True)
-            results['TL-sep'] = do_bench(tilelang_sep, warmup=warmup, rep=rep)
-            print(f"{results['TL-sep']:.4f}ms", flush=True)
+            med, lo, hi = stable_bench(tilelang_sep, warmup, rep, n_repeats)
+            results['TL-sep'] = med
+            results['_TL-sep_minmax'] = (lo, hi)
+            print(_fmt_bench(med, lo, hi), flush=True)
         except Exception as e:
             print(f"    [TL-sep] FAIL: {e}", flush=True)
             results['TL-sep'] = float('inf')
@@ -306,10 +339,11 @@ def run_single_config(name, H, E, K, num_tokens, warmup=25, rep=100):
             kern(X_bf16, W_padded)
             torch.cuda.synchronize()
             print(f"    [{algo}] timing...", end=" ", flush=True)
-            raw_variants[algo] = do_bench(
+            med, lo, hi = stable_bench(
                 lambda k=kern: k(X_bf16, W_padded),
-                warmup=warmup, rep=rep)
-            print(f"{raw_variants[algo]:.4f}ms", flush=True)
+                warmup, rep, n_repeats)
+            raw_variants[algo] = med
+            print(_fmt_bench(med, lo, hi), flush=True)
         except Exception as e:
             print(f"    [{algo}] FAIL: {e}", flush=True)
             raw_variants[algo] = float('inf')
@@ -335,6 +369,10 @@ def main():
     parser.add_argument("--input-tokens", type=str, default=None)
     parser.add_argument("--warmup", type=int, default=25, help="Warmup time budget in ms")
     parser.add_argument("--rep", type=int, default=100, help="Benchmark time budget in ms")
+    parser.add_argument("--repeats", type=int, default=3,
+                        help="Outer-loop repetitions of do_bench; result is median, "
+                             "min/max also reported. Defends against autotune flakiness "
+                             "and GPU clock drift.")
     parser.add_argument("--json", type=str, default=None,
                         help="If set, dump structured results to this JSON path")
     args = parser.parse_args()
@@ -359,7 +397,8 @@ def main():
     print("Fused kernels:", "available" if HAS_FUSED else "NOT available")
     print("Triton (vanilla):", "available" if HAS_TRITON else "NOT available")
     print("Timing: do_bench (per-iteration events + L2 flush) for ALL versions")
-    print("Inductor: first-compile time excluded (3 warm passes before do_bench)")
+    print(f"        wrapped in stable_bench (median of {args.repeats} repeats, min/max also shown)")
+    print("Inductor: first-compile time excluded (5 warm passes before do_bench)")
     print()
 
     all_rows = []
@@ -372,7 +411,8 @@ def main():
         for num_tokens in input_sweep:
             results = run_single_config(
                 name, H, E, K, num_tokens,
-                warmup=args.warmup, rep=args.rep)
+                warmup=args.warmup, rep=args.rep,
+                n_repeats=args.repeats)
 
             parts = []
             for v in summary_keys:
@@ -390,6 +430,12 @@ def main():
             }
             for v in summary_keys:
                 row[v] = results.get(v, float('inf'))
+            spreads = {}
+            for v in summary_keys:
+                mm = results.get(f'_{v}_minmax')
+                if mm is not None:
+                    spreads[v] = {'min': mm[0], 'max': mm[1]}
+            row['spreads'] = spreads
             row['variants'] = results.get('_variants', {})
             all_rows.append(row)
 
@@ -453,6 +499,7 @@ def main():
             "torch_version": torch.__version__,
             "warmup": args.warmup,
             "rep": args.rep,
+            "repeats": args.repeats,
             "summary_keys": summary_keys,
             "fused_variants": FUSED_VARIANTS,
             "rows": serialized,
